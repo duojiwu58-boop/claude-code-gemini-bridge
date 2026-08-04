@@ -1,0 +1,30 @@
+# Rust build output
+/target/
+
+# Release packages and locally deployed service artifacts
+/dist/
+/service/*.exe
+/service/logs/
+/ClaudeBridgeManager.exe
+
+# Machine-local bridge state
+/bridge-state.json
+
+# Delphi build output and user-local IDE state
+**/Win32/
+**/Win64/
+*.dcu
+*.dproj.local
+*.identcache
+*.stat
+__history/
+
+# Logs, temporary files, and editor/OS metadata
+*.log
+*.log.*
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

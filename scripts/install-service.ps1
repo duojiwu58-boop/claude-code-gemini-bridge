@@ -1,0 +1,268 @@
+param(
+    [string]$ProxyUrl = 'http://127.0.0.1:8080',
+    [int]$Port = 18787,
+    [string]$ApiKeyProfile = (
+        Join-Path $env:USERPROFILE '.codex\gemini35flash-aistudio.config.toml'
+    ),
+    [string]$ClaudeSettingsDir = (
+        Join-Path $env:USERPROFILE '.claude'
+    ),
+    [switch]$SkipBuild
+)
+
+$ErrorActionPreference = 'Stop'
+
+$serviceName = 'ClaudeCodeBridge'
+$displayName = 'Claude Code Multi-Model Bridge'
+$projectDir = Split-Path -Parent $PSScriptRoot
+$buildTargetDir = Join-Path $projectDir 'target\service-build'
+$releaseExe = Join-Path $buildTargetDir 'x86_64-pc-windows-msvc\release\claude-bridge.exe'
+$projectReleaseExe = Join-Path $projectDir 'target\x86_64-pc-windows-msvc\release\claude-bridge.exe'
+$legacyExe = Join-Path $projectDir 'target\x86_64-pc-windows-msvc\release\codex-gemini-bridge.exe'
+$serviceDir = Join-Path $projectDir 'service'
+$serviceExe = Join-Path $serviceDir 'claude-bridge.exe'
+$legacyServiceExe = Join-Path $serviceDir 'codex-gemini-bridge.exe'
+$logDir = Join-Path $serviceDir 'logs'
+$stateFile = Join-Path $projectDir 'bridge-state.json'
+$legacyPidFile = Join-Path $projectDir 'target\bridge.pid'
+$registryPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$serviceName"
+
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = [Security.Principal.WindowsPrincipal]::new($identity)
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw 'Installing the Windows service requires an elevated PowerShell process.'
+}
+
+if (-not (Test-Path -LiteralPath $ApiKeyProfile -PathType Leaf)) {
+    throw "API key profile does not exist: $ApiKeyProfile"
+}
+$profileText = [System.IO.File]::ReadAllText($ApiKeyProfile)
+$keyMatch = [regex]::Match(
+    $profileText,
+    '(?m)^experimental_bearer_token\s*=\s*"([^"]+)"\s*$'
+)
+if (-not $keyMatch.Success) {
+    throw "API key not found in $ApiKeyProfile"
+}
+if (-not (Test-Path -LiteralPath $ClaudeSettingsDir -PathType Container)) {
+    throw "Claude settings directory does not exist: $ClaudeSettingsDir"
+}
+
+if (-not $SkipBuild) {
+    $env:CARGO_TARGET_DIR = $buildTargetDir
+    & cargo build --locked --release --target x86_64-pc-windows-msvc
+    if ($LASTEXITCODE -ne 0) {
+        throw "Cargo release build failed with exit code $LASTEXITCODE."
+    }
+}
+if (-not (Test-Path -LiteralPath $releaseExe -PathType Leaf)) {
+    throw "Bridge release executable does not exist: $releaseExe"
+}
+
+$existingService = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+if ($null -ne $existingService -and $existingService.Status -ne 'Stopped') {
+    Stop-Service -Name $serviceName -Force
+    $existingService.WaitForStatus(
+        [System.ServiceProcess.ServiceControllerStatus]::Stopped,
+        [TimeSpan]::FromSeconds(30)
+    )
+}
+
+$listeners = @(
+    Get-NetTCPConnection `
+        -LocalAddress '127.0.0.1' `
+        -LocalPort $Port `
+        -State Listen `
+        -ErrorAction SilentlyContinue
+)
+foreach ($listener in $listeners) {
+    $processId = [int]$listener.OwningProcess
+    $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
+    if ($null -eq $process) {
+        continue
+    }
+    $actualPath = $null
+    try {
+        $actualPath = $process.Path
+    }
+    catch {
+        $actualPath = $null
+    }
+    if ([string]::IsNullOrWhiteSpace($actualPath)) {
+        $processInfo = Get-CimInstance `
+            -ClassName Win32_Process `
+            -Filter "ProcessId = $processId" `
+            -ErrorAction SilentlyContinue
+        $actualPath = $processInfo.ExecutablePath
+    }
+
+    $allowedPaths = @(
+        $releaseExe
+        $projectReleaseExe
+        $legacyExe
+        $serviceExe
+        $legacyServiceExe
+    ) | ForEach-Object {
+        [System.IO.Path]::GetFullPath($_)
+    }
+    if (
+        [string]::IsNullOrWhiteSpace($actualPath) -or
+        -not ($allowedPaths -contains [System.IO.Path]::GetFullPath($actualPath))
+    ) {
+        throw "Port 127.0.0.1:$Port is owned by an unrelated process (PID $processId)."
+    }
+
+    try {
+        Invoke-RestMethod `
+            -Uri "http://127.0.0.1:$Port/admin/shutdown" `
+            -Method Post `
+            -TimeoutSec 5 | Out-Null
+    }
+    catch {
+        Stop-Process -Id $processId
+    }
+
+    $deadline = [DateTime]::UtcNow.AddSeconds(15)
+    while (
+        $null -ne (Get-Process -Id $processId -ErrorAction SilentlyContinue) -and
+        [DateTime]::UtcNow -lt $deadline
+    ) {
+        Start-Sleep -Milliseconds 100
+    }
+    if ($null -ne (Get-Process -Id $processId -ErrorAction SilentlyContinue)) {
+        Stop-Process -Id $processId
+        Wait-Process -Id $processId -ErrorAction SilentlyContinue
+    }
+}
+if (Test-Path -LiteralPath $legacyPidFile -PathType Leaf) {
+    Remove-Item -LiteralPath $legacyPidFile -Force
+}
+
+New-Item -ItemType Directory -Path $serviceDir -Force | Out-Null
+New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+Copy-Item -LiteralPath $releaseExe -Destination $serviceExe -Force
+
+$binaryPath = "`"$serviceExe`" --windows-service"
+$scBinaryPath = '\"' + $serviceExe + '\" --windows-service'
+if ($null -eq $existingService) {
+    New-Service `
+        -Name $serviceName `
+        -BinaryPathName $binaryPath `
+        -DisplayName $displayName `
+        -Description 'Always-on local protocol bridge for Claude Code model providers.' `
+        -StartupType Automatic | Out-Null
+}
+else {
+    & sc.exe config $serviceName binPath= $scBinaryPath | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to update service configuration (sc.exe exit $LASTEXITCODE)."
+    }
+}
+
+& sc.exe config $serviceName start= delayed-auto | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to enable delayed automatic startup (sc.exe exit $LASTEXITCODE)."
+}
+& sc.exe description $serviceName 'Always-on local protocol bridge for Claude Code model providers.' | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to set service description (sc.exe exit $LASTEXITCODE)."
+}
+& sc.exe failure $serviceName reset= 86400 actions= restart/5000/restart/15000/restart/60000 | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to set service recovery actions (sc.exe exit $LASTEXITCODE)."
+}
+& sc.exe failureflag $serviceName 1 | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to enable recovery for non-crash failures (sc.exe exit $LASTEXITCODE)."
+}
+
+# The Delphi GUI runs without elevation. Grant only the installing user the
+# right to query/start/stop this one service; configuration and deletion remain
+# administrator-only.
+$serviceSddlOutput = & sc.exe sdshow $serviceName
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to read service permissions (sc.exe exit $LASTEXITCODE)."
+}
+$serviceSddl = $serviceSddlOutput |
+    Where-Object { $_ -match '^D:' } |
+    Select-Object -First 1
+if ([string]::IsNullOrWhiteSpace($serviceSddl)) {
+    throw 'Windows returned an empty service security descriptor.'
+}
+$currentUserSid = $identity.User.Value
+if (-not $serviceSddl.Contains(";;;$currentUserSid)")) {
+    $userControlAce = "(A;;LCRPWPLO;;;$currentUserSid)"
+    $saclIndex = $serviceSddl.IndexOf('S:')
+    if ($saclIndex -ge 0) {
+        $serviceSddl = $serviceSddl.Insert($saclIndex, $userControlAce)
+    }
+    else {
+        $serviceSddl += $userControlAce
+    }
+    & sc.exe sdset $serviceName $serviceSddl | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to grant GUI service controls (sc.exe exit $LASTEXITCODE)."
+    }
+}
+
+$serviceEnvironment = @(
+    "GEMINI_BRIDGE_LISTEN=127.0.0.1:$Port"
+    "GEMINI_BRIDGE_PROXY=$ProxyUrl"
+    "GEMINI_BRIDGE_API_KEY_PROFILE=$ApiKeyProfile"
+    "GEMINI_BRIDGE_STATE_FILE=$stateFile"
+    "GEMINI_BRIDGE_LOG_DIR=$logDir"
+    "CLAUDE_SETTINGS_DIR=$ClaudeSettingsDir"
+    'RUST_LOG=claude_bridge=info,tower_http=info'
+)
+New-ItemProperty `
+    -LiteralPath $registryPath `
+    -Name Environment `
+    -PropertyType MultiString `
+    -Value $serviceEnvironment `
+    -Force | Out-Null
+
+Start-Service -Name $serviceName
+$service = Get-Service -Name $serviceName
+$service.WaitForStatus(
+    [System.ServiceProcess.ServiceControllerStatus]::Running,
+    [TimeSpan]::FromSeconds(30)
+)
+
+$healthUrl = "http://127.0.0.1:$Port/health"
+$deadline = [DateTime]::UtcNow.AddSeconds(30)
+$healthy = $false
+while ([DateTime]::UtcNow -lt $deadline) {
+    try {
+        $health = Invoke-RestMethod -Uri $healthUrl -TimeoutSec 3
+        $healthy = $health.status -eq 'ok'
+    }
+    catch {
+        $healthy = $false
+    }
+    if ($healthy) {
+        break
+    }
+    Start-Sleep -Milliseconds 250
+}
+if (-not $healthy) {
+    throw "Service is running but its health endpoint did not become ready: $healthUrl"
+}
+
+$resolvedLegacyServiceExe = [System.IO.Path]::GetFullPath($legacyServiceExe)
+$resolvedServiceExe = [System.IO.Path]::GetFullPath($serviceExe)
+if (
+    -not [string]::Equals(
+        $resolvedLegacyServiceExe,
+        $resolvedServiceExe,
+        [StringComparison]::OrdinalIgnoreCase
+    ) -and
+    (Test-Path -LiteralPath $resolvedLegacyServiceExe -PathType Leaf)
+) {
+    Remove-Item -LiteralPath $resolvedLegacyServiceExe -Force
+}
+
+Write-Output "service_name=$serviceName"
+Write-Output 'startup_type=AutomaticDelayedStart'
+Write-Output "binary_path=$serviceExe"
+Write-Output "health_url=$healthUrl"
+Write-Output 'service_status=Running'

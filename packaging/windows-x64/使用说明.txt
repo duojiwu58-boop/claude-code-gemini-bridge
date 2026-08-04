@@ -1,0 +1,63 @@
+Claude Code Multi-Model Bridge（Windows x64）
+================================================
+
+一、安装
+
+推荐直接运行 ClaudeCodeBridge-版本-Setup.exe。
+
+1. 同意 Windows 管理员权限提示。
+2. 按安装向导完成安装。
+3. Gemini 是可选项，默认不勾选；不使用 Gemini 时无需输入 API Key。
+4. 如需 Gemini，勾选“配置 Google Gemini”，再输入 API Key。安装器会自动检测并预填 Windows 系统代理，用户可以修改；清空代理表示直连。
+5. 安装成功后，重新启动正在运行的 Claude Code 会话。
+
+ZIP 是便携发布包，需要使用时请先完整解压，再双击 Install.cmd。
+
+服务会监听：
+http://127.0.0.1:18787
+
+Windows 服务名：
+ClaudeCodeBridge
+
+二、模型切换 GUI
+
+安装程序会创建开始菜单快捷方式，也可以按需创建桌面快捷方式。
+GUI 可以查看桥接状态、重新加载配置并实时切换模型。
+Gemini 代理可在 GUI 中随时检测、修改、测试并立即生效，无需重新安装或重启服务；清空后保存表示直连。
+
+不使用 Gemini 时，GUI 会读取已有的
+%USERPROFILE%\.claude\settings - *.json
+供应商配置。若尚无配置，服务仍可正常安装，添加配置后重新加载即可。
+
+三、文件位置
+
+程序：
+C:\Program Files\ClaudeCodeBridge
+
+API Key、状态和日志：
+C:\ProgramData\ClaudeCodeBridge
+
+Claude Code 配置：
+%USERPROFILE%\.claude
+
+安装程序修改 settings.json 前会创建带时间戳的备份。
+
+四、更新 API Key
+
+从开始菜单打开“配置或更新 Gemini API Key”，输入新 Key。
+便携包用户也可以双击 Update-API-Key.cmd。
+
+五、卸载
+
+从 Windows“已安装的应用”或开始菜单卸载。
+便携包用户可以双击 Uninstall.cmd。
+
+默认保留 API Key、日志和 Claude 配置，避免误删个人数据。
+如需删除 C:\ProgramData\ClaudeCodeBridge，请在确认不再需要后手工删除。
+
+六、注意事项
+
+1. 本软件没有商业代码签名证书，Windows 可能显示“未知发布者”。
+2. 只接受来自本机 127.0.0.1 的连接，不对局域网开放端口。
+3. API Key 不写入服务注册表，单独存放在受访问控制保护的文件中。
+4. 请勿将自己已经填写 API Key 的配置文件转发给他人。
