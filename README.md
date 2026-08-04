@@ -1,7 +1,8 @@
 # Claude Code ↔ Gemini Deep-Compatibility Bridge
 
 **A protocol-aware Rust bridge built specifically to make Gemini behave like a
-first-class Claude Code backend—not merely an OpenAI-shaped chat endpoint.**
+first-class Claude Code backend—not merely an OpenAI-shaped chat endpoint—with
+live model switching that does not require restarting VS Code or Claude Code.**
 
 This project aims to be one of the most deeply adapted open-source bridges for
 running Google Gemini from Claude Code. Its primary path translates the
@@ -11,8 +12,10 @@ semantics on the way back.
 
 > **中文定位：** 本项目不是只做字段改名的通用 API 转发器，而是针对 Claude
 > Code 的思考流、工具调用状态机、Gemini thought signature、多模态工具结果、
-> JSON Schema 严格校验和安全拦截等边界行为进行深度适配。目标是让 Gemini 在
-> Claude Code 中不仅“能回答”，而且能稳定完成真实的长链路编程代理任务。
+> JSON Schema 严格校验和安全拦截等边界行为进行深度适配；同时通过固定本地
+> 端点和配套 GUI，在无需重启 VS Code 或 Claude Code 的情况下，随时热切换
+> Gemini 及其他 Anthropic-compatible 模型。目标是让模型在 Claude Code 中
+> 不仅“能回答”，而且能稳定、方便地完成真实的长链路编程代理任务。
 
 It can also forward requests to other Anthropic-compatible providers and
 retains a legacy OpenAI Responses API route for Codex, but Claude Code ↔ Gemini
@@ -40,6 +43,7 @@ This bridge handles those behaviors explicitly:
 | Safety filtering | Crashes on an empty `choices` array | Converts Gemini `promptFeedback.blockReason` into a valid Anthropic `refusal` message with a readable reason |
 | Truncated tool calls | Executes malformed/empty arguments or reports the wrong stop reason | Maps cutoff responses to `max_tokens` and suppresses incomplete tool calls and uncached signatures |
 | Token accounting | Uses a byte-only estimate that undercounts non-ASCII prompts | Uses a Unicode-aware conservative input estimate and updates usage from streamed Gemini usage data when available |
+| Live model switching | Requires editing Claude settings and restarting/reloading the client whenever the provider changes | Keeps Claude Code connected to one stable local endpoint and switches Gemini or another Anthropic-compatible profile from the GUI without restarting VS Code, Claude Code, or the bridge service |
 | Operations | Runs as an ad hoc console proxy | Includes a native Windows service, delayed auto-start, recovery policy, graceful shutdown, health checks, persistent routing state, packaging, and a Delphi model-switcher GUI |
 
 ## Deep compatibility details
@@ -121,6 +125,28 @@ the same way, while length cutoffs become `max_tokens`.
 The SSE decoder also tolerates CRLF/LF framing, multiple data lines, partial
 network frames, and UTF-8 code points split across byte chunks. This prevents
 transport fragmentation from becoming visible as protocol corruption.
+
+### Models can be hot-switched without restarting VS Code or Claude Code
+
+Claude Code stays pointed at the bridge's stable local endpoint:
+`http://127.0.0.1:18787`. The bundled Delphi GUI discovers usable
+`%USERPROFILE%\.claude\settings - *.json` provider profiles and changes the
+bridge's active upstream route through its local management API. Subsequent
+Claude Code requests use the newly selected provider immediately.
+
+This makes it practical to move between:
+
+- Google Gemini through the bridge's deep protocol translator
+- Other Anthropic-compatible providers already represented by Claude settings
+- Different Gemini configurations, including runtime proxy/direct-mode changes
+
+The switch does **not** rewrite the active Claude Code configuration, reload the
+VS Code window, restart Claude Code, or restart the Windows bridge service.
+Provider credentials remain in their original local profile files and are never
+returned by the management API; only the selected profile filename and Gemini
+proxy mode are persisted. The result is a fixed Claude Code connection with a
+hot-swappable backend—one of the project's most convenient differences from a
+single-provider bridge.
 
 ## Compatibility scope and honest limits
 
