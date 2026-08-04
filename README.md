@@ -21,6 +21,13 @@ It can also forward requests to other Anthropic-compatible providers and
 retains a legacy OpenAI Responses API route for Codex, but Claude Code ↔ Gemini
 compatibility is the main maintenance target.
 
+![Claude Code model center showing Gemini and Anthropic-compatible profiles with zero-restart switching](gui/delphi11/ClaudeBridgeManager/assets/ClaudeBridgeManager-screenshot.png)
+
+*The bundled model center keeps Claude Code on one stable local endpoint while
+Gemini, DeepSeek, Kimi, Claude, Qwen, proxy settings, and other compatible
+profiles can be switched live. The next request uses the selected route—no
+VS Code reload or Claude Code restart required.*
+
 ## Why this is different from a generic bridge
 
 A generic bridge often stops after mapping `messages`, `content`, and
