@@ -1,13 +1,139 @@
-# Claude Code Multi-Model Bridge
+# Claude Code ↔ Gemini Deep-Compatibility Bridge
 
-Local adapter and model router for Claude Code. It can translate Anthropic
-Messages requests to Google AI Studio Gemini, or forward them to other
-Anthropic-compatible providers.
+**A protocol-aware Rust bridge built specifically to make Gemini behave like a
+first-class Claude Code backend—not merely an OpenAI-shaped chat endpoint.**
 
-It accepts the OpenAI Responses API shape used by Codex and converts requests
-to Gemini's OpenAI-compatible Chat Completions endpoint. It also accepts the
-Anthropic Messages API shape used by Claude Code, including streamed text and
-tool-use events.
+This project aims to be one of the most deeply adapted open-source bridges for
+running Google Gemini from Claude Code. Its primary path translates the
+Anthropic Messages API used by Claude Code into Google AI Studio's Gemini
+OpenAI-compatible Chat Completions endpoint, then reconstructs Anthropic
+semantics on the way back.
+
+> **中文定位：** 本项目不是只做字段改名的通用 API 转发器，而是针对 Claude
+> Code 的思考流、工具调用状态机、Gemini thought signature、多模态工具结果、
+> JSON Schema 严格校验和安全拦截等边界行为进行深度适配。目标是让 Gemini 在
+> Claude Code 中不仅“能回答”，而且能稳定完成真实的长链路编程代理任务。
+
+It can also forward requests to other Anthropic-compatible providers and
+retains a legacy OpenAI Responses API route for Codex, but Claude Code ↔ Gemini
+compatibility is the main maintenance target.
+
+## Why this is different from a generic bridge
+
+A generic bridge often stops after mapping `messages`, `content`, and
+`tool_calls`. That is enough for a chat demo, but coding agents exercise a much
+larger protocol surface: interleaved thinking and text, streamed partial JSON,
+parallel tools, multimodal tool results, strict schemas, truncated generations,
+and provider-specific state that must survive a tool round trip.
+
+This bridge handles those behaviors explicitly:
+
+| Compatibility surface | Common generic-bridge behavior | This project |
+| --- | --- | --- |
+| Streaming | Buffers the upstream response or assumes each network chunk is one SSE event | Calls Gemini with `stream: true`, incrementally decodes SSE across UTF-8 and network boundaries, and forwards Anthropic events as they become valid |
+| Extended thinking | Drops Gemini `reasoning_content` / `thinking` | Emits Anthropic `thinking` blocks and `thinking_delta` events, closes them before text or tools, and preserves thinking in non-streaming responses |
+| Tool arguments | Forwards incomplete JSON fragments directly | Accumulates streamed fragments, preserves parallel-call order, validates the completed JSON object, then emits a valid Anthropic `tool_use` block |
+| Gemini thought signatures | Loses `extra_content.google.thought_signature` after the first tool call | Caches signatures by tool-call ID and restores them on the next assistant/tool round trip, with bounded eviction |
+| Tool-result ordering | Preserves Claude block order even when Gemini requires tool results immediately after assistant tool calls | Emits `role: tool` results before remaining user text/images while preserving tool-call identity |
+| Multimodal tool results | Stringifies or drops image/document blocks | Converts base64 images and PDFs to Gemini-compatible `image_url` data URIs, including structured `tool_result` content |
+| Tool schemas | Passes Anthropic JSON Schema through unchanged and receives Gemini HTTP 400 errors | Recursively removes unsupported `$schema`, `$id`, and `$comment`, traverses definitions/combinators/items, and infers `type: object` when `properties` is present |
+| Safety filtering | Crashes on an empty `choices` array | Converts Gemini `promptFeedback.blockReason` into a valid Anthropic `refusal` message with a readable reason |
+| Truncated tool calls | Executes malformed/empty arguments or reports the wrong stop reason | Maps cutoff responses to `max_tokens` and suppresses incomplete tool calls and uncached signatures |
+| Token accounting | Uses a byte-only estimate that undercounts non-ASCII prompts | Uses a Unicode-aware conservative input estimate and updates usage from streamed Gemini usage data when available |
+| Operations | Runs as an ad hoc console proxy | Includes a native Windows service, delayed auto-start, recovery policy, graceful shutdown, health checks, persistent routing state, packaging, and a Delphi model-switcher GUI |
+
+## Deep compatibility details
+
+### Thinking is translated as a real Anthropic content-block lifecycle
+
+Gemini thinking is not exposed as ordinary assistant text. The streaming
+translator recognizes both `delta.reasoning_content` and `delta.thinking` and
+produces the event sequence Claude Code expects:
+
+```text
+Gemini reasoning token
+  -> content_block_start(type=thinking)
+  -> content_block_delta(type=thinking_delta)
+  -> content_block_stop
+  -> text or tool-use content begins
+```
+
+The thinking block is closed when normal text or a tool call arrives, and also
+during stream finalization. Non-streaming `reasoning_content` is prepended as
+an Anthropic `thinking` content block rather than silently discarded. This is
+what allows Claude Code to render its thinking state instead of appearing
+frozen while Gemini reasons.
+
+### Tool use is treated as a stateful protocol, not a JSON rename
+
+- Streamed tool calls are keyed and accumulated in insertion order, including
+  parallel tool calls whose IDs, names, and argument fragments arrive in
+  different chunks.
+- Completed arguments must parse as a JSON object before Claude Code sees the
+  tool request.
+- Gemini 3 thought signatures are captured from
+  `extra_content.google.thought_signature`, stored in a bounded cache, and
+  restored when Claude Code returns the corresponding tool result.
+- A `length` / `max_tokens` finish suppresses unfinished tool calls so Claude
+  Code never executes truncated arguments. Signatures from those invalid calls
+  are not cached.
+- Claude user messages that mix `tool_result`, text, and images are reordered
+  only where Gemini's sequencing contract requires it: tool results immediately
+  follow the assistant calls, while the remaining user content stays structured.
+
+### Tool results remain multimodal
+
+Claude Code tools can return screenshots, images, or PDF documents. Instead of
+flattening these blocks into lossy text, the bridge emits structured OpenAI
+content parts for Gemini:
+
+- Anthropic base64 image → `image_url` with `data:<media-type>;base64,...`
+- Anthropic base64 PDF document → `image_url` with
+  `data:application/pdf;base64,...`
+- Mixed text and media → one structured `role: tool` content array
+- `is_error: true` → preserved as an explicit tool-error text part without
+  discarding accompanying media
+
+This matters for screenshot-driven debugging, browser automation, document
+inspection, and other Claude Code workflows where the tool output is not just
+plain text.
+
+### Anthropic tool schemas are sanitized for Gemini's stricter parser
+
+Claude Code and MCP tools frequently send modern JSON Schema metadata that
+Gemini function declarations reject. Before forwarding a tool, the bridge
+recursively sanitizes `properties`, `items`, `oneOf`, `anyOf`, `allOf`, `$defs`,
+and `definitions`; removes `$schema`, `$id`, and `$comment`; and adds
+`type: object` when an object has `properties` but omits its type.
+
+This avoids a class of HTTP 400 failures that only appears with real-world MCP
+tool catalogs and is commonly missed by bridges tested with one simple
+function schema.
+
+### Provider failures degrade into valid Claude Code responses
+
+Gemini safety interception can return `promptFeedback.blockReason` with no
+`choices[0].message`. The bridge turns that provider-specific response into a
+well-formed Anthropic assistant message with `stop_reason: refusal` instead of
+returning an internal bridge error. Content-filter finish reasons are normalized
+the same way, while length cutoffs become `max_tokens`.
+
+The SSE decoder also tolerates CRLF/LF framing, multiple data lines, partial
+network frames, and UTF-8 code points split across byte chunks. This prevents
+transport fragmentation from becoming visible as protocol corruption.
+
+## Compatibility scope and honest limits
+
+- The Gemini OpenAI-compatible endpoint does not provide an Anthropic-compatible
+  tokenizer endpoint, so `/v1/messages/count_tokens` is a conservative estimate,
+  not an exact Gemini token count.
+- The legacy Codex Responses route is intentionally buffered. True upstream
+  streaming is implemented for the primary Claude Code Messages path.
+- Gemini and Claude Code can evolve independently. The regression suite covers
+  the protocol edge cases above, but compatibility is maintained continuously
+  rather than claimed as a timeless blanket guarantee.
+- This project focuses on protocol fidelity and agent reliability; it does not
+  attempt to make Gemini produce the same model behavior as Claude.
 
 ## Environment
 
