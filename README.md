@@ -168,6 +168,30 @@ single-provider bridge.
 - This project focuses on protocol fidelity and agent reliability; it does not
   attempt to make Gemini produce the same model behavior as Claude.
 
+## Download and use without compiling
+
+Most users do **not** need Rust, Delphi, Inno Setup, or a local build
+environment. Download the latest ready-to-run Windows package from:
+
+**[GitHub Releases — installer and portable ZIP](https://github.com/duojiwu58-boop/claude-code-gemini-bridge/releases/latest)**
+
+- **`ClaudeCodeBridge-0.1.3-Setup.exe` (recommended):** installs the native
+  Windows service, model-switcher GUI, Start Menu shortcuts, automatic startup,
+  recovery policy, configuration tools, and uninstaller.
+- **`ClaudeCodeBridge-0.1.3-windows-x64.zip`:** contains the same prebuilt
+  service and GUI for portable/manual deployment. Extract it and run
+  `Install.cmd` when service installation is desired.
+
+The installer can configure Gemini with a Google AI Studio API key, or skip
+Gemini setup when the user only wants to switch among existing
+Anthropic-compatible Claude profiles. After installation, open **Claude Code
+模型中心**, select or double-click a model, and the next Claude Code request
+uses it immediately—no VS Code reload or Claude Code restart is required.
+
+Release binaries are currently not code-signed, so Windows SmartScreen may ask
+for confirmation on first launch. SHA-256 checksums are published with the
+release and included inside the portable package.
+
 ## Environment
 
 - `GEMINI_API_KEY` (optional fallback)
