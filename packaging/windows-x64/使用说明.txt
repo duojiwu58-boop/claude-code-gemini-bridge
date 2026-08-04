@@ -1,4 +1,73 @@
-Claude Code Multi-Model Bridge（Windows x64）
+Claude Code Multi-Model Bridge (Windows x64)
+================================================
+
+ENGLISH VERSION
+------------------------------------------------
+
+1. Installation
+
+Running `ClaudeCodeBridge-<version>-Setup.exe` directly is recommended.
+
+1. Accept the Windows Administrator permissions prompt.
+2. Follow the setup wizard to complete installation.
+3. Gemini setup is optional and unchecked by default; no API key is required if not using Gemini.
+4. If Gemini is desired, check "Configure Google Gemini" and enter your API Key. The installer automatically detects and prefills the Windows system proxy if present (editable; clear to use direct connection).
+5. After installation completes, restart any running Claude Code sessions.
+
+The ZIP package is portable. To use it, extract the entire archive first, then double-click `Install.cmd`.
+
+Service listens on:
+http://127.0.0.1:18787
+
+Windows Service Name:
+ClaudeCodeBridge
+
+2. Model Switcher GUI
+
+The installer creates a Start Menu shortcut and optionally a Desktop shortcut.
+The GUI allows inspecting bridge status, reloading profiles, and switching active models live.
+Gemini proxy settings can be inspected, edited, tested, and applied instantly from the GUI without reinstalling or restarting the service (clearing proxy and saving selects direct connection).
+
+When Gemini is not enabled, the GUI reads existing provider profiles from:
+%USERPROFILE%\.claude\settings - *.json
+If no profiles exist yet, the service still installs normally; add profiles and click Reload in the GUI when ready.
+
+3. File Locations
+
+Program executable:
+C:\Program Files\ClaudeCodeBridge
+
+API Key, state, and logs:
+C:\ProgramData\ClaudeCodeBridge
+
+Claude Code configuration:
+%USERPROFILE%\.claude
+
+The installer creates a timestamped backup before modifying `settings.json`.
+
+4. Updating API Key
+
+Open "Configure or Update Gemini API Key" from the Start Menu and enter the new key.
+Portable ZIP users can also double-click `Update-API-Key.cmd`.
+
+5. Uninstallation
+
+Uninstall via Windows "Installed apps" or the Start Menu shortcut.
+Portable ZIP users can double-click `Uninstall.cmd`.
+
+API keys, logs, and Claude settings are preserved by default to prevent accidental data loss.
+To remove `C:\ProgramData\ClaudeCodeBridge`, delete it manually after confirming it is no longer needed.
+
+6. Important Notes
+
+1. Binaries are not digitally signed; Windows SmartScreen may show an "Unknown publisher" warning.
+2. Connects are accepted only from local 127.0.0.1; ports are not exposed to the local network.
+3. API Keys are stored in access-controlled configuration files, not in the service registry.
+4. Do not distribute configuration files containing your API keys to others.
+
+
+================================================
+中文版本 (CHINESE VERSION)
 ================================================
 
 一、安装
