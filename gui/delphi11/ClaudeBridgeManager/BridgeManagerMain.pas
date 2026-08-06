@@ -13,6 +13,8 @@ uses
   System.Generics.Collections,
   System.JSON,
   System.UITypes,
+  System.Math,
+  System.IOUtils,
   System.Win.Registry,
   System.Net.URLClient,
   System.Net.HttpClient,
@@ -25,9 +27,29 @@ uses
   Vcl.Dialogs;
 
 type
+  TProfileRow = record
+    Model: string;
+    BaseUrl: string;
+    Proxy: string;
+    Route: string;
+    FileName: string;
+    Active: Boolean;
+  end;
+
+  TStatusSnapshot = record
+    Online: Boolean;
+    HasProfile: Boolean;
+    Model: string;
+    FileName: string;
+    Proxy: string;
+    Stamp: string;
+    SettingsDir: string;
+    Detail: string;
+  end;
+
   TMainForm = class(TForm)
   private
-    FHttpClient: THTTPClient;
+    FBridgeUrl: string;
     FProfileFiles: TStringList;
     FActiveFile: string;
     FBridgeRoot: string;
@@ -60,6 +82,14 @@ type
     FStartButton: TButton;
     FStopButton: TButton;
     FPollTimer: TTimer;
+    FClosing: Boolean;
+    FBusy: Boolean;
+    FStatusInFlight: Boolean;
+    FProfilesBusy: Boolean;
+    FProfilesLoaded: Boolean;
+    FProxyDirty: Boolean;
+    FUpdatingProxy: Boolean;
+    FSettingsStamp: string;
     procedure FormShown(Sender: TObject);
     procedure FormResize(Sender: TObject);
     procedure RefreshClick(Sender: TObject);
@@ -71,21 +101,36 @@ type
     procedure ApplyProxyClick(Sender: TObject);
     procedure PollTimer(Sender: TObject);
     procedure ProfileDblClick(Sender: TObject);
+    procedure ListSelectItem(Sender: TObject; Item: TListItem;
+      Selected: Boolean);
+    procedure ProxyEditChange(Sender: TObject);
     procedure BuildUi;
     procedure ApplyWindowsAppearance;
     procedure AppendLog(const AText: string);
-    procedure RefreshProfiles;
-    procedure RefreshStatus(const AQuiet: Boolean);
+    procedure QueueToMain(const AProc: TProc);
+    procedure SetBusy(const ABusy: Boolean);
+    procedure RefreshStatusAsync(const AQuiet: Boolean);
+    procedure StartProfilesRefresh(const AQuiet: Boolean);
+    procedure SwitchProfileAsync(const AFileName: string);
+    procedure StartStopAsync(const AStart: Boolean);
+    procedure ApplyStatusSnapshot(const ASnapshot: TStatusSnapshot;
+      const AQuiet: Boolean);
+    procedure FillProfileList(const ARows: TArray<TProfileRow>);
+    procedure AdjustProfileColumns;
     procedure SetBridgeState(const AOnline: Boolean; const ADetail: string);
-    procedure SwitchProfile(const AFileName: string);
-    procedure UpdateProxyFromStatus(AJson: TJSONObject);
+    procedure UpdateProxyFromStatus(const AServerProxy: string);
     function ProxyRequestJson: string;
     function DetectWindowsProxy: string;
-    function GetJson(const APath: string): TJSONObject;
-    function PostJson(const APath, AJson: string): TJSONObject;
+    function NewHttpClient(const AResponseTimeout: Integer): THTTPClient;
+    function GetJsonWith(AClient: THTTPClient; const APath: string): TJSONObject;
+    function PostJsonWith(AClient: THTTPClient; const APath,
+      AJson: string): TJSONObject;
     function JsonText(AObject: TJSONObject; const AName: string): string;
     function JsonBool(AObject: TJSONObject; const AName: string): Boolean;
     function FindBridgeRoot: string;
+    function ResolveBridgeUrl: string;
+    function ReadStateListen(const AStatePath: string): string;
+    function ReadServiceStateFilePath: string;
     function RunPowerShellScript(const AScriptPath: string): Cardinal;
   protected
     procedure DoClose(var Action: TCloseAction); override;
@@ -100,7 +145,10 @@ var
 implementation
 
 const
-  BRIDGE_URL = 'http://127.0.0.1:18787';
+  DEFAULT_BRIDGE_URL = 'http://127.0.0.1:18787';
+  STATUS_RESPONSE_TIMEOUT_MS = 4000;
+  ACTION_RESPONSE_TIMEOUT_MS = 30000;
+  LOG_MAX_LINES = 500;
   DWMWA_WINDOW_CORNER_PREFERENCE = 33;
   DWMWCP_ROUND = 2;
 
@@ -120,7 +168,7 @@ begin
   try
     inherited CreateNew(AOwner);
     LStage := '设置窗口属性';
-    Caption := 'Claude Code 模型切换器';
+    Caption := 'Claude Code 模型中心';
     Width := 1020;
     Height := 760;
     Position := poScreenCenter;
@@ -132,13 +180,10 @@ begin
     DoubleBuffered := True;
     Icon.Assign(Application.Icon);
 
-    LStage := '创建 HTTP 客户端';
-    FHttpClient := THTTPClient.Create;
-    FHttpClient.ConnectionTimeout := 2000;
-    FHttpClient.ResponseTimeout := 30000;
     LStage := '创建配置列表';
     FProfileFiles := TStringList.Create;
     FBridgeRoot := FindBridgeRoot;
+    FBridgeUrl := ResolveBridgeUrl;
 
     LStage := '创建界面控件';
     BuildUi;
@@ -155,7 +200,6 @@ end;
 destructor TMainForm.Destroy;
 begin
   FPollTimer.Enabled := False;
-  FHttpClient.Free;
   FProfileFiles.Free;
   inherited;
 end;
@@ -230,14 +274,12 @@ begin
   FRefreshButton.Parent := FTopPanel;
   FRefreshButton.SetBounds(572, 24, 96, 34);
   FRefreshButton.Caption := '刷新配置';
-  FRefreshButton.Anchors := [akTop, akRight];
   FRefreshButton.OnClick := RefreshClick;
 
   FSwitchButton := TButton.Create(Self);
   FSwitchButton.Parent := FTopPanel;
   FSwitchButton.SetBounds(676, 24, 132, 34);
   FSwitchButton.Caption := '切换选中模型';
-  FSwitchButton.Anchors := [akTop, akRight];
   FSwitchButton.Default := True;
   FSwitchButton.OnClick := SwitchClick;
 
@@ -245,22 +287,24 @@ begin
   FStartButton.Parent := FTopPanel;
   FStartButton.SetBounds(816, 24, 86, 34);
   FStartButton.Caption := '启动服务';
-  FStartButton.Anchors := [akTop, akRight];
   FStartButton.OnClick := StartClick;
 
   FStopButton := TButton.Create(Self);
   FStopButton.Parent := FTopPanel;
   FStopButton.SetBounds(910, 24, 86, 34);
   FStopButton.Caption := '停止服务';
-  FStopButton.Anchors := [akTop, akRight];
   FStopButton.OnClick := StopClick;
 
   FStatusBar := TStatusBar.Create(Self);
   FStatusBar.Parent := Self;
   FStatusBar.Align := alBottom;
   FStatusBar.Height := 28;
-  FStatusBar.SimplePanel := True;
-  FStatusBar.SimpleText := '配置目录：%USERPROFILE%\.claude';
+  FStatusBar.SimplePanel := False;
+  FStatusBar.Panels.Add;
+  FStatusBar.Panels.Add;
+  FStatusBar.Panels.Add;
+  FStatusBar.Panels[0].Text := '桥接地址：' + FBridgeUrl;
+  FStatusBar.Panels[1].Text := '配置目录：%USERPROFILE%\.claude';
   FStatusBar.Font.Name := 'Segoe UI';
 
   FContentPanel := TPanel.Create(Self);
@@ -300,28 +344,25 @@ begin
   FProxyEdit := TEdit.Create(Self);
   FProxyEdit.Parent := FProxyPanel;
   FProxyEdit.SetBounds(104, 44, 448, 28);
-  FProxyEdit.Anchors := [akLeft, akTop, akRight];
   FProxyEdit.Font.Name := 'Segoe UI';
   FProxyEdit.TextHint := '例如 http://127.0.0.1:8080';
+  FProxyEdit.OnChange := ProxyEditChange;
 
   FDetectProxyButton := TButton.Create(Self);
   FDetectProxyButton.Parent := FProxyPanel;
   FDetectProxyButton.SetBounds(566, 42, 118, 32);
-  FDetectProxyButton.Anchors := [akTop, akRight];
   FDetectProxyButton.Caption := '检测系统代理';
   FDetectProxyButton.OnClick := DetectProxyClick;
 
   FTestProxyButton := TButton.Create(Self);
   FTestProxyButton.Parent := FProxyPanel;
   FTestProxyButton.SetBounds(692, 42, 100, 32);
-  FTestProxyButton.Anchors := [akTop, akRight];
   FTestProxyButton.Caption := '测试连接';
   FTestProxyButton.OnClick := TestProxyClick;
 
   FApplyProxyButton := TButton.Create(Self);
   FApplyProxyButton.Parent := FProxyPanel;
   FApplyProxyButton.SetBounds(800, 42, 156, 32);
-  FApplyProxyButton.Anchors := [akTop, akRight];
   FApplyProxyButton.Caption := '保存并立即生效';
   FApplyProxyButton.OnClick := ApplyProxyClick;
 
@@ -388,6 +429,7 @@ begin
   FProfileList.HideSelection := False;
   FProfileList.GridLines := False;
   FProfileList.OnDblClick := ProfileDblClick;
+  FProfileList.OnSelectItem := ListSelectItem;
   FProfileList.Font.Name := 'Segoe UI';
   FProfileList.Font.Size := 10;
 
@@ -422,11 +464,9 @@ begin
     FormResize(Self);
     ApplyWindowsAppearance;
     AppendLog('桥接器目录：' + FBridgeRoot);
+    AppendLog('桥接地址：' + FBridgeUrl);
     LStage := '读取桥接器状态';
-    RefreshStatus(True);
-    LStage := '读取模型配置列表';
-    if FStatusLabel.Tag = 1 then
-      RefreshProfiles;
+    RefreshStatusAsync(False);
     LStage := '启动状态轮询';
     FPollTimer.Enabled := True;
   except
@@ -471,6 +511,39 @@ begin
     FProxyEdit.Width :=
       FDetectProxyButton.Left - CONTROL_GAP - FProxyEdit.Left;
   end;
+
+  if Assigned(FStatusBar) then
+  begin
+    FStatusBar.Panels[0].Width := FStatusBar.ClientWidth * 2 div 5;
+    FStatusBar.Panels[1].Width := FStatusBar.ClientWidth * 3 div 10;
+  end;
+
+  AdjustProfileColumns;
+end;
+
+procedure TMainForm.AdjustProfileColumns;
+var
+  LTotal: Integer;
+  LModel: Integer;
+  LUrl: Integer;
+  LProxy: Integer;
+  LRoute: Integer;
+begin
+  if not Assigned(FProfileList) or not FProfileList.HandleAllocated then
+    Exit;
+  LTotal := FProfileList.ClientWidth - GetSystemMetrics(SM_CXVSCROLL) - 4;
+  if LTotal < 500 then
+    Exit;
+  LModel := Max(170, LTotal * 22 div 100);
+  LUrl := Max(230, LTotal * 30 div 100);
+  LProxy := Max(80, LTotal * 10 div 100);
+  LRoute := Max(100, LTotal * 12 div 100);
+  FProfileList.Columns[0].Width := LModel;
+  FProfileList.Columns[1].Width := LUrl;
+  FProfileList.Columns[2].Width := LProxy;
+  FProfileList.Columns[3].Width := LRoute;
+  FProfileList.Columns[4].Width :=
+    Max(140, LTotal - LModel - LUrl - LProxy - LRoute);
 end;
 
 procedure TMainForm.ApplyWindowsAppearance;
@@ -512,6 +585,7 @@ end;
 
 procedure TMainForm.DoClose(var Action: TCloseAction);
 begin
+  FClosing := True;
   FPollTimer.Enabled := False;
   Action := caFree;
   Application.Terminate;
@@ -519,8 +593,36 @@ end;
 
 procedure TMainForm.AppendLog(const AText: string);
 begin
-  FLogMemo.Lines.Add(FormatDateTime('hh:nn:ss', Now) + '  ' + AText);
-  FLogMemo.SelStart := Length(FLogMemo.Text);
+  FLogMemo.Lines.BeginUpdate;
+  try
+    FLogMemo.Lines.Add(FormatDateTime('hh:nn:ss', Now) + '  ' + AText);
+    while FLogMemo.Lines.Count > LOG_MAX_LINES do
+      FLogMemo.Lines.Delete(0);
+    FLogMemo.SelStart := Length(FLogMemo.Text);
+    FLogMemo.Perform(EM_SCROLLCARET, 0, 0);
+  finally
+    FLogMemo.Lines.EndUpdate;
+  end;
+end;
+
+procedure TMainForm.QueueToMain(const AProc: TProc);
+var
+  LQueued: TThreadProcedure;
+begin
+  LQueued :=
+    procedure
+    begin
+      if not FClosing then
+        AProc();
+    end;
+  TThread.Queue(nil, LQueued);
+end;
+
+function TMainForm.NewHttpClient(const AResponseTimeout: Integer): THTTPClient;
+begin
+  Result := THTTPClient.Create;
+  Result.ConnectionTimeout := 2000;
+  Result.ResponseTimeout := AResponseTimeout;
 end;
 
 function TMainForm.JsonText(AObject: TJSONObject; const AName: string): string;
@@ -541,13 +643,163 @@ begin
   Result := SameText(JsonText(AObject, AName), 'true');
 end;
 
-procedure TMainForm.UpdateProxyFromStatus(AJson: TJSONObject);
+function TMainForm.GetJsonWith(AClient: THTTPClient; const APath: string): TJSONObject;
 var
-  LProxy: string;
+  LResponse: IHTTPResponse;
+  LValue: TJSONValue;
 begin
-  LProxy := JsonText(AJson, 'gemini_proxy');
-  if not FProxyEdit.Focused then
-    FProxyEdit.Text := LProxy;
+  LResponse := AClient.Get(FBridgeUrl + APath);
+  if LResponse.StatusCode <> 200 then
+    raise Exception.CreateFmt('HTTP %d: %s', [
+      LResponse.StatusCode,
+      LResponse.ContentAsString(TEncoding.UTF8)
+    ]);
+  LValue := TJSONObject.ParseJSONValue(
+    LResponse.ContentAsString(TEncoding.UTF8)
+  );
+  if not (LValue is TJSONObject) then
+  begin
+    LValue.Free;
+    raise Exception.Create('桥接器返回了无效 JSON');
+  end;
+  Result := TJSONObject(LValue);
+end;
+
+function TMainForm.PostJsonWith(AClient: THTTPClient; const APath,
+  AJson: string): TJSONObject;
+var
+  LHeaders: TNetHeaders;
+  LResponse: IHTTPResponse;
+  LStream: TStringStream;
+  LValue: TJSONValue;
+begin
+  SetLength(LHeaders, 1);
+  LHeaders[0].Name := 'Content-Type';
+  LHeaders[0].Value := 'application/json';
+  LStream := TStringStream.Create(AJson, TEncoding.UTF8);
+  try
+    LResponse := AClient.Post(
+      FBridgeUrl + APath,
+      LStream,
+      nil,
+      LHeaders
+    );
+  finally
+    LStream.Free;
+  end;
+  if LResponse.StatusCode <> 200 then
+    raise Exception.CreateFmt('HTTP %d: %s', [
+      LResponse.StatusCode,
+      LResponse.ContentAsString(TEncoding.UTF8)
+    ]);
+  LValue := TJSONObject.ParseJSONValue(
+    LResponse.ContentAsString(TEncoding.UTF8)
+  );
+  if not (LValue is TJSONObject) then
+  begin
+    LValue.Free;
+    raise Exception.Create('桥接器返回了无效 JSON');
+  end;
+  Result := TJSONObject(LValue);
+end;
+
+function TMainForm.ReadStateListen(const AStatePath: string): string;
+var
+  LValue: TJSONValue;
+begin
+  Result := '';
+  if (AStatePath = '') or not FileExists(AStatePath) then
+    Exit;
+  LValue := TJSONObject.ParseJSONValue(TFile.ReadAllText(AStatePath));
+  if LValue is TJSONObject then
+    Result := JsonText(TJSONObject(LValue), 'listen');
+  LValue.Free;
+  if Result <> '' then
+    Result := 'http://' + Result;
+end;
+
+function TMainForm.ReadServiceStateFilePath: string;
+var
+  LKey: HKEY;
+  LValueType: DWORD;
+  LSize: DWORD;
+  LBuffer: TBytes;
+  LText: string;
+  LPart: string;
+begin
+  Result := '';
+  if RegOpenKeyEx(
+    HKEY_LOCAL_MACHINE,
+    'SYSTEM\CurrentControlSet\Services\ClaudeCodeBridge',
+    0,
+    KEY_READ,
+    LKey
+  ) <> ERROR_SUCCESS then
+    Exit;
+  try
+    LSize := 0;
+    if RegQueryValueEx(LKey, 'Environment', nil, @LValueType, nil, @LSize) <>
+      ERROR_SUCCESS then
+      Exit;
+    if (LValueType <> REG_MULTI_SZ) or (LSize = 0) then
+      Exit;
+    SetLength(LBuffer, LSize);
+    if RegQueryValueEx(LKey, 'Environment', nil, @LValueType, @LBuffer[0],
+      @LSize) <> ERROR_SUCCESS then
+      Exit;
+    LText := TEncoding.Unicode.GetString(LBuffer);
+    for LPart in LText.Split([#0]) do
+      if LPart.StartsWith('GEMINI_BRIDGE_STATE_FILE=') then
+        Exit(LPart.Substring(Length('GEMINI_BRIDGE_STATE_FILE=')));
+  finally
+    RegCloseKey(LKey);
+  end;
+end;
+
+function TMainForm.ResolveBridgeUrl: string;
+var
+  LStatePath: string;
+  LListenUrl: string;
+begin
+  Result := DEFAULT_BRIDGE_URL;
+  try
+    LStatePath := GetEnvironmentVariable('GEMINI_BRIDGE_STATE_FILE');
+    if LStatePath = '' then
+      LStatePath := FBridgeRoot + '\bridge-state.json';
+    LListenUrl := ReadStateListen(LStatePath);
+    if (LListenUrl = '') and
+       (not SameText(LStatePath, FBridgeRoot + '\bridge-state.json')) then
+      Exit;
+    if LListenUrl = '' then
+      LListenUrl := ReadStateListen(ReadServiceStateFilePath);
+    if LListenUrl <> '' then
+      Result := LListenUrl;
+  except
+    Result := DEFAULT_BRIDGE_URL;
+  end;
+end;
+
+procedure TMainForm.UpdateProxyFromStatus(const AServerProxy: string);
+begin
+  if SameText(Trim(FProxyEdit.Text), Trim(AServerProxy)) then
+  begin
+    FProxyDirty := False;
+    Exit;
+  end;
+  if FProxyDirty or FProxyEdit.Focused then
+    Exit;
+  FUpdatingProxy := True;
+  try
+    FProxyEdit.Text := AServerProxy;
+  finally
+    FUpdatingProxy := False;
+  end;
+end;
+
+procedure TMainForm.ProxyEditChange(Sender: TObject);
+begin
+  if not FUpdatingProxy then
+    FProxyDirty := True;
 end;
 
 function TMainForm.ProxyRequestJson: string;
@@ -623,63 +875,25 @@ begin
     Result := 'http://' + Result;
 end;
 
-function TMainForm.GetJson(const APath: string): TJSONObject;
-var
-  LResponse: IHTTPResponse;
-  LValue: TJSONValue;
+procedure TMainForm.SetBusy(const ABusy: Boolean);
 begin
-  LResponse := FHttpClient.Get(BRIDGE_URL + APath);
-  if LResponse.StatusCode <> 200 then
-    raise Exception.CreateFmt('HTTP %d: %s', [
-      LResponse.StatusCode,
-      LResponse.ContentAsString(TEncoding.UTF8)
-    ]);
-  LValue := TJSONObject.ParseJSONValue(
-    LResponse.ContentAsString(TEncoding.UTF8)
-  );
-  if not (LValue is TJSONObject) then
+  FBusy := ABusy;
+  if ABusy then
   begin
-    LValue.Free;
-    raise Exception.Create('桥接器返回了无效 JSON');
-  end;
-  Result := TJSONObject(LValue);
-end;
-
-function TMainForm.PostJson(const APath, AJson: string): TJSONObject;
-var
-  LHeaders: TNetHeaders;
-  LResponse: IHTTPResponse;
-  LStream: TStringStream;
-  LValue: TJSONValue;
-begin
-  SetLength(LHeaders, 1);
-  LHeaders[0].Name := 'Content-Type';
-  LHeaders[0].Value := 'application/json';
-  LStream := TStringStream.Create(AJson, TEncoding.UTF8);
-  try
-    LResponse := FHttpClient.Post(
-      BRIDGE_URL + APath,
-      LStream,
-      nil,
-      LHeaders
-    );
-  finally
-    LStream.Free;
-  end;
-  if LResponse.StatusCode <> 200 then
-    raise Exception.CreateFmt('HTTP %d: %s', [
-      LResponse.StatusCode,
-      LResponse.ContentAsString(TEncoding.UTF8)
-    ]);
-  LValue := TJSONObject.ParseJSONValue(
-    LResponse.ContentAsString(TEncoding.UTF8)
-  );
-  if not (LValue is TJSONObject) then
+    FRefreshButton.Enabled := False;
+    FSwitchButton.Enabled := False;
+    FStartButton.Enabled := False;
+    FStopButton.Enabled := False;
+    FTestProxyButton.Enabled := False;
+    FApplyProxyButton.Enabled := False;
+    Screen.Cursor := crHourGlass;
+  end
+  else
   begin
-    LValue.Free;
-    raise Exception.Create('桥接器返回了无效 JSON');
+    Screen.Cursor := crDefault;
+    FDetectProxyButton.Enabled := True;
+    RefreshStatusAsync(True);
   end;
-  Result := TJSONObject(LValue);
 end;
 
 procedure TMainForm.SetBridgeState(
@@ -714,176 +928,325 @@ begin
     FTestProxyButton.Enabled := False;
     FApplyProxyButton.Enabled := False;
   end;
-  FStatusBar.SimpleText := ADetail;
+  if FBusy then
+  begin
+    FRefreshButton.Enabled := False;
+    FSwitchButton.Enabled := False;
+    FStartButton.Enabled := False;
+    FStopButton.Enabled := False;
+    FTestProxyButton.Enabled := False;
+    FApplyProxyButton.Enabled := False;
+  end;
+  FStatusBar.Panels[0].Text := ADetail;
 end;
 
-procedure TMainForm.RefreshStatus(const AQuiet: Boolean);
-var
-  LJson: TJSONObject;
-  LProfile: TJSONObject;
-  LModel: string;
-  LFileName: string;
+procedure TMainForm.RefreshStatusAsync(const AQuiet: Boolean);
 begin
+  if FClosing or FStatusInFlight then
+    Exit;
+  FStatusInFlight := True;
+  TThread.CreateAnonymousThread(
+    procedure
+    var
+      LClient: THTTPClient;
+      LJson: TJSONObject;
+      LProfile: TJSONObject;
+      LSnapshot: TStatusSnapshot;
+    begin
+      LSnapshot := Default(TStatusSnapshot);
+      try
+        LClient := NewHttpClient(STATUS_RESPONSE_TIMEOUT_MS);
+        try
+          LJson := GetJsonWith(LClient, '/admin/status');
+          try
+            LSnapshot.Online := True;
+            if LJson.Values['active_profile'] is TJSONObject then
+            begin
+              LProfile := TJSONObject(LJson.Values['active_profile']);
+              LSnapshot.HasProfile := True;
+              LSnapshot.Model := JsonText(LProfile, 'model');
+              LSnapshot.FileName := JsonText(LProfile, 'file');
+            end;
+            LSnapshot.Proxy := JsonText(LJson, 'gemini_proxy');
+            LSnapshot.Stamp := JsonText(LJson, 'settings_stamp');
+            LSnapshot.SettingsDir := JsonText(LJson, 'settings_dir');
+          finally
+            LJson.Free;
+          end;
+        finally
+          LClient.Free;
+        end;
+      except
+        on E: Exception do
+        begin
+          LSnapshot.Online := False;
+          LSnapshot.Detail := E.Message;
+        end;
+      end;
+      QueueToMain(
+        procedure
+        begin
+          FStatusInFlight := False;
+          ApplyStatusSnapshot(LSnapshot, AQuiet);
+        end);
+    end).Start;
+end;
+
+procedure TMainForm.ApplyStatusSnapshot(
+  const ASnapshot: TStatusSnapshot;
+  const AQuiet: Boolean);
+var
+  LStampChanged: Boolean;
+begin
+  if ASnapshot.Online then
+  begin
+    UpdateProxyFromStatus(ASnapshot.Proxy);
+    if ASnapshot.HasProfile then
+    begin
+      FActiveFile := ASnapshot.FileName;
+      FCurrentModelLabel.Caption := '当前模型：' + ASnapshot.Model;
+      SetBridgeState(True, '当前配置：' + ASnapshot.FileName);
+    end
+    else
+    begin
+      FActiveFile := '';
+      FCurrentModelLabel.Caption := '当前模型：暂无可用配置';
+      SetBridgeState(
+        True,
+        '桥接器运行中，请添加 settings - *.json 模型配置'
+      );
+      FSwitchButton.Enabled := False;
+    end;
+    if ASnapshot.SettingsDir <> '' then
+      FStatusBar.Panels[1].Text := '配置目录：' + ASnapshot.SettingsDir;
+    LStampChanged :=
+      (ASnapshot.Stamp <> '') and (ASnapshot.Stamp <> FSettingsStamp);
+    if LStampChanged then
+    begin
+      FSettingsStamp := ASnapshot.Stamp;
+      StartProfilesRefresh(FProfilesLoaded);
+    end;
+  end
+  else
+  begin
+    SetBridgeState(False, ASnapshot.Detail);
+    if not AQuiet then
+      AppendLog('状态检查失败：' + ASnapshot.Detail);
+  end;
+end;
+
+procedure TMainForm.StartProfilesRefresh(const AQuiet: Boolean);
+var
+  LEditProxy: string;
+begin
+  if FClosing or FProfilesBusy then
+    Exit;
+  FProfilesBusy := True;
+  LEditProxy := Trim(FProxyEdit.Text);
+  if not AQuiet then
+    SetBusy(True);
+  TThread.CreateAnonymousThread(
+    procedure
+    var
+      LClient: THTTPClient;
+      LReload: TJSONObject;
+      LJson: TJSONObject;
+      LArray: TJSONArray;
+      LProfile: TJSONObject;
+      LRows: TArray<TProfileRow>;
+      LRow: TProfileRow;
+      LStamp: string;
+      LError: string;
+      I: Integer;
+    begin
+      LError := '';
+      try
+        LClient := NewHttpClient(ACTION_RESPONSE_TIMEOUT_MS);
+        try
+          LReload := PostJsonWith(LClient, '/admin/reload-profiles', '{}');
+          LReload.Free;
+          LJson := GetJsonWith(LClient, '/admin/profiles');
+          try
+            LArray := LJson.Values['profiles'] as TJSONArray;
+            SetLength(LRows, LArray.Count);
+            for I := 0 to LArray.Count - 1 do
+            begin
+              LProfile := LArray.Items[I] as TJSONObject;
+              LRow := Default(TProfileRow);
+              LRow.Model := JsonText(LProfile, 'model');
+              LRow.FileName := JsonText(LProfile, 'file');
+              LRow.BaseUrl := JsonText(LProfile, 'base_url');
+              LRow.Proxy := JsonText(LProfile, 'proxy');
+              LRow.Active := JsonBool(LProfile, 'active');
+              if JsonBool(LProfile, 'local_gemini') then
+              begin
+                LRow.Route := 'Gemini 转换';
+                LRow.Proxy := LEditProxy;
+              end
+              else
+                LRow.Route := 'Anthropic 直通';
+              if LRow.Proxy = '' then
+                LRow.Proxy := '(直连)';
+              LRows[I] := LRow;
+            end;
+            LStamp := JsonText(LJson, 'settings_stamp');
+          finally
+            LJson.Free;
+          end;
+        finally
+          LClient.Free;
+        end;
+      except
+        on E: Exception do
+          LError := E.Message;
+      end;
+      QueueToMain(
+        procedure
+        begin
+          FProfilesBusy := False;
+          if not AQuiet then
+            SetBusy(False);
+          if LError <> '' then
+          begin
+            AppendLog('刷新失败：' + LError);
+            if not AQuiet then
+              MessageDlg(LError, mtError, [mbOK], 0);
+          end
+          else
+          begin
+            FillProfileList(LRows);
+            FProfilesLoaded := True;
+            FSettingsStamp := LStamp;
+            AppendLog(Format('已加载 %d 个模型配置。', [Length(LRows)]));
+          end;
+        end);
+    end).Start;
+end;
+
+procedure TMainForm.FillProfileList(const ARows: TArray<TProfileRow>);
+var
+  I: Integer;
+  LItem: TListItem;
+  LRow: TProfileRow;
+begin
+  FProfileList.Items.BeginUpdate;
   try
-    LJson := GetJson('/admin/status');
-    try
-      UpdateProxyFromStatus(LJson);
-      LProfile := nil;
-      if LJson.Values['active_profile'] is TJSONObject then
-        LProfile := TJSONObject(LJson.Values['active_profile']);
-      if Assigned(LProfile) then
+    FProfileList.Items.Clear;
+    FProfileFiles.Clear;
+    for I := 0 to High(ARows) do
+    begin
+      LRow := ARows[I];
+      LItem := FProfileList.Items.Add;
+      if LRow.Active then
       begin
-        LModel := JsonText(LProfile, 'model');
-        LFileName := JsonText(LProfile, 'file');
-        FActiveFile := LFileName;
-        FCurrentModelLabel.Caption := '当前模型：' + LModel;
-        SetBridgeState(True, '当前配置：' + LFileName);
+        LItem.Caption := '✓  ' + LRow.Model;
+        LItem.Selected := True;
+        LItem.Focused := True;
+        FActiveFile := LRow.FileName;
       end
       else
-      begin
-        FActiveFile := '';
-        FCurrentModelLabel.Caption := '当前模型：暂无可用配置';
-        SetBridgeState(True, '桥接器运行中，请添加 settings - *.json 模型配置');
-        FSwitchButton.Enabled := False;
-      end;
-    finally
-      LJson.Free;
+        LItem.Caption := LRow.Model;
+      LItem.SubItems.Add(LRow.BaseUrl);
+      LItem.SubItems.Add(LRow.Proxy);
+      LItem.SubItems.Add(LRow.Route);
+      LItem.SubItems.Add(LRow.FileName);
+      FProfileFiles.Add(LRow.FileName);
     end;
-  except
-    on E: Exception do
+  finally
+    FProfileList.Items.EndUpdate;
+  end;
+  AdjustProfileColumns;
+end;
+
+procedure TMainForm.ListSelectItem(Sender: TObject; Item: TListItem;
+  Selected: Boolean);
+begin
+  if Selected and (Item.SubItems.Count >= 4) then
+    FStatusBar.Panels[2].Text := '选中：' + Item.SubItems[3];
+end;
+
+procedure TMainForm.SwitchProfileAsync(const AFileName: string);
+begin
+  if FClosing then
+    Exit;
+  SetBusy(True);
+  TThread.CreateAnonymousThread(
+    procedure
+    var
+      LClient: THTTPClient;
+      LRequest: TJSONObject;
+      LResult: TJSONObject;
+      LError: string;
     begin
-      SetBridgeState(False, E.Message);
-      if not AQuiet then
-        AppendLog('状态检查失败：' + E.Message);
-    end;
-  end;
-end;
-
-procedure TMainForm.RefreshProfiles;
-var
-  LReload: TJSONObject;
-  LJson: TJSONObject;
-  LArray: TJSONArray;
-  LProfile: TJSONObject;
-  LItem: TListItem;
-  LModel: string;
-  LFileName: string;
-  LBaseUrl: string;
-  LProxy: string;
-  LRoute: string;
-  I: Integer;
-begin
-  LReload := PostJson('/admin/reload-profiles', '{}');
-  LReload.Free;
-  LJson := GetJson('/admin/profiles');
-  try
-    FProfileList.Items.BeginUpdate;
-    try
-      FProfileList.Items.Clear;
-      FProfileFiles.Clear;
-      LArray := LJson.Values['profiles'] as TJSONArray;
-      for I := 0 to LArray.Count - 1 do
-      begin
-        LProfile := LArray.Items[I] as TJSONObject;
-        LModel := JsonText(LProfile, 'model');
-        LFileName := JsonText(LProfile, 'file');
-        LBaseUrl := JsonText(LProfile, 'base_url');
-        LProxy := JsonText(LProfile, 'proxy');
-        if JsonBool(LProfile, 'local_gemini') then
-        begin
-          LRoute := 'Gemini 转换';
-          LProxy := Trim(FProxyEdit.Text);
-        end
-        else
-          LRoute := 'Anthropic 直通';
-        if LProxy = '' then
-          LProxy := '(直连)';
-
-        LItem := FProfileList.Items.Add;
-        if JsonBool(LProfile, 'active') then
-        begin
-          LItem.Caption := '✓  ' + LModel;
-          LItem.Selected := True;
-          LItem.Focused := True;
-          FActiveFile := LFileName;
-        end
-        else
-          LItem.Caption := LModel;
-        LItem.SubItems.Add(LBaseUrl);
-        LItem.SubItems.Add(LProxy);
-        LItem.SubItems.Add(LRoute);
-        LItem.SubItems.Add(LFileName);
-        FProfileFiles.Add(LFileName);
+      LError := '';
+      try
+        LClient := NewHttpClient(ACTION_RESPONSE_TIMEOUT_MS);
+        try
+          LRequest := TJSONObject.Create;
+          try
+            LRequest.AddPair('file', AFileName);
+            LResult := PostJsonWith(
+              LClient,
+              '/admin/active-profile',
+              LRequest.ToJSON
+            );
+          finally
+            LRequest.Free;
+          end;
+          LResult.Free;
+        finally
+          LClient.Free;
+        end;
+      except
+        on E: Exception do
+          LError := E.Message;
       end;
-    finally
-      FProfileList.Items.EndUpdate;
-    end;
-    AppendLog(Format('已加载 %d 个模型配置。', [FProfileFiles.Count]));
-  finally
-    LJson.Free;
-  end;
-  RefreshStatus(True);
-end;
-
-procedure TMainForm.SwitchProfile(const AFileName: string);
-var
-  LRequest: TJSONObject;
-  LResult: TJSONObject;
-begin
-  LRequest := TJSONObject.Create;
-  try
-    LRequest.AddPair('file', AFileName);
-    LResult := PostJson('/admin/active-profile', LRequest.ToJSON);
-    try
-      AppendLog('模型已切换：' + AFileName);
-    finally
-      LResult.Free;
-    end;
-  finally
-    LRequest.Free;
-  end;
-  RefreshProfiles;
+      QueueToMain(
+        procedure
+        begin
+          SetBusy(False);
+          if LError <> '' then
+          begin
+            AppendLog('切换失败：' + LError);
+            MessageDlg(LError, mtError, [mbOK], 0);
+          end
+          else
+          begin
+            AppendLog('模型已切换：' + AFileName);
+            StartProfilesRefresh(True);
+          end;
+        end);
+    end).Start;
 end;
 
 procedure TMainForm.RefreshClick(Sender: TObject);
 begin
-  try
-    RefreshProfiles;
-  except
-    on E: Exception do
-    begin
-      AppendLog('刷新失败：' + E.Message);
-      MessageDlg(E.Message, mtError, [mbOK], 0);
-    end;
-  end;
+  StartProfilesRefresh(False);
 end;
 
 procedure TMainForm.SwitchClick(Sender: TObject);
-var
-  LIndex: Integer;
 begin
   if not Assigned(FProfileList.Selected) then
   begin
     MessageDlg('请先选择一个模型配置。', mtInformation, [mbOK], 0);
     Exit;
   end;
-  LIndex := FProfileList.Selected.Index;
-  if (LIndex < 0) or (LIndex >= FProfileFiles.Count) then
+  if (FProfileList.Selected.Index < 0) or
+     (FProfileList.Selected.Index >= FProfileFiles.Count) then
     Exit;
-  try
-    SwitchProfile(FProfileFiles[LIndex]);
-  except
-    on E: Exception do
-    begin
-      AppendLog('切换失败：' + E.Message);
-      MessageDlg(E.Message, mtError, [mbOK], 0);
-    end;
-  end;
+  SwitchProfileAsync(FProfileFiles[FProfileList.Selected.Index]);
 end;
 
 procedure TMainForm.ProfileDblClick(Sender: TObject);
+var
+  LPos: TPoint;
+  LItem: TListItem;
 begin
-  SwitchClick(Sender);
+  LPos := FProfileList.ScreenToClient(Mouse.CursorPos);
+  LItem := FProfileList.GetItemAt(LPos.X, LPos.Y);
+  if (LItem <> nil) and (LItem.Index >= 0) and
+     (LItem.Index < FProfileFiles.Count) then
+    SwitchProfileAsync(FProfileFiles[LItem.Index]);
 end;
 
 function TMainForm.FindBridgeRoot: string;
@@ -944,53 +1307,66 @@ begin
   end;
 end;
 
-procedure TMainForm.StartClick(Sender: TObject);
-var
-  LExitCode: Cardinal;
+procedure TMainForm.StartStopAsync(const AStart: Boolean);
 begin
-  FPollTimer.Enabled := False;
-  try
-    LExitCode := RunPowerShellScript(
-      FBridgeRoot + '\scripts\start-bridge.ps1'
-    );
-    if LExitCode <> 0 then
-      raise Exception.CreateFmt('启动脚本返回错误码 %d', [LExitCode]);
-    AppendLog('桥接器已启动。');
-    Sleep(500);
-    RefreshStatus(False);
-    if FStatusLabel.Tag = 1 then
-      RefreshProfiles;
-  except
-    on E: Exception do
+  if FClosing then
+    Exit;
+  SetBusy(True);
+  TThread.CreateAnonymousThread(
+    procedure
+    var
+      LExitCode: Cardinal;
+      LError: string;
+      LScript: string;
+      LLogOk: string;
+      LLogFail: string;
     begin
-      AppendLog('启动失败：' + E.Message);
-      MessageDlg(E.Message, mtError, [mbOK], 0);
-    end;
-  end;
-  FPollTimer.Enabled := True;
+      LError := '';
+      if AStart then
+      begin
+        LScript := FBridgeRoot + '\scripts\start-bridge.ps1';
+        LLogOk := '桥接器已启动。';
+        LLogFail := '启动失败：';
+      end
+      else
+      begin
+        LScript := FBridgeRoot + '\scripts\stop-bridge.ps1';
+        LLogOk := '桥接器已停止。';
+        LLogFail := '停止失败：';
+      end;
+      try
+        LExitCode := RunPowerShellScript(LScript);
+        if LExitCode <> 0 then
+          raise Exception.CreateFmt('脚本返回错误码 %d', [LExitCode]);
+        if AStart then
+          Sleep(500);
+      except
+        on E: Exception do
+          LError := E.Message;
+      end;
+      QueueToMain(
+        procedure
+        begin
+          SetBusy(False);
+          if LError <> '' then
+          begin
+            AppendLog(LLogFail + LError);
+            MessageDlg(LError, mtError, [mbOK], 0);
+          end
+          else
+            AppendLog(LLogOk);
+        end);
+    end).Start;
+end;
+
+procedure TMainForm.StartClick(Sender: TObject);
+begin
+  StartStopAsync(True);
 end;
 
 procedure TMainForm.StopClick(Sender: TObject);
-var
-  LExitCode: Cardinal;
 begin
-  FPollTimer.Enabled := False;
-  try
-    LExitCode := RunPowerShellScript(
-      FBridgeRoot + '\scripts\stop-bridge.ps1'
-    );
-    if LExitCode <> 0 then
-      raise Exception.CreateFmt('停止脚本返回错误码 %d', [LExitCode]);
-    AppendLog('桥接器已停止。');
-    SetBridgeState(False, '桥接器已停止');
-  except
-    on E: Exception do
-    begin
-      AppendLog('停止失败：' + E.Message);
-      MessageDlg(E.Message, mtError, [mbOK], 0);
-    end;
-  end;
-  FPollTimer.Enabled := True;
+  StartStopAsync(False);
 end;
 
 procedure TMainForm.DetectProxyClick(Sender: TObject);
@@ -1015,60 +1391,103 @@ end;
 
 procedure TMainForm.TestProxyClick(Sender: TObject);
 var
-  LResult: TJSONObject;
+  LBody: string;
 begin
+  LBody := ProxyRequestJson;
   FTestProxyButton.Enabled := False;
-  try
-    LResult := PostJson('/admin/gemini-proxy/test', ProxyRequestJson);
-    try
-      AppendLog(
-        'Gemini 连接测试成功，模型：' + JsonText(LResult, 'model')
-      );
-      MessageDlg('Gemini 连接测试成功。', mtInformation, [mbOK], 0);
-    finally
-      LResult.Free;
-    end;
-  except
-    on E: Exception do
+  TThread.CreateAnonymousThread(
+    procedure
+    var
+      LClient: THTTPClient;
+      LResult: TJSONObject;
+      LModel: string;
+      LError: string;
     begin
-      AppendLog('Gemini 连接测试失败：' + E.Message);
-      MessageDlg(E.Message, mtError, [mbOK], 0);
-    end;
-  end;
-  FTestProxyButton.Enabled := FStatusLabel.Tag = 1;
+      LError := '';
+      try
+        LClient := NewHttpClient(ACTION_RESPONSE_TIMEOUT_MS);
+        try
+          LResult := PostJsonWith(LClient, '/admin/gemini-proxy/test', LBody);
+          LModel := JsonText(LResult, 'model');
+          LResult.Free;
+        finally
+          LClient.Free;
+        end;
+      except
+        on E: Exception do
+          LError := E.Message;
+      end;
+      QueueToMain(
+        procedure
+        begin
+          FTestProxyButton.Enabled := (not FBusy) and (FStatusLabel.Tag = 1);
+          if LError <> '' then
+          begin
+            AppendLog('Gemini 连接测试失败：' + LError);
+            MessageDlg(LError, mtError, [mbOK], 0);
+          end
+          else
+          begin
+            AppendLog('Gemini 连接测试成功，模型：' + LModel);
+            MessageDlg('Gemini 连接测试成功。', mtInformation, [mbOK], 0);
+          end;
+        end);
+    end).Start;
 end;
 
 procedure TMainForm.ApplyProxyClick(Sender: TObject);
 var
-  LResult: TJSONObject;
-  LProxy: string;
+  LBody: string;
 begin
+  LBody := ProxyRequestJson;
   FApplyProxyButton.Enabled := False;
-  try
-    LResult := PostJson('/admin/gemini-proxy', ProxyRequestJson);
-    try
-      LProxy := JsonText(LResult, 'gemini_proxy');
-      if LProxy = '' then
-        AppendLog('Gemini 已切换为直连。')
-      else
-        AppendLog('Gemini 代理已保存并立即生效：' + LProxy);
-    finally
-      LResult.Free;
-    end;
-    RefreshProfiles;
-  except
-    on E: Exception do
+  TThread.CreateAnonymousThread(
+    procedure
+    var
+      LClient: THTTPClient;
+      LResult: TJSONObject;
+      LProxy: string;
+      LError: string;
     begin
-      AppendLog('保存 Gemini 代理失败：' + E.Message);
-      MessageDlg(E.Message, mtError, [mbOK], 0);
-    end;
-  end;
-  FApplyProxyButton.Enabled := FStatusLabel.Tag = 1;
+      LError := '';
+      try
+        LClient := NewHttpClient(ACTION_RESPONSE_TIMEOUT_MS);
+        try
+          LResult := PostJsonWith(LClient, '/admin/gemini-proxy', LBody);
+          LProxy := JsonText(LResult, 'gemini_proxy');
+          LResult.Free;
+        finally
+          LClient.Free;
+        end;
+      except
+        on E: Exception do
+          LError := E.Message;
+      end;
+      QueueToMain(
+        procedure
+        begin
+          FApplyProxyButton.Enabled := (not FBusy) and (FStatusLabel.Tag = 1);
+          if LError <> '' then
+          begin
+            AppendLog('保存 Gemini 代理失败：' + LError);
+            MessageDlg(LError, mtError, [mbOK], 0);
+          end
+          else
+          begin
+            FProxyDirty := False;
+            if LProxy = '' then
+              AppendLog('Gemini 已切换为直连。')
+            else
+              AppendLog('Gemini 代理已保存并立即生效：' + LProxy);
+            StartProfilesRefresh(True);
+          end;
+        end);
+    end).Start;
 end;
 
 procedure TMainForm.PollTimer(Sender: TObject);
 begin
-  RefreshStatus(True);
+  RefreshStatusAsync(True);
 end;
 
 end.
