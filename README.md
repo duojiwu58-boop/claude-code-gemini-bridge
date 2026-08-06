@@ -116,6 +116,8 @@ After installation, open **Claude Code 模型中心**, select or double-click a 
 - `GEMINI_BRIDGE_STATE_FILE` (optional model-switcher state file)
 - `GEMINI_BRIDGE_LOG_DIR` (Windows service log directory)
 - `CLAUDE_SETTINGS_DIR` (Claude provider profile directory)
+- `CLAUDE_BRIDGE_UPSTREAM_IDENTITY` (optional per-profile model identity shown to the upstream model)
+- `CLAUDE_BRIDGE_IDENTITY_OVERRIDE` (optional per-profile switch; defaults to `true`)
 
 ### Run from Source
 

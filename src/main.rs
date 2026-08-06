@@ -40,6 +40,8 @@ use uuid::Uuid;
 const THOUGHT_SIGNATURE_CAPACITY: usize = 4096;
 const THOUGHT_SIGNATURE_EVICTION_BATCH: usize = 512;
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
+const BRIDGE_IDENTITY_MARKER: &str = "<bridge_runtime_identity>";
+const MAX_UPSTREAM_IDENTITY_CHARS: usize = 200;
 
 type ThoughtSignatureCache = RwLock<IndexMap<String, String>>;
 
@@ -47,6 +49,8 @@ type ThoughtSignatureCache = RwLock<IndexMap<String, String>>;
 struct ProviderProfile {
     file_name: String,
     model: String,
+    upstream_identity: Option<String>,
+    identity_override: bool,
     base_url: String,
     auth_token: Option<String>,
     api_key: Option<String>,
@@ -355,6 +359,10 @@ fn load_provider_profiles(
         let model = get_env("ANTHROPIC_MODEL")
             .or_else(|| get_env("ANTHROPIC_DEFAULT_SONNET_MODEL"))
             .ok_or_else(|| format!("Profile '{file_name}' has no model"))?;
+        let upstream_identity = get_env("CLAUDE_BRIDGE_UPSTREAM_IDENTITY");
+        let identity_override = get_env("CLAUDE_BRIDGE_IDENTITY_OVERRIDE")
+            .map(|value| identity_override_enabled(&value))
+            .unwrap_or(true);
         let auth_token = get_env("ANTHROPIC_AUTH_TOKEN");
         let api_key = get_env("ANTHROPIC_API_KEY");
         if auth_token.is_none() && api_key.is_none() {
@@ -381,6 +389,8 @@ fn load_provider_profiles(
         profiles.push(ProviderProfile {
             file_name,
             model,
+            upstream_identity,
+            identity_override,
             base_url,
             auth_token,
             api_key,
@@ -395,6 +405,13 @@ fn load_provider_profiles(
 
 fn normalize_base_url(value: &str) -> String {
     value.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
+fn identity_override_enabled(value: &str) -> bool {
+    !matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
 }
 
 fn build_gemini_client(
@@ -493,6 +510,8 @@ fn provider_profile_json(profile: &ProviderProfile, active_file: &str) -> Value 
     json!({
         "file": profile.file_name,
         "model": profile.model,
+        "upstream_identity": profile.upstream_identity,
+        "identity_override": profile.identity_override,
         "base_url": profile.base_url,
         "proxy": profile.proxy_url,
         "local_gemini": profile.local_gemini,
@@ -949,7 +968,7 @@ async fn responses(
 async fn anthropic_messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(request): Json<Value>,
+    Json(mut request): Json<Value>,
 ) -> Response {
     // Claude Code only requires a non-empty local gateway token. When the
     // bridge was started with GEMINI_API_KEY, keep the real Google key inside
@@ -974,6 +993,11 @@ async fn anthropic_messages(
             "No active provider profile",
         );
     };
+    if let Some(identity) = upstream_identity_label(&active_profile, &state.model) {
+        if let Err(message) = append_bridge_identity(&mut request, &identity) {
+            return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message);
+        }
+    }
     if !active_profile.local_gemini {
         return forward_anthropic_profile(active_profile, &headers, request).await;
     }
@@ -1691,7 +1715,7 @@ fn anthropic_stream_error_event(message: &str) -> Event {
 async fn anthropic_count_tokens(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(request): Json<Value>,
+    Json(mut request): Json<Value>,
 ) -> Response {
     let has_api_key = bearer_token(&headers)
         .or_else(|| state.fallback_api_key.clone())
@@ -1702,6 +1726,14 @@ async fn anthropic_count_tokens(
             "authentication_error",
             "Missing API key",
         );
+    }
+
+    if let Some(profile) = active_provider_profile(&state) {
+        if let Some(identity) = upstream_identity_label(&profile, &state.model) {
+            if let Err(message) = append_bridge_identity(&mut request, &identity) {
+                return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message);
+            }
+        }
     }
 
     let input_tokens = estimate_anthropic_input_tokens(&request);
@@ -1816,6 +1848,65 @@ fn remember_thought_signature(
         }
     }
     cache.insert(call_id.to_string(), signature.to_string());
+}
+
+fn sanitize_identity_label(value: &str) -> Option<String> {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let sanitized = normalized
+        .chars()
+        .take(MAX_UPSTREAM_IDENTITY_CHARS)
+        .collect::<String>();
+    (!sanitized.is_empty()).then_some(sanitized)
+}
+
+fn upstream_identity_label(profile: &ProviderProfile, local_model: &str) -> Option<String> {
+    if !profile.identity_override {
+        return None;
+    }
+
+    let identity = profile.upstream_identity.clone().unwrap_or_else(|| {
+        if profile.local_gemini {
+            format!("Google Gemini ({local_model})")
+        } else {
+            profile.model.clone()
+        }
+    });
+    sanitize_identity_label(&identity)
+}
+
+fn bridge_identity_note(identity: &str) -> String {
+    format!(
+        "{BRIDGE_IDENTITY_MARKER}\nYou are running as the upstream model \"{identity}\" inside Claude Code. Claude Code is the client and agent environment, not your model identity. Continue following all Claude Code tool, workflow, safety, and output-format instructions. If asked which model or provider you are, answer with \"{identity}\"; do not claim to be Claude or Anthropic unless that identity is actually a Claude model.\n</bridge_runtime_identity>"
+    )
+}
+
+fn append_bridge_identity(request: &mut Value, identity: &str) -> Result<bool, String> {
+    let request = request
+        .as_object_mut()
+        .ok_or_else(|| "Anthropic request body must be a JSON object".to_string())?;
+    let system = request.entry("system").or_insert(Value::Null);
+    if value_to_text(system).contains(BRIDGE_IDENTITY_MARKER) {
+        return Ok(false);
+    }
+
+    let note = bridge_identity_note(identity);
+    match system {
+        Value::Null => *system = Value::String(note),
+        Value::String(text) => {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(&note);
+        }
+        Value::Array(blocks) => blocks.push(json!({"type": "text", "text": note})),
+        _ => {
+            return Err(
+                "Anthropic field 'system' must be a string, an array of content blocks, or null"
+                    .to_string(),
+            )
+        }
+    }
+    Ok(true)
 }
 
 fn translate_anthropic_request(
@@ -3677,6 +3768,8 @@ mod tests {
         let profile = ProviderProfile {
             file_name: "test.json".to_string(),
             model: "test-model".to_string(),
+            upstream_identity: None,
+            identity_override: true,
             base_url: "https://example.invalid".to_string(),
             auth_token: Some("bearer-secret".to_string()),
             api_key: Some("api-key-secret".to_string()),
@@ -3708,5 +3801,93 @@ mod tests {
             Some(DEFAULT_ANTHROPIC_VERSION)
         );
         assert!(!request.headers().contains_key("anthropic-beta"));
+    }
+
+    #[test]
+    fn appends_identity_without_rewriting_claude_code_prompt() {
+        let original = "You are Claude Code, Anthropic's official CLI for Claude.";
+        let mut request = json!({
+            "system": original,
+            "messages": [{"role": "user", "content": "Who are you?"}]
+        });
+
+        assert!(append_bridge_identity(&mut request, "Google Gemini (gemini-3.6-flash)").unwrap());
+        assert!(!append_bridge_identity(&mut request, "Google Gemini (gemini-3.6-flash)").unwrap());
+
+        let system = request["system"].as_str().unwrap();
+        assert!(system.starts_with(original));
+        assert_eq!(system.matches(BRIDGE_IDENTITY_MARKER).count(), 1);
+        assert!(system.contains("upstream model \"Google Gemini (gemini-3.6-flash)\""));
+
+        let signatures = RwLock::new(IndexMap::new());
+        let translated =
+            translate_anthropic_request(&request, "gemini-3.6-flash", &signatures).unwrap();
+        let translated_system = translated["messages"][0]["content"].as_str().unwrap();
+        assert!(translated_system.starts_with(original));
+        assert!(translated_system.contains(BRIDGE_IDENTITY_MARKER));
+    }
+
+    #[test]
+    fn preserves_system_blocks_and_cache_control_when_appending_identity() {
+        let mut request = json!({
+            "system": [{
+                "type": "text",
+                "text": "Cached Claude Code instructions.",
+                "cache_control": {"type": "ephemeral"}
+            }],
+            "messages": []
+        });
+
+        append_bridge_identity(&mut request, "DeepSeek V3").unwrap();
+        let blocks = request["system"].as_array().unwrap();
+
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+        assert!(blocks[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("upstream model \"DeepSeek V3\""));
+    }
+
+    #[test]
+    fn creates_system_prompt_when_identity_is_the_only_system_instruction() {
+        let mut request = json!({"messages": []});
+
+        append_bridge_identity(&mut request, "Kimi K2").unwrap();
+
+        assert!(request["system"]
+            .as_str()
+            .unwrap()
+            .contains("upstream model \"Kimi K2\""));
+    }
+
+    #[test]
+    fn selects_profile_identity_and_honors_disable_switch() {
+        let client = Client::builder().build().unwrap();
+        let mut profile = ProviderProfile {
+            file_name: "settings - deepseek.json".to_string(),
+            model: "deepseek-chat".to_string(),
+            upstream_identity: Some("  DeepSeek\nV3  ".to_string()),
+            identity_override: true,
+            base_url: "https://example.invalid".to_string(),
+            auth_token: Some("secret".to_string()),
+            api_key: None,
+            proxy_url: None,
+            local_gemini: false,
+            client,
+        };
+
+        assert_eq!(
+            upstream_identity_label(&profile, "gemini-3.6-flash").as_deref(),
+            Some("DeepSeek V3")
+        );
+        profile.upstream_identity = None;
+        profile.local_gemini = true;
+        assert_eq!(
+            upstream_identity_label(&profile, "gemini-3.6-flash").as_deref(),
+            Some("Google Gemini (gemini-3.6-flash)")
+        );
+        profile.identity_override = false;
+        assert_eq!(upstream_identity_label(&profile, "gemini-3.6-flash"), None);
     }
 }
