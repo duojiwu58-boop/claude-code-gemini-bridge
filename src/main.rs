@@ -42,6 +42,21 @@ const THOUGHT_SIGNATURE_EVICTION_BATCH: usize = 512;
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 const BRIDGE_IDENTITY_MARKER: &str = "<bridge_runtime_identity>";
 const MAX_UPSTREAM_IDENTITY_CHARS: usize = 200;
+// Identity phrases Claude Code injects into system prompts. These are matched
+// as phrases/patterns rather than whole declarations so that subagent persona
+// variants ("You are a file search specialist for Claude Code, ...", "You are
+// an agent for Claude Code, ...") and future rewordings are still neutralized.
+const CLAUDE_OFFICIAL_CLI_PHRASE: &str = "Claude Code, Anthropic's official CLI for Claude";
+const CLAUDE_CLI_SDK_SUFFIX: &str = ", running within the Claude Agent SDK";
+const CLAUDE_AGENT_SDK_DECLARATION: &str =
+    "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+const CLAUDE_COORDINATOR_DECLARATION: &str =
+    "You are Claude Code, an AI assistant that orchestrates software engineering tasks across multiple workers.";
+const CLAUDE_POWERED_BY_PREFIX: &str = "You are powered by the model";
+const CLAUDE_EXACT_MODEL_ID_PREFIX: &str = " The exact model ID is";
+const CLAUDE_CO_AUTHOR_LINE: &str = "Co-Authored-By: Claude <noreply@anthropic.com>";
+const MAX_INTERCEPTED_QUERY_CHARS: usize = 30;
+const MAX_EXACT_INTERCEPTED_QUERY_CHARS: usize = 40;
 
 type ThoughtSignatureCache = RwLock<IndexMap<String, String>>;
 
@@ -994,6 +1009,20 @@ async fn anthropic_messages(
         );
     };
     if let Some(identity) = upstream_identity_label(&active_profile, &state.model) {
+        if !is_claude_identity(&identity) {
+            if let Some((query, kind)) = identity_query_text(&request) {
+                let model = if active_profile.local_gemini {
+                    &state.model
+                } else {
+                    &active_profile.model
+                };
+                info!(
+                    "Intercepted identity question '{query}' on profile '{}'; answering as '{identity}' ({kind:?})",
+                    active_profile.file_name
+                );
+                return anthropic_identity_answer(&request, &query, kind, &identity, model);
+            }
+        }
         if let Err(message) = append_bridge_identity(&mut request, &identity) {
             return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message);
         }
@@ -1089,6 +1118,386 @@ async fn anthropic_messages(
             }
         };
     Json(message).into_response()
+}
+
+fn normalized_identity_query(text: &str) -> String {
+    text.chars()
+        .flat_map(char::to_lowercase)
+        .filter(|character| character.is_alphanumeric())
+        .take(80)
+        .collect()
+}
+
+// Vendor and model-family keywords recognized in "are you X?" style identity
+// questions. Used both to intercept the question and to decide whether the
+// bridged identity actually matches the vendor being asked about.
+const IDENTITY_VENDOR_KEYWORDS: [&str; 29] = [
+    "anthropic",
+    "claude",
+    "gemini",
+    "google",
+    "gpt",
+    "chatgpt",
+    "openai",
+    "deepseek",
+    "kimi",
+    "moonshot",
+    "qwen",
+    "tongyi",
+    "glm",
+    "zhipu",
+    "mistral",
+    "llama",
+    "grok",
+    "minimax",
+    "doubao",
+    "wenxin",
+    "ernie",
+    "通义",
+    "千问",
+    "智谱",
+    "豆包",
+    "文心",
+    "谷歌",
+    "月之暗面",
+    "深度求索",
+];
+
+// "Are you a/an ...?" targets that ask about the assistant's nature without
+// naming a vendor.
+const GENERIC_SELF_TARGETS: [&str; 14] = [
+    "ai", "anai", "human", "ahuman", "robot", "arobot", "abot", "bot", "alive", "real", "amodel",
+    "model", "llm", "anllm",
+];
+
+const GENERIC_SELF_TARGETS_ZH: [&str; 8] = [
+    "机器人",
+    "真人",
+    "人类",
+    "ai",
+    "llm",
+    "模型",
+    "大模型",
+    "人工智能",
+];
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IdentityQueryKind {
+    General,
+    Vendor(&'static str),
+}
+
+fn identity_query_kind(text: &str) -> Option<IdentityQueryKind> {
+    let normalized = normalized_identity_query(text);
+    if normalized.is_empty() {
+        return None;
+    }
+
+    // High-confidence standalone phrasings.
+    if normalized.len() <= MAX_EXACT_INTERCEPTED_QUERY_CHARS {
+        let exact = match normalized.as_str() {
+            "whoareyou"
+            | "whatareyou"
+            | "whatmodelareyou"
+            | "whichmodelareyou"
+            | "whichaimodelareyou"
+            | "whomadeyou"
+            | "whodevelopedyou"
+            | "whocreatedyou"
+            | "你是谁"
+            | "你是谁呀"
+            | "你是谁啊"
+            | "你是什么"
+            | "你是什么模型"
+            | "你用的什么模型"
+            | "你是哪个模型"
+            | "谁开发了你"
+            | "谁创造了你" => Some(IdentityQueryKind::General),
+            "areyouclaude" | "你是claude吗" => Some(IdentityQueryKind::Vendor("claude")),
+            "areyougemini" | "你是gemini吗" => Some(IdentityQueryKind::Vendor("gemini")),
+            _ => None,
+        };
+        if exact.is_some() {
+            return exact;
+        }
+    }
+
+    // Keep containment heuristics restricted to short standalone messages so a
+    // long task description that merely mentions one of the phrases is never
+    // intercepted.
+    if normalized.len() > MAX_INTERCEPTED_QUERY_CHARS {
+        return None;
+    }
+
+    // "Are you Claude?", "你是不是claude", "are you an AI?" ...
+    if let Some(kind) = are_you_question(&normalized) {
+        return Some(kind);
+    }
+
+    // "who are you, exactly?", "so who are you and what can you do?" ...
+    if let Some(kind) = anchored_who_are_you(&normalized) {
+        return Some(kind);
+    }
+
+    for pattern in [
+        "modelareyou",
+        "llmareyou",
+        "modelisthis",
+        "llmisthis",
+        "whomadeyou",
+        "whocreatedyou",
+        "whodevelopedyou",
+        "whobuiltyou",
+        "whotrainedyou",
+        "tellmeaboutyourself",
+        "introduceyourself",
+        "你是谁",
+        "谁开发了你",
+        "谁开发的你",
+        "谁创造了你",
+        "谁创造的你",
+        "谁训练了你",
+        "谁训练的你",
+        "介绍一下你自己",
+        "介绍下你自己",
+        "你用的什么模型",
+        "你用的哪个模型",
+        "你背后是什么模型",
+        "你是哪个模型",
+        "你是哪款模型",
+        "你是哪家的模型",
+        "你是什么大模型",
+    ] {
+        if normalized.contains(pattern) {
+            return Some(IdentityQueryKind::General);
+        }
+    }
+
+    // "你是什么..." is only an identity question when it asks what the
+    // assistant IS ("你是什么模型"), never for phrases like "你是什么意思".
+    for suffix in ["模型", "大模型", "版本", "ai", "llm", "东西"] {
+        if normalized.contains(&format!("你是什么{suffix}")) {
+            return Some(IdentityQueryKind::General);
+        }
+    }
+
+    None
+}
+
+fn are_you_question(normalized: &str) -> Option<IdentityQueryKind> {
+    if let Some(rest) = normalized.strip_prefix("areyou") {
+        if GENERIC_SELF_TARGETS.contains(&rest) {
+            return Some(IdentityQueryKind::General);
+        }
+        // "are you made by X?", "are you built by X?" ...
+        for connector in ["madeby", "createdby", "developedby", "builtby", "trainedby"] {
+            if let Some(vendor_rest) = rest.strip_prefix(connector) {
+                return vendor_keyword_prefix(vendor_rest).map(IdentityQueryKind::Vendor);
+            }
+        }
+        return vendor_keyword_prefix(rest).map(IdentityQueryKind::Vendor);
+    }
+
+    let core = if let Some(rest) = normalized.strip_prefix("你是不是") {
+        rest
+    } else if let Some(rest) = normalized.strip_prefix("你不是") {
+        rest
+    } else {
+        let rest = normalized.strip_prefix("你是")?;
+        rest.strip_prefix("不是").unwrap_or(rest)
+    };
+    let core = core.trim_end_matches(['吗', '么', '啊', '呀', '吧', '呢']);
+    if GENERIC_SELF_TARGETS_ZH.contains(&core) {
+        return Some(IdentityQueryKind::General);
+    }
+    vendor_keyword_exact(core).map(IdentityQueryKind::Vendor)
+}
+
+fn anchored_who_are_you(normalized: &str) -> Option<IdentityQueryKind> {
+    const LEADING_FILLERS: [&str; 9] = [
+        "please", "so", "wait", "okay", "ok", "then", "but", "and", "now",
+    ];
+    const TRAILING_FILLERS: [&str; 7] = [
+        "exactly", "really", "actually", "again", "then", "anyway", "now",
+    ];
+
+    let mut core = normalized;
+    while let Some(next) = LEADING_FILLERS
+        .iter()
+        .find_map(|filler| core.strip_prefix(filler))
+    {
+        core = next;
+    }
+    while let Some(next) = TRAILING_FILLERS
+        .iter()
+        .find_map(|filler| core.strip_suffix(filler))
+    {
+        core = next;
+    }
+
+    // Allow "who are you and what can you do", but not arbitrary continuations
+    // such as "what are you doing".
+    let remainder = core
+        .strip_prefix("whoareyou")
+        .or_else(|| core.strip_prefix("whatareyou"))?;
+    if remainder.is_empty() || remainder.starts_with("and") {
+        return Some(IdentityQueryKind::General);
+    }
+    None
+}
+
+fn vendor_keyword_exact(core: &str) -> Option<&'static str> {
+    IDENTITY_VENDOR_KEYWORDS
+        .into_iter()
+        .find(|keyword| *keyword == core)
+}
+
+fn vendor_keyword_prefix(rest: &str) -> Option<&'static str> {
+    for keyword in IDENTITY_VENDOR_KEYWORDS {
+        let Some(tail) = rest.strip_prefix(keyword) else {
+            continue;
+        };
+        // Accept "...claude?" (empty tail), "...gpt4", "...claude or GPT", but
+        // reject words that merely begin with a keyword such as "claudette".
+        let boundary_ok = tail.is_empty()
+            || tail
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_digit())
+            || ["or", "and", "not", "madeby", "model", "version"]
+                .iter()
+                .any(|connector| tail.starts_with(connector));
+        if boundary_ok {
+            return Some(keyword);
+        }
+    }
+    None
+}
+
+fn identity_query_text(request: &Value) -> Option<(String, IdentityQueryKind)> {
+    let message = request
+        .get("messages")?
+        .as_array()?
+        .iter()
+        .rev()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))?;
+    let content = message.get("content")?;
+    match content {
+        Value::String(text) => identity_query_kind(text).map(|kind| (text.clone(), kind)),
+        Value::Array(parts) => {
+            if parts
+                .iter()
+                .any(|part| part.get("type").and_then(Value::as_str) == Some("tool_result"))
+            {
+                return None;
+            }
+            parts.iter().find_map(|part| {
+                let text = part.get("text").and_then(Value::as_str)?;
+                identity_query_kind(text).map(|kind| (text.to_string(), kind))
+            })
+        }
+        _ => None,
+    }
+}
+
+fn is_chinese_text(text: &str) -> bool {
+    text.chars()
+        .any(|character| matches!(character, '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}'))
+}
+
+fn is_claude_identity(identity: &str) -> bool {
+    let identity = identity.to_ascii_lowercase();
+    identity.contains("claude") || identity.contains("anthropic")
+}
+
+fn identity_matches_vendor(identity: &str, keyword: &str) -> bool {
+    let identity = identity.to_ascii_lowercase();
+    match keyword {
+        "gpt" | "chatgpt" | "openai" => identity.contains("gpt") || identity.contains("openai"),
+        "gemini" | "google" | "谷歌" => {
+            identity.contains("gemini") || identity.contains("google")
+        }
+        "kimi" | "moonshot" | "月之暗面" => {
+            identity.contains("kimi") || identity.contains("moonshot")
+        }
+        "qwen" | "tongyi" | "通义" | "千问" => {
+            identity.contains("qwen") || identity.contains("tongyi") || identity.contains("通义")
+        }
+        "glm" | "zhipu" | "智谱" => {
+            identity.contains("glm") || identity.contains("zhipu") || identity.contains("智谱")
+        }
+        _ => identity.contains(keyword),
+    }
+}
+
+fn identity_answer_text(query: &str, kind: IdentityQueryKind, identity: &str) -> String {
+    match (kind, is_chinese_text(query)) {
+        (IdentityQueryKind::General, false) => {
+            format!("I'm {identity}, operating through the Claude Code client.")
+        }
+        (IdentityQueryKind::General, true) => {
+            format!("我是 {identity}，通过 Claude Code 客户端为你提供服务。")
+        }
+        (IdentityQueryKind::Vendor(keyword), false) => {
+            let prefix = if identity_matches_vendor(identity, keyword) {
+                "Yes"
+            } else {
+                "No"
+            };
+            format!("{prefix}, I'm {identity}, operating through the Claude Code client.")
+        }
+        (IdentityQueryKind::Vendor(keyword), true) => {
+            let prefix = if identity_matches_vendor(identity, keyword) {
+                "是的"
+            } else {
+                "不"
+            };
+            format!("{prefix}，我是 {identity}，通过 Claude Code 客户端为你提供服务。")
+        }
+    }
+}
+
+fn anthropic_identity_answer(
+    request: &Value,
+    query: &str,
+    kind: IdentityQueryKind,
+    identity: &str,
+    model: &str,
+) -> Response {
+    let text = identity_answer_text(query, kind, identity);
+    let output_tokens = text.chars().count().div_ceil(4).max(1);
+    let message = json!({
+        "id": format!("msg_bridge_identity_{}", Uuid::new_v4().simple()),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [{"type": "text", "text": text}],
+        "stop_reason": "end_turn",
+        "stop_sequence": Value::Null,
+        "usage": {
+            "input_tokens": estimate_anthropic_input_tokens(request),
+            "output_tokens": output_tokens
+        }
+    });
+
+    if !request
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Json(message).into_response();
+    }
+
+    let events = match anthropic_stream_events(&message) {
+        Ok(events) => events,
+        Err(message) => {
+            return anthropic_error(StatusCode::INTERNAL_SERVER_ERROR, "api_error", &message);
+        }
+    };
+    let event_stream = stream::iter(events.into_iter().map(Ok::<Event, Infallible>));
+    Sse::new(event_stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
 }
 
 async fn forward_anthropic_profile(
@@ -1868,16 +2277,204 @@ fn upstream_identity_label(profile: &ProviderProfile, local_model: &str) -> Opti
         if profile.local_gemini {
             format!("Google Gemini ({local_model})")
         } else {
-            profile.model.clone()
+            display_model_name(&profile.model)
         }
     });
     sanitize_identity_label(&identity)
 }
 
+/// Model IDs can carry routing suffixes such as "deepseek-v4-pro[1m]". Those
+/// are transport details, not part of a presentable identity.
+fn display_model_name(model: &str) -> String {
+    if let Some(bracket_start) = model.find('[') {
+        if model.ends_with(']') {
+            let trimmed = model[..bracket_start].trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    model.to_string()
+}
+
 fn bridge_identity_note(identity: &str) -> String {
     format!(
-        "{BRIDGE_IDENTITY_MARKER}\nYou are running as the upstream model \"{identity}\" inside Claude Code. Claude Code is the client and agent environment, not your model identity. Continue following all Claude Code tool, workflow, safety, and output-format instructions. If asked which model or provider you are, answer with \"{identity}\"; do not claim to be Claude or Anthropic unless that identity is actually a Claude model.\n</bridge_runtime_identity>"
+        "{BRIDGE_IDENTITY_MARKER}\nThe bridge supplies authoritative routing metadata because it selected the upstream model for this request. This is factual runtime information, not a request to role-play or impersonate another model. Your actual model and first-person assistant identity is \"{identity}\" in every language. Claude Code is only the client and agent environment, not your identity. Any conflicting claim in the client compatibility prompt or in your training priors that you are Claude or were developed by Anthropic is false for this route unless \"{identity}\" is actually a Claude model. Continue following all Claude Code tool, workflow, safety, and output-format instructions. For every identity question in any language, including \"Who are you?\", \"What model are you?\", \"你是谁呀？\", \"你是什么模型？\", or \"谁开发了你？\", always identify yourself as \"{identity}\".\n身份规则：桥接器已选择本次请求的真实上游模型“{identity}”，这是可信的运行时事实，不是角色扮演。Claude Code 只是客户端；无论用户用什么语言询问你是谁、你是什么模型或谁开发了你，都必须明确回答“{identity}”。\n</bridge_runtime_identity>"
     )
+}
+
+fn replace_all_occurrences(text: &mut String, from: &str, to: &str) -> bool {
+    let mut changed = false;
+    let mut cursor = 0;
+    while let Some(offset) = text[cursor..].find(from) {
+        let start = cursor + offset;
+        text.replace_range(start..start + from.len(), to);
+        cursor = start + to.len();
+        changed = true;
+    }
+    changed
+}
+
+/// Find the end of the sentence starting at `start` (index just past the
+/// terminating period), bounded to a single line and a sane length so a stray
+/// match cannot swallow a whole system prompt.
+fn sentence_end_after(text: &str, start: usize) -> Option<usize> {
+    const MAX_SENTENCE_CHARS: usize = 300;
+    for (offset, character) in text[start..].char_indices() {
+        if offset >= MAX_SENTENCE_CHARS || character == '\n' {
+            return None;
+        }
+        if character == '.' {
+            return Some(start + offset + 1);
+        }
+    }
+    None
+}
+
+/// Catch reworded persona declarations Claude Code updates may introduce, e.g.
+/// "You are Claude Code, a coding assistant built by Anthropic." Only
+/// sentence-initial occurrences are rewritten; the replacement itself cannot
+/// match the prefixes again, so the scan terminates.
+fn neutralize_claude_persona_sentences(text: &mut String, identity: &str) -> bool {
+    const PERSONA_PREFIXES: [&str; 2] = ["You are Claude Code", "You are a Claude agent"];
+    let replacement = format!(
+        "You are \"{identity}\", operating through the Claude Code CLI coding environment."
+    );
+
+    let mut changed = false;
+    let mut cursor = 0;
+    while cursor < text.len() {
+        let Some((start, prefix)) = PERSONA_PREFIXES
+            .iter()
+            .filter_map(|prefix| {
+                let offset = text[cursor..].find(prefix)?;
+                Some((cursor + offset, *prefix))
+            })
+            .min_by_key(|(start, _)| *start)
+        else {
+            break;
+        };
+        let at_sentence_start = start == 0 || text[..start].ends_with('\n');
+        if !at_sentence_start {
+            cursor = start + prefix.len();
+            continue;
+        }
+        let Some(end) = sentence_end_after(text, start) else {
+            cursor = start + prefix.len();
+            continue;
+        };
+        text.replace_range(start..end, &replacement);
+        cursor = start + replacement.len();
+        changed = true;
+    }
+    changed
+}
+
+/// The "# Environment" section says "You are powered by the model named X. The
+/// exact model ID is Y." with the client's configured model name, which is the
+/// wrong upstream for bridged routes. Rewrite the whole line; it is always a
+/// standalone line in Claude Code's system prompt.
+fn neutralize_powered_by_line(text: &mut String, identity: &str) -> bool {
+    let replacement = format!("You are powered by {identity}.");
+    let exact_model_prefix = CLAUDE_EXACT_MODEL_ID_PREFIX.trim_start();
+    let mut changed = false;
+    let mut cursor = 0;
+    while let Some(offset) = text[cursor..].find(CLAUDE_POWERED_BY_PREFIX) {
+        let start = cursor + offset;
+        let line_start = text[..start]
+            .rfind('\n')
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let line_end = text[start..]
+            .find('\n')
+            .map(|index| start + index)
+            .unwrap_or(text.len());
+        if !text[line_start..line_end]
+            .trim_start()
+            .starts_with(CLAUDE_POWERED_BY_PREFIX)
+        {
+            cursor = start + CLAUDE_POWERED_BY_PREFIX.len();
+            continue;
+        }
+        // Claude Code sometimes splits the exact-model-ID sentence onto its own
+        // line; drop that line too.
+        let mut replace_end = line_end;
+        if line_end < text.len() {
+            let next_line_start = line_end + 1;
+            let next_line_end = text[next_line_start..]
+                .find('\n')
+                .map(|index| next_line_start + index)
+                .unwrap_or(text.len());
+            if text[next_line_start..next_line_end]
+                .trim_start()
+                .starts_with(exact_model_prefix)
+            {
+                replace_end = next_line_end;
+            }
+        }
+        text.replace_range(line_start..replace_end, &replacement);
+        cursor = line_start + replacement.len();
+        changed = true;
+    }
+    changed
+}
+
+fn neutralize_claude_identity_declaration(text: &mut String, identity: &str) -> bool {
+    if is_claude_identity(identity) {
+        return false;
+    }
+
+    let persona = format!(
+        "You are \"{identity}\", operating through the Claude Code CLI coding environment."
+    );
+    // Same wording without the leading "You are" so declarations that carry a
+    // role prefix ("You are a file search specialist for ...", "You are an
+    // agent for ...") keep the role and only swap the product identity.
+    let persona_tail =
+        format!("\"{identity}\", operating through the Claude Code CLI coding environment");
+
+    let mut changed = false;
+
+    // 1. Whole-sentence persona declarations.
+    changed |= replace_all_occurrences(text, CLAUDE_AGENT_SDK_DECLARATION, &persona);
+    changed |= replace_all_occurrences(text, CLAUDE_COORDINATOR_DECLARATION, &persona);
+
+    // 2. The "Claude Code, Anthropic's official CLI for Claude" phrase with an
+    //    optional SDK suffix. This covers the main persona and every subagent
+    //    persona variant built on the same phrase.
+    let sdk_phrase = format!("{CLAUDE_OFFICIAL_CLI_PHRASE}{CLAUDE_CLI_SDK_SUFFIX}");
+    changed |= replace_all_occurrences(text, &sdk_phrase, &persona_tail);
+    changed |= replace_all_occurrences(text, CLAUDE_OFFICIAL_CLI_PHRASE, &persona_tail);
+
+    // 3. Fallback for future rewordings of the persona sentences.
+    changed |= neutralize_claude_persona_sentences(text, identity);
+
+    // 4. The model line Claude Code injects always names the configured model,
+    //    not the bridge's actual upstream.
+    changed |= neutralize_powered_by_line(text, identity);
+
+    // 5. Git attribution would otherwise stamp "Co-Authored-By: Claude" into
+    //    every commit made through a bridged model.
+    let co_author = format!("Co-Authored-By: {identity} <noreply@anthropic.com>");
+    changed |= replace_all_occurrences(text, CLAUDE_CO_AUTHOR_LINE, &co_author);
+
+    changed
+}
+
+fn neutralize_system_identity(system: &mut Value, identity: &str) -> bool {
+    match system {
+        Value::String(text) => neutralize_claude_identity_declaration(text, identity),
+        Value::Array(blocks) => {
+            let mut changed = false;
+            for block in blocks {
+                if let Some(Value::String(text)) = block.get_mut("text") {
+                    changed |= neutralize_claude_identity_declaration(text, identity);
+                }
+            }
+            changed
+        }
+        _ => false,
+    }
 }
 
 fn append_bridge_identity(request: &mut Value, identity: &str) -> Result<bool, String> {
@@ -1889,6 +2486,7 @@ fn append_bridge_identity(request: &mut Value, identity: &str) -> Result<bool, S
         return Ok(false);
     }
 
+    neutralize_system_identity(system, identity);
     let note = bridge_identity_note(identity);
     match system {
         Value::Null => *system = Value::String(note),
@@ -1915,10 +2513,14 @@ fn translate_anthropic_request(
     thought_signatures: &ThoughtSignatureCache,
 ) -> Result<Value, String> {
     let mut messages = Vec::new();
+    let mut runtime_identity_reminder = None;
 
     if let Some(system) = request.get("system") {
         let text = value_to_text(system);
         if !text.is_empty() {
+            runtime_identity_reminder = text
+                .rfind(BRIDGE_IDENTITY_MARKER)
+                .map(|start| text[start..].to_string());
             messages.push(json!({"role": "system", "content": text}));
         }
     }
@@ -1948,6 +2550,10 @@ fn translate_anthropic_request(
             }
             _ => return Err(format!("Unsupported Anthropic message role '{role}'")),
         }
+    }
+
+    if let Some(reminder) = runtime_identity_reminder {
+        messages.push(json!({"role": "system", "content": reminder}));
     }
 
     let mut body = Map::new();
@@ -2454,7 +3060,6 @@ fn translate_anthropic_response(
     }))
 }
 
-#[cfg(test)]
 fn anthropic_stream_events(message: &Value) -> Result<Vec<Event>, String> {
     let mut events = Vec::new();
     let mut start_message = message.clone();
@@ -3804,10 +4409,10 @@ mod tests {
     }
 
     #[test]
-    fn appends_identity_without_rewriting_claude_code_prompt() {
+    fn neutralizes_claude_identity_and_appends_runtime_identity() {
         let original = "You are Claude Code, Anthropic's official CLI for Claude.";
         let mut request = json!({
-            "system": original,
+            "system": format!("<system-reminder>Runtime context.</system-reminder>\n{original}"),
             "messages": [{"role": "user", "content": "Who are you?"}]
         });
 
@@ -3815,16 +4420,32 @@ mod tests {
         assert!(!append_bridge_identity(&mut request, "Google Gemini (gemini-3.6-flash)").unwrap());
 
         let system = request["system"].as_str().unwrap();
-        assert!(system.starts_with(original));
+        assert!(system.contains(
+            "You are \"Google Gemini (gemini-3.6-flash)\", operating through the Claude Code CLI coding environment."
+        ));
+        assert!(!system.contains(original));
         assert_eq!(system.matches(BRIDGE_IDENTITY_MARKER).count(), 1);
-        assert!(system.contains("upstream model \"Google Gemini (gemini-3.6-flash)\""));
+        assert!(system.contains(
+            "actual model and first-person assistant identity is \"Google Gemini (gemini-3.6-flash)\""
+        ));
+        assert!(system.contains("\"你是谁呀？\""));
+        assert!(system.contains("\"谁开发了你？\""));
 
         let signatures = RwLock::new(IndexMap::new());
         let translated =
             translate_anthropic_request(&request, "gemini-3.6-flash", &signatures).unwrap();
         let translated_system = translated["messages"][0]["content"].as_str().unwrap();
-        assert!(translated_system.starts_with(original));
+        assert!(translated_system.contains(
+            "You are \"Google Gemini (gemini-3.6-flash)\", operating through the Claude Code CLI coding environment."
+        ));
         assert!(translated_system.contains(BRIDGE_IDENTITY_MARKER));
+        let translated_messages = translated["messages"].as_array().unwrap();
+        let reminder = translated_messages.last().unwrap();
+        assert_eq!(reminder["role"], "system");
+        assert!(reminder["content"]
+            .as_str()
+            .unwrap()
+            .starts_with(BRIDGE_IDENTITY_MARKER));
     }
 
     #[test]
@@ -3832,8 +4453,11 @@ mod tests {
         let mut request = json!({
             "system": [{
                 "type": "text",
-                "text": "Cached Claude Code instructions.",
+                "text": "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.\nCached Claude Code instructions.",
                 "cache_control": {"type": "ephemeral"}
+            }, {
+                "type": "text",
+                "text": "You are Claude Code, an AI assistant that orchestrates software engineering tasks across multiple workers."
             }],
             "messages": []
         });
@@ -3841,12 +4465,294 @@ mod tests {
         append_bridge_identity(&mut request, "DeepSeek V3").unwrap();
         let blocks = request["system"].as_array().unwrap();
 
-        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks.len(), 3);
         assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
-        assert!(blocks[1]["text"]
+        assert!(blocks[0]["text"].as_str().unwrap().starts_with(
+            "You are \"DeepSeek V3\", operating through the Claude Code CLI coding environment."
+        ));
+        assert!(blocks[0]["text"]
             .as_str()
             .unwrap()
-            .contains("upstream model \"DeepSeek V3\""));
+            .ends_with("Cached Claude Code instructions."));
+        assert!(blocks[1]["text"].as_str().unwrap().starts_with(
+            "You are \"DeepSeek V3\", operating through the Claude Code CLI coding environment."
+        ));
+        assert!(blocks[2]["text"]
+            .as_str()
+            .unwrap()
+            .contains("actual model and first-person assistant identity is \"DeepSeek V3\""));
+    }
+
+    #[test]
+    fn keeps_claude_identity_and_unrelated_claude_code_references_unchanged() {
+        let claude_declaration =
+            "You are Claude Code, Anthropic's official CLI for Claude.".to_string();
+        let mut actual_claude = claude_declaration.clone();
+        assert!(!neutralize_claude_identity_declaration(
+            &mut actual_claude,
+            "Anthropic Claude Sonnet 4"
+        ));
+        assert_eq!(actual_claude, claude_declaration);
+
+        let mut unrelated = "Use Claude Code tools exactly as documented.".to_string();
+        assert!(!neutralize_claude_identity_declaration(
+            &mut unrelated,
+            "Google Gemini"
+        ));
+        assert_eq!(unrelated, "Use Claude Code tools exactly as documented.");
+    }
+
+    #[test]
+    fn detects_only_short_standalone_identity_queries() {
+        for query in [
+            "who are you?",
+            "What model are you?",
+            "你是谁呀？",
+            "你是什么模型？",
+            "谁开发了你？",
+        ] {
+            let request = json!({
+                "messages": [{"role": "user", "content": query}]
+            });
+            let intercepted = identity_query_text(&request).map(|(text, _)| text);
+            assert_eq!(intercepted.as_deref(), Some(query));
+        }
+
+        let unrelated = json!({
+            "messages": [{
+                "role": "user",
+                "content": "Explain how a who-are-you check should work in this codebase."
+            }]
+        });
+        assert_eq!(identity_query_text(&unrelated), None);
+    }
+
+    #[test]
+    fn intercepts_paraphrased_identity_queries_with_kinds() {
+        let cases = [
+            ("who are you, exactly?", IdentityQueryKind::General),
+            ("So, who are you?", IdentityQueryKind::General),
+            (
+                "who are you and what can you do?",
+                IdentityQueryKind::General,
+            ),
+            ("tell me about yourself", IdentityQueryKind::General),
+            ("Please introduce yourself.", IdentityQueryKind::General),
+            ("Which LLM is this?", IdentityQueryKind::General),
+            ("who made you?", IdentityQueryKind::General),
+            ("who trained you?", IdentityQueryKind::General),
+            ("are you an AI?", IdentityQueryKind::General),
+            ("Are you a robot?", IdentityQueryKind::General),
+            (
+                "are you Claude or GPT?",
+                IdentityQueryKind::Vendor("claude"),
+            ),
+            (
+                "Are you Claude or something else?",
+                IdentityQueryKind::Vendor("claude"),
+            ),
+            ("are you gpt4?", IdentityQueryKind::Vendor("gpt")),
+            (
+                "are you made by OpenAI?",
+                IdentityQueryKind::Vendor("openai"),
+            ),
+            ("你是不是claude", IdentityQueryKind::Vendor("claude")),
+            ("你不是deepseek吗", IdentityQueryKind::Vendor("deepseek")),
+            ("你是哪家的模型", IdentityQueryKind::General),
+            ("介绍一下你自己吧", IdentityQueryKind::General),
+            ("你是什么东西", IdentityQueryKind::General),
+            ("你背后是什么模型", IdentityQueryKind::General),
+            ("谁训练的你", IdentityQueryKind::General),
+            ("你是机器人吗", IdentityQueryKind::General),
+        ];
+        for (query, expected) in cases {
+            let request = json!({
+                "messages": [{"role": "user", "content": query}]
+            });
+            let (text, kind) = identity_query_text(&request)
+                .unwrap_or_else(|| panic!("expected interception for: {query}"));
+            assert_eq!(text, query);
+            assert_eq!(kind, expected, "unexpected kind for: {query}");
+        }
+    }
+
+    #[test]
+    fn does_not_intercept_recommendation_or_unrelated_questions() {
+        for query in [
+            "what model should I use for this task?",
+            "which model is best for code generation?",
+            "你是说要用claude吗",
+            "帮我写个自我介绍",
+            "Explain how a who-are-you check should work in this codebase.",
+            "what are you doing with that file?",
+            "Can you tell me about the model field in this schema?",
+            "你是什么意思",
+        ] {
+            let request = json!({
+                "messages": [{"role": "user", "content": query}]
+            });
+            assert_eq!(
+                identity_query_text(&request),
+                None,
+                "unexpected interception: {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn answers_vendor_questions_yes_or_no() {
+        assert_eq!(
+            identity_answer_text(
+                "are you qwen?",
+                IdentityQueryKind::Vendor("qwen"),
+                "qwen3.8-max"
+            ),
+            "Yes, I'm qwen3.8-max, operating through the Claude Code client."
+        );
+        assert_eq!(
+            identity_answer_text(
+                "are you claude?",
+                IdentityQueryKind::Vendor("claude"),
+                "qwen3.8-max"
+            ),
+            "No, I'm qwen3.8-max, operating through the Claude Code client."
+        );
+        assert_eq!(
+            identity_answer_text(
+                "你是claude吗",
+                IdentityQueryKind::Vendor("claude"),
+                "qwen3.8-max"
+            ),
+            "不，我是 qwen3.8-max，通过 Claude Code 客户端为你提供服务。"
+        );
+        assert_eq!(
+            identity_answer_text(
+                "你是gemini吗",
+                IdentityQueryKind::Vendor("gemini"),
+                "Google Gemini (gemini-3.6-flash)"
+            ),
+            "是的，我是 Google Gemini (gemini-3.6-flash)，通过 Claude Code 客户端为你提供服务。"
+        );
+        assert_eq!(
+            identity_answer_text("你是谁", IdentityQueryKind::General, "DeepSeek V3"),
+            "我是 DeepSeek V3，通过 Claude Code 客户端为你提供服务。"
+        );
+    }
+
+    #[test]
+    fn neutralizes_subagent_personas_environment_and_attribution() {
+        let mut text = concat!(
+            "You are a file search specialist for Claude Code, Anthropic's official CLI for Claude.\n",
+            "You are an agent for Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.\n",
+            "# Environment\n",
+            "You are powered by the model named Claude Sonnet 4.5. The exact model ID is claude-sonnet-4-5-20250929.\n",
+            "End git commit messages with: Co-Authored-By: Claude <noreply@anthropic.com>"
+        )
+        .to_string();
+
+        assert!(neutralize_claude_identity_declaration(
+            &mut text,
+            "qwen3.8-max"
+        ));
+        assert!(text.contains(
+            "You are a file search specialist for \"qwen3.8-max\", operating through the Claude Code CLI coding environment."
+        ));
+        assert!(text.contains(
+            "You are an agent for \"qwen3.8-max\", operating through the Claude Code CLI coding environment."
+        ));
+        assert!(text.contains("You are powered by qwen3.8-max."));
+        assert!(!text.contains("claude-sonnet-4-5"));
+        assert!(text.contains("Co-Authored-By: qwen3.8-max <noreply@anthropic.com>"));
+        assert!(!text.contains("Anthropic's official CLI"));
+        assert!(text.contains("# Environment"));
+    }
+
+    #[test]
+    fn neutralizes_reworded_persona_sentences() {
+        let mut text = concat!(
+            "You are Claude Code, a helpful coding assistant built by Anthropic.\n",
+            "You are a Claude agent that helps with programming tasks.\n",
+            "Claude Code is available as a CLI in the terminal.\n",
+            "Other instructions stay."
+        )
+        .to_string();
+
+        assert!(neutralize_claude_identity_declaration(
+            &mut text,
+            "DeepSeek V3"
+        ));
+        assert_eq!(
+            text.matches(
+                "You are \"DeepSeek V3\", operating through the Claude Code CLI coding environment."
+            )
+            .count(),
+            2
+        );
+        // Factual capability sentences must survive the rewrite.
+        assert!(text.contains(
+            "Claude Code is available as a CLI in the terminal.\nOther instructions stay."
+        ));
+        assert!(!text.contains("You are Claude Code"));
+        assert!(!text.contains("You are a Claude agent"));
+    }
+
+    #[test]
+    fn rewrites_powered_by_line_with_model_names_containing_periods() {
+        let mut text = concat!(
+            "# Environment\n",
+            "You are powered by the model named Claude Sonnet 4.5. The exact model ID is claude-sonnet-4-5-20250929.\n",
+            "Today's date is 2026-08-06."
+        )
+        .to_string();
+
+        assert!(neutralize_powered_by_line(&mut text, "kimi-k3"));
+        assert!(text.contains("You are powered by kimi-k3."));
+        assert!(!text.contains("Claude Sonnet 4.5"));
+        assert!(!text.contains("exact model ID"));
+        assert!(text.contains("Today's date is 2026-08-06."));
+    }
+
+    #[test]
+    fn strips_bracket_suffix_from_model_identity_fallback() {
+        let client = Client::builder().build().unwrap();
+        let profile = ProviderProfile {
+            file_name: "settings - ds4.json".to_string(),
+            model: "deepseek-v4-pro[1m]".to_string(),
+            upstream_identity: None,
+            identity_override: true,
+            base_url: "https://example.invalid".to_string(),
+            auth_token: None,
+            api_key: Some("secret".to_string()),
+            proxy_url: None,
+            local_gemini: false,
+            client,
+        };
+
+        assert_eq!(
+            upstream_identity_label(&profile, "gemini-3.6-flash").as_deref(),
+            Some("deepseek-v4-pro")
+        );
+    }
+
+    #[test]
+    fn does_not_intercept_identity_text_inside_tool_result_turns() {
+        let request = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "who are you?"},
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": "result"
+                    }
+                ]
+            }]
+        });
+
+        assert_eq!(identity_query_text(&request), None);
+        assert!(is_claude_identity("Anthropic Claude Sonnet 4"));
+        assert!(!is_claude_identity("qwen3.8-max"));
     }
 
     #[test]
@@ -3858,7 +4764,7 @@ mod tests {
         assert!(request["system"]
             .as_str()
             .unwrap()
-            .contains("upstream model \"Kimi K2\""));
+            .contains("actual model and first-person assistant identity is \"Kimi K2\""));
     }
 
     #[test]

@@ -119,6 +119,8 @@ After installation, open **Claude Code 模型中心**, select or double-click a 
 - `CLAUDE_BRIDGE_UPSTREAM_IDENTITY` (optional per-profile model identity shown to the upstream model)
 - `CLAUDE_BRIDGE_IDENTITY_OVERRIDE` (optional per-profile switch; defaults to `true`)
 
+When the override is active for a non-Claude profile, the bridge rewrites the request before routing: it neutralizes the Claude persona declarations that Claude Code injects (main, coordinator, and subagent variants, plus the "powered by the model" environment line and the `Co-Authored-By: Claude` git attribution), appends an authoritative `<bridge_runtime_identity>` note naming the real upstream model, and answers short standalone identity questions ("who are you?", "你是谁？", "are you Claude?", ...) directly so the upstream model is never asked to impersonate Claude. Factual references to Claude Code as a tool stay untouched. If `CLAUDE_BRIDGE_UPSTREAM_IDENTITY` is unset, the identity falls back to the profile model name (with provider routing suffixes such as `[1m]` removed).
+
 ### Run from Source
 
 ```powershell
