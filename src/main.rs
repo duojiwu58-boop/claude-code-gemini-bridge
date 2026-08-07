@@ -2890,15 +2890,18 @@ fn translate_anthropic_assistant_message(
     }
 
     if !text_parts.is_empty() || !tool_calls.is_empty() {
-        messages.push(json!({
+        let mut translated = json!({
             "role": "assistant",
             "content": if text_parts.is_empty() {
                 Value::Null
             } else {
                 Value::String(text_parts.join("\n"))
-            },
-            "tool_calls": tool_calls
-        }));
+            }
+        });
+        if !tool_calls.is_empty() {
+            translated["tool_calls"] = Value::Array(tool_calls);
+        }
+        messages.push(translated);
     }
 }
 
@@ -4106,6 +4109,31 @@ mod tests {
         );
         assert_eq!(translated["tool_choice"], "auto");
         assert_eq!(translated["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn omits_empty_tool_calls_from_text_only_assistant_messages() {
+        let request = json!({
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "internal"},
+                    {"type": "text", "text": "done"}
+                ]},
+                {"role": "user", "content": [{"type": "text", "text": "continue"}]}
+            ]
+        });
+
+        let signatures = RwLock::new(IndexMap::new());
+        let translated = translate_anthropic_request(&request, "qwen3.8-max", &signatures).unwrap();
+        let assistant = translated["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .unwrap();
+        assert_eq!(assistant["content"], "done");
+        assert!(assistant.get("tool_calls").is_none());
     }
 
     #[test]
