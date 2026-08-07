@@ -7,6 +7,15 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 
 ## English
 
+## [v0.3.1] - 2026-08-07
+
+### Fixes
+- Normalize missing, empty, and whitespace-only OpenAI tool-call IDs to unique bridge-generated IDs in streaming and non-streaming responses, preserving parallel tool-result correlation in Claude Code.
+
+### Verification
+- Confirmed the Qwen/Claude Code tool loop is resolved in a live local-service test.
+- 58 Rust unit tests, strict Clippy checks, the Delphi 11 GUI build, static-CRT package build, portable ZIP, Inno Setup installer, and SHA-256 manifests completed successfully.
+
 ## [v0.3.0] - 2026-08-07
 
 ### Near-Lossless OpenAI Semantic Core
@@ -92,6 +101,15 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 ---
 
 ## 中文
+
+## [v0.3.1] - 2026-08-07
+
+### 修复
+- 流式与非流式 OpenAI 响应中的工具调用 ID 如果缺失、为空或仅含空白，桥接器会生成各自唯一的 ID，保证 Claude Code 能正确关联并行工具结果。
+
+### 验证
+- 已通过本机服务实测，确认千问在 Claude Code 中反复调用工具的问题已解决。
+- 58 项 Rust 单元测试、严格 Clippy 检查、Delphi 11 GUI、静态 CRT 发布构建、便携 ZIP、Inno Setup 安装程序及 SHA-256 清单均成功完成。
 
 ## [v0.3.0] - 2026-08-07
 

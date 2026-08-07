@@ -2616,7 +2616,10 @@ impl AnthropicStreamTranslator {
 
     fn accumulate_tool_call(&mut self, tool_call: &Value) {
         let index = tool_call.get("index").and_then(Value::as_u64);
-        let incoming_id = tool_call.get("id").and_then(Value::as_str);
+        let incoming_id = tool_call
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty());
         let key = if let Some(index) = index {
             format!("index:{index}")
         } else if let Some(id) = incoming_id {
@@ -3934,6 +3937,7 @@ fn translate_anthropic_response_with_capabilities(
             let call_id = tool_call
                 .get("id")
                 .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty())
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("toolu_{}", Uuid::new_v4().simple()));
             let name = tool_call
@@ -5481,6 +5485,70 @@ mod tests {
         let events = translator.finish().unwrap();
         let debug = format!("{events:?}");
         assert!(debug.contains(r#"partial_json\":\"{\\\"path\\\":\\\"src\\\"}\""#));
+    }
+
+    #[test]
+    fn generates_distinct_ids_for_parallel_streamed_tool_calls_with_blank_ids() {
+        let signatures = Arc::new(RwLock::new(IndexMap::new()));
+        let mut translator =
+            AnthropicStreamTranslator::new("qwen-tool-model".to_string(), signatures, 0);
+        translator
+            .process_payload(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"","type":"function","function":{"name":"first","arguments":"{}"}},{"index":1,"id":"   ","type":"function","function":{"name":"second","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+            )
+            .unwrap();
+
+        let ids = translator
+            .tool_calls
+            .values()
+            .map(|call| call.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.iter().all(|id| id.starts_with("toolu_")));
+        assert_ne!(ids[0], ids[1]);
+
+        let debug = format!("{:?}", translator.finish().unwrap());
+        assert!(ids.iter().all(|id| debug.contains(id)));
+    }
+
+    #[test]
+    fn generates_distinct_ids_for_parallel_non_streaming_tool_calls_with_blank_ids() {
+        let upstream = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {
+                            "id": "",
+                            "type": "function",
+                            "function": {"name": "first", "arguments": "{}"}
+                        },
+                        {
+                            "id": "   ",
+                            "type": "function",
+                            "function": {"name": "second", "arguments": "{}"}
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let signatures = RwLock::new(IndexMap::new());
+
+        let message =
+            translate_anthropic_response(&upstream, "qwen-tool-model", &signatures).unwrap();
+        let ids = message["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|block| block["type"] == "tool_use")
+            .map(|block| block["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids.len(), 2);
+        assert!(ids.iter().all(|id| id.starts_with("toolu_")));
+        assert_ne!(ids[0], ids[1]);
     }
 
     #[test]
