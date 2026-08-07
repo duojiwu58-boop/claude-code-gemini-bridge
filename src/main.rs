@@ -8,12 +8,13 @@
 mod windows_service;
 
 use std::{
-    collections::VecDeque,
+    collections::{hash_map::DefaultHasher, VecDeque},
     convert::Infallible,
     env, fs,
+    hash::{Hash, Hasher},
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -58,6 +59,23 @@ const CLAUDE_CO_AUTHOR_LINE: &str = "Co-Authored-By: Claude <noreply@anthropic.c
 
 type ThoughtSignatureCache = RwLock<IndexMap<String, String>>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderTransport {
+    LocalGemini,
+    Anthropic,
+    OpenAiChat,
+}
+
+impl ProviderTransport {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalGemini => "gemini",
+            Self::Anthropic => "anthropic",
+            Self::OpenAiChat => "openai-chat",
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ProviderProfile {
     file_name: String,
@@ -69,6 +87,8 @@ struct ProviderProfile {
     api_key: Option<String>,
     proxy_url: Option<String>,
     local_gemini: bool,
+    transport: ProviderTransport,
+    upstream_url: String,
     client: Client,
 }
 
@@ -95,6 +115,7 @@ struct AppState {
     settings_dir: PathBuf,
     bridge_state_path: PathBuf,
     local_bridge_base_url: String,
+    admin_state_lock: Arc<Mutex<()>>,
 }
 
 fn main() {
@@ -215,6 +236,7 @@ where
         settings_dir,
         bridge_state_path,
         local_bridge_base_url,
+        admin_state_lock: Arc::new(Mutex::new(())),
     });
 
     let app = Router::new()
@@ -405,6 +427,14 @@ fn load_provider_profiles(
             .map_err(|err| format!("Cannot create HTTP client for '{file_name}': {err}"))?;
         let local_gemini =
             normalize_base_url(&base_url) == normalize_base_url(local_bridge_base_url);
+        let (transport, upstream_url) = resolve_provider_transport(
+            &base_url,
+            &model,
+            local_gemini,
+            get_env("CLAUDE_BRIDGE_TRANSPORT").as_deref(),
+            get_env("CLAUDE_BRIDGE_UPSTREAM_URL").as_deref(),
+        )
+        .map_err(|err| format!("Invalid transport in profile '{file_name}': {err}"))?;
 
         profiles.push(ProviderProfile {
             file_name,
@@ -416,6 +446,8 @@ fn load_provider_profiles(
             api_key,
             proxy_url,
             local_gemini,
+            transport,
+            upstream_url,
             client,
         });
     }
@@ -425,6 +457,97 @@ fn load_provider_profiles(
 
 fn normalize_base_url(value: &str) -> String {
     value.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
+fn resolve_provider_transport(
+    base_url: &str,
+    model: &str,
+    local_gemini: bool,
+    configured_transport: Option<&str>,
+    configured_upstream_url: Option<&str>,
+) -> Result<(ProviderTransport, String), String> {
+    if local_gemini {
+        return Ok((ProviderTransport::LocalGemini, base_url.to_string()));
+    }
+
+    let configured = configured_transport
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("auto")
+        .to_ascii_lowercase();
+    match configured.as_str() {
+        "auto" => {
+            if !is_claude_identity(model) {
+                if let Some(upstream_url) = known_openai_chat_endpoint(base_url) {
+                    return Ok((ProviderTransport::OpenAiChat, upstream_url));
+                }
+            }
+            Ok((
+                ProviderTransport::Anthropic,
+                anthropic_messages_endpoint(base_url),
+            ))
+        }
+        "anthropic" => Ok((
+            ProviderTransport::Anthropic,
+            configured_upstream_url
+                .map(str::to_owned)
+                .unwrap_or_else(|| anthropic_messages_endpoint(base_url)),
+        )),
+        "openai" | "openai-chat" | "chat-completions" => Ok((
+            ProviderTransport::OpenAiChat,
+            configured_upstream_url
+                .map(str::to_owned)
+                .unwrap_or_else(|| openai_chat_endpoint(base_url)),
+        )),
+        other => Err(format!(
+            "unsupported CLAUDE_BRIDGE_TRANSPORT '{other}' (expected auto, anthropic, or openai-chat)"
+        )),
+    }
+}
+
+fn anthropic_messages_endpoint(base_url: &str) -> String {
+    let base_url = base_url.trim().trim_end_matches('/');
+    if base_url.ends_with("/v1/messages") {
+        base_url.to_string()
+    } else {
+        format!("{base_url}/v1/messages")
+    }
+}
+
+fn openai_chat_endpoint(base_url: &str) -> String {
+    let base_url = base_url.trim().trim_end_matches('/');
+    if base_url.ends_with("/chat/completions") {
+        base_url.to_string()
+    } else if base_url.ends_with("/v1") || base_url.ends_with("/compatible-mode/v1") {
+        format!("{base_url}/chat/completions")
+    } else {
+        format!("{base_url}/v1/chat/completions")
+    }
+}
+
+fn known_openai_chat_endpoint(base_url: &str) -> Option<String> {
+    let normalized = normalize_base_url(base_url);
+
+    if normalized == "https://api.deepseek.com/anthropic" {
+        return Some("https://api.deepseek.com/chat/completions".to_string());
+    }
+    if normalized == "https://api.moonshot.cn/anthropic" {
+        return Some("https://api.moonshot.cn/v1/chat/completions".to_string());
+    }
+    if normalized == "https://api.moonshot.ai/anthropic" {
+        return Some("https://api.moonshot.ai/v1/chat/completions".to_string());
+    }
+    if let Some(prefix) = normalized.strip_suffix("/apps/anthropic") {
+        if prefix == "https://coding.dashscope.aliyuncs.com"
+            || prefix == "https://coding-intl.dashscope.aliyuncs.com"
+        {
+            return Some(format!("{prefix}/v1/chat/completions"));
+        }
+        if prefix.ends_with("dashscope.aliyuncs.com") || prefix.ends_with("maas.aliyuncs.com") {
+            return Some(format!("{prefix}/compatible-mode/v1/chat/completions"));
+        }
+    }
+    None
 }
 
 fn identity_override_enabled(value: &str) -> bool {
@@ -458,29 +581,37 @@ fn settings_dir_stamp(settings_dir: &Path) -> String {
     let Ok(entries) = fs::read_dir(settings_dir) else {
         return String::new();
     };
-    let mut count = 0u64;
-    let mut newest_secs = 0u64;
-    let mut total_len = 0u64;
-    for entry in entries.flatten() {
-        let path = entry.path();
+    let mut paths = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_provider_profile_file_name)
+        })
+        .collect::<Vec<_>>();
+    paths.sort_by_key(|path| path.to_string_lossy().to_ascii_lowercase());
+
+    let mut hasher = DefaultHasher::new();
+    for path in &paths {
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if !is_provider_profile_file_name(file_name) {
-            continue;
-        }
-        let Ok(metadata) = fs::metadata(&path) else {
+        file_name.hash(&mut hasher);
+        let Ok(metadata) = fs::metadata(path) else {
             continue;
         };
-        count += 1;
-        total_len += metadata.len();
+        metadata.len().hash(&mut hasher);
         if let Ok(modified) = metadata.modified() {
-            if let Ok(secs) = modified.duration_since(UNIX_EPOCH) {
-                newest_secs = newest_secs.max(secs.as_secs());
+            if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
+                duration.as_nanos().hash(&mut hasher);
             }
         }
+        if let Ok(contents) = fs::read(path) {
+            contents.hash(&mut hasher);
+        }
     }
-    format!("{count}:{newest_secs}:{total_len}")
+    format!("{}:{:016x}", paths.len(), hasher.finish())
 }
 
 fn read_state_object(state_path: &Path) -> Map<String, Value> {
@@ -592,6 +723,8 @@ fn provider_profile_json(profile: &ProviderProfile, active_file: &str) -> Value 
         "base_url": profile.base_url,
         "proxy": profile.proxy_url,
         "local_gemini": profile.local_gemini,
+        "transport": profile.transport.as_str(),
+        "upstream_url": profile.upstream_url,
         "active": profile.file_name == active_file
     })
 }
@@ -662,6 +795,13 @@ async fn admin_set_active_profile(
         )
             .into_response();
     };
+    let Ok(_transition) = state.admin_state_lock.lock() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "Cannot lock provider state"})),
+        )
+            .into_response();
+    };
     let Ok(mut routing) = state.routing.write() else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -718,6 +858,13 @@ async fn admin_reload_profiles(State(state): State<Arc<AppState>>) -> Response {
         Err(message) => {
             return (StatusCode::BAD_REQUEST, Json(json!({"error": message}))).into_response();
         }
+    };
+    let Ok(_transition) = state.admin_state_lock.lock() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "Cannot lock provider state"})),
+        )
+            .into_response();
     };
     let Ok(mut routing) = state.routing.write() else {
         return (
@@ -792,6 +939,13 @@ async fn admin_set_gemini_proxy(
         Err(message) => {
             return (StatusCode::BAD_REQUEST, Json(json!({"error": message}))).into_response();
         }
+    };
+    let Ok(_transition) = state.admin_state_lock.lock() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "Cannot lock provider state"})),
+        )
+            .into_response();
     };
     let active_profile = match state.routing.read() {
         Ok(routing) => routing.active_file.clone(),
@@ -1082,8 +1236,19 @@ async fn anthropic_messages(
             return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message);
         }
     }
-    if !active_profile.local_gemini {
-        return forward_anthropic_profile(active_profile, &headers, request).await;
+    match active_profile.transport {
+        ProviderTransport::Anthropic => {
+            return forward_anthropic_profile(active_profile, &headers, request).await;
+        }
+        ProviderTransport::OpenAiChat => {
+            return forward_openai_profile(
+                active_profile,
+                request,
+                state.thought_signatures.clone(),
+            )
+            .await;
+        }
+        ProviderTransport::LocalGemini => {}
     }
 
     let chat_request =
@@ -1186,7 +1351,7 @@ async fn forward_anthropic_profile(
     mut request: Value,
 ) -> Response {
     request["model"] = json!(profile.model);
-    let upstream_url = format!("{}/v1/messages", profile.base_url.trim_end_matches('/'));
+    let upstream_url = profile.upstream_url.clone();
     let upstream_request = profile.client.post(&upstream_url).json(&request);
     let upstream_request =
         apply_anthropic_forward_headers(upstream_request, &profile, client_headers);
@@ -1229,6 +1394,109 @@ async fn forward_anthropic_profile(
             &format!("Cannot build provider response: {err}"),
         )
     })
+}
+
+async fn forward_openai_profile(
+    profile: ProviderProfile,
+    request: Value,
+    thought_signatures: Arc<ThoughtSignatureCache>,
+) -> Response {
+    let upstream_model = display_model_name(&profile.model);
+    let chat_request =
+        match translate_anthropic_request(&request, &upstream_model, &thought_signatures) {
+            Ok(value) => value,
+            Err(message) => {
+                return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message);
+            }
+        };
+    let stream_requested = request
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let estimated_input_tokens =
+        u64::try_from(estimate_anthropic_input_tokens(&request)).unwrap_or(u64::MAX);
+
+    let Some(credential) = profile.auth_token.as_ref().or(profile.api_key.as_ref()) else {
+        return anthropic_error(
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "The active OpenAI-compatible profile has no API credential",
+        );
+    };
+    let upstream = match profile
+        .client
+        .post(&profile.upstream_url)
+        .bearer_auth(credential)
+        .json(&chat_request)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            error!(
+                "Provider '{}' OpenAI-compatible request to '{}' failed: {err}",
+                profile.file_name, profile.upstream_url
+            );
+            return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", &err.to_string());
+        }
+    };
+
+    let status = upstream.status();
+    if !status.is_success() {
+        let response_text = match upstream.text().await {
+            Ok(text) => text,
+            Err(err) => format!("Cannot read provider error response: {err}"),
+        };
+        let message = serde_json::from_str::<Value>(&response_text)
+            .ok()
+            .map(|value| safe_error_message(&value))
+            .unwrap_or(response_text);
+        error!(
+            "Provider '{}' returned HTTP {status}: {message}",
+            profile.file_name
+        );
+        return anthropic_error(
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            "api_error",
+            &message,
+        );
+    }
+
+    if stream_requested {
+        return anthropic_upstream_stream_response(
+            upstream,
+            upstream_model,
+            thought_signatures,
+            estimated_input_tokens,
+        );
+    }
+
+    let upstream_body = match upstream.json::<Value>().await {
+        Ok(value) => value,
+        Err(err) => {
+            error!(
+                "Provider '{}' returned a non-JSON response: {err}",
+                profile.file_name
+            );
+            return anthropic_error(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                "OpenAI-compatible provider returned a non-JSON response",
+            );
+        }
+    };
+    let message =
+        match translate_anthropic_response(&upstream_body, &upstream_model, &thought_signatures) {
+            Ok(value) => value,
+            Err(message) => {
+                error!(
+                    "Cannot translate provider '{}' response: {message}",
+                    profile.file_name
+                );
+                return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", &message);
+            }
+        };
+    Json(message).into_response()
 }
 
 fn apply_anthropic_forward_headers(
@@ -1422,7 +1690,7 @@ impl AnthropicStreamTranslator {
 
     fn process_payload(&mut self, payload: &str) -> Result<Vec<Event>, String> {
         let chunk: Value = serde_json::from_str(payload)
-            .map_err(|err| format!("Invalid JSON in Gemini SSE stream: {err}"))?;
+            .map_err(|err| format!("Invalid JSON in OpenAI-compatible SSE stream: {err}"))?;
         if chunk.get("error").is_some() {
             return Err(safe_error_message(&chunk));
         }
@@ -1749,7 +2017,7 @@ fn anthropic_upstream_stream_response(
                     },
                     Some(Err(err)) => {
                         pending.push_back(anthropic_stream_error_event(&format!(
-                            "Gemini stream failed: {err}"
+                            "OpenAI-compatible stream failed: {err}"
                         )));
                         ended = true;
                     }
@@ -3964,6 +4232,8 @@ mod tests {
             api_key: Some("api-key-secret".to_string()),
             proxy_url: None,
             local_gemini: false,
+            transport: ProviderTransport::Anthropic,
+            upstream_url: "https://example.invalid/v1/messages".to_string(),
             client: client.clone(),
         };
         let request = apply_anthropic_forward_headers(
@@ -3990,6 +4260,76 @@ mod tests {
             Some(DEFAULT_ANTHROPIC_VERSION)
         );
         assert!(!request.headers().contains_key("anthropic-beta"));
+    }
+
+    #[test]
+    fn routes_known_non_claude_providers_through_openai_chat() {
+        let cases = [
+            (
+                "https://dashscope.aliyuncs.com/apps/anthropic",
+                "qwen3.8-max",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+            ),
+            (
+                "https://api.deepseek.com/anthropic",
+                "deepseek-v4-pro",
+                "https://api.deepseek.com/chat/completions",
+            ),
+            (
+                "https://api.moonshot.cn/anthropic",
+                "kimi-k3",
+                "https://api.moonshot.cn/v1/chat/completions",
+            ),
+        ];
+
+        for (base_url, model, expected_url) in cases {
+            let (transport, upstream_url) =
+                resolve_provider_transport(base_url, model, false, None, None).unwrap();
+            assert_eq!(transport, ProviderTransport::OpenAiChat);
+            assert_eq!(upstream_url, expected_url);
+        }
+    }
+
+    #[test]
+    fn keeps_claude_and_unknown_providers_on_anthropic_by_default() {
+        let (claude_transport, claude_url) = resolve_provider_transport(
+            "https://openrouter.ai/api",
+            "anthropic/claude-opus-5",
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(claude_transport, ProviderTransport::Anthropic);
+        assert_eq!(claude_url, "https://openrouter.ai/api/v1/messages");
+
+        let (unknown_transport, unknown_url) = resolve_provider_transport(
+            "https://provider.example/anthropic",
+            "custom-model",
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(unknown_transport, ProviderTransport::Anthropic);
+        assert_eq!(
+            unknown_url,
+            "https://provider.example/anthropic/v1/messages"
+        );
+    }
+
+    #[test]
+    fn explicit_transport_and_upstream_url_override_auto_routing() {
+        let (transport, upstream_url) = resolve_provider_transport(
+            "https://provider.example/anthropic",
+            "custom-model",
+            false,
+            Some("openai-chat"),
+            Some("https://gateway.example/chat/completions"),
+        )
+        .unwrap();
+        assert_eq!(transport, ProviderTransport::OpenAiChat);
+        assert_eq!(upstream_url, "https://gateway.example/chat/completions");
     }
 
     #[test]
@@ -4175,6 +4515,8 @@ mod tests {
             api_key: Some("secret".to_string()),
             proxy_url: None,
             local_gemini: false,
+            transport: ProviderTransport::OpenAiChat,
+            upstream_url: "https://example.invalid/v1/chat/completions".to_string(),
             client,
         };
 
@@ -4243,6 +4585,8 @@ mod tests {
             api_key: None,
             proxy_url: None,
             local_gemini: false,
+            transport: ProviderTransport::OpenAiChat,
+            upstream_url: "https://example.invalid/v1/chat/completions".to_string(),
             client,
         };
 

@@ -100,8 +100,8 @@ Most users do **not** need Rust, Delphi, Inno Setup, or a local build environmen
 
 **[GitHub Releases — installer and portable ZIP](https://github.com/duojiwu58-boop/claude-code-gemini-bridge/releases/latest)**
 
-- **`ClaudeCodeBridge-0.1.3-Setup.exe` (recommended):** installs the native Windows service, model-switcher GUI, Start Menu shortcuts, automatic startup, recovery policy, configuration tools, and uninstaller.
-- **`ClaudeCodeBridge-0.1.3-windows-x64.zip`:** contains the same prebuilt service and GUI for portable/manual deployment. Extract it and run `Install.cmd` when service installation is desired.
+- **`ClaudeCodeBridge-0.1.4-Setup.exe` (recommended):** installs the native Windows service, model-switcher GUI, Start Menu shortcuts, automatic startup, recovery policy, configuration tools, and uninstaller.
+- **`ClaudeCodeBridge-0.1.4-windows-x64.zip`:** contains the same prebuilt service and GUI for portable/manual deployment. Extract it and run `Install.cmd` when service installation is desired.
 
 After installation, open **Claude Code 模型中心**, select or double-click a model, and the next Claude Code request uses it immediately—no VS Code reload or Claude Code restart is required.
 
@@ -118,8 +118,12 @@ After installation, open **Claude Code 模型中心**, select or double-click a 
 - `CLAUDE_SETTINGS_DIR` (Claude provider profile directory)
 - `CLAUDE_BRIDGE_UPSTREAM_IDENTITY` (optional per-profile model identity shown to the upstream model)
 - `CLAUDE_BRIDGE_IDENTITY_OVERRIDE` (optional per-profile switch; defaults to `true`)
+- `CLAUDE_BRIDGE_TRANSPORT` (optional per-profile transport: `auto`, `anthropic`, or `openai-chat`; defaults to `auto`)
+- `CLAUDE_BRIDGE_UPSTREAM_URL` (optional exact per-profile endpoint used with an explicit transport)
 
 When the override is active for a non-Claude profile, the bridge adapts the request's system prompt before routing: it replaces the Claude persona declarations Claude Code injects (main, coordinator, and subagent variants, plus the "powered by the model" environment line and the `Co-Authored-By: Claude` git attribution) with the true upstream identity, and appends a factual `<bridge_runtime_identity>` routing note naming the real upstream model. Identity questions pass through verbatim and are answered by the upstream model itself; the bridge never generates answers or rewrites upstream content. Factual references to Claude Code as a tool stay untouched. If `CLAUDE_BRIDGE_UPSTREAM_IDENTITY` is unset, the identity falls back to the profile model name (with provider routing suffixes such as `[1m]` removed).
+
+In `auto` mode, known non-Claude Anthropic-compatible profiles for Qwen/DashScope, DeepSeek, and Kimi/Moonshot are routed through each provider's native OpenAI Chat Completions endpoint. The bridge converts only the wire protocol; the downstream model still produces the answer. Claude profiles and unknown providers remain on Anthropic pass-through for compatibility. Custom providers can opt in with `CLAUDE_BRIDGE_TRANSPORT=openai-chat` and an exact `CLAUDE_BRIDGE_UPSTREAM_URL`.
 
 ### Run from Source
 
@@ -187,5 +191,13 @@ Claude Code 始终连接本地固定的 `http://127.0.0.1:18787`。双击配套�
 
 👉 **[前往 GitHub Releases 下载安装包与免安装 ZIP](https://github.com/duojiwu58-boop/claude-code-gemini-bridge/releases/latest)**
 
-- **`ClaudeCodeBridge-0.1.3-Setup.exe`（推荐）**：一键安装程序，注册 Windows 系统服务、配置开机自启、创建开始菜单快捷方式并附带 GUI 切换器。
-- **`ClaudeCodeBridge-0.1.3-windows-x64.zip`**：绿色免安装包，解压即用。
+- **`ClaudeCodeBridge-0.1.4-Setup.exe`（推荐）**：一键安装程序，注册 Windows 系统服务、配置开机自启、创建开始菜单快捷方式并附带 GUI 切换器。
+- **`ClaudeCodeBridge-0.1.4-windows-x64.zip`**：绿色免安装包，解压即用。
+
+---
+
+## License / 许可证
+
+This project is licensed under the **GNU General Public License v3.0 (GPL-3.0)** — see the [LICENSE](LICENSE) file for the full text. You may freely use, modify, and redistribute it, provided derivative works are also released under GPL-3.0 with source available.
+
+本项目采用 **GNU GPL v3.0** 协议开源，完整条款见 [LICENSE](LICENSE)。您可以自由使用、修改和再分发，但衍生作品也须以 GPL-3.0 协议开源。

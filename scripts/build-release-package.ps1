@@ -1,5 +1,5 @@
 ﻿param(
-    [string]$Version = '0.1.3'
+    [string]$Version = '0.1.4'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -14,12 +14,14 @@ $appIcon = Join-Path `
     'gui\delphi11\ClaudeBridgeManager\assets\ClaudeBridgeManager.ico'
 $settingsTemplate = Join-Path $projectDir 'claude-settings.example.json'
 $bridgeSettingsTemplate = Join-Path $projectDir 'claude-settings.bridge.json'
+$licenseFile = Join-Path $projectDir 'LICENSE'
 $innoScript = Join-Path $projectDir 'packaging\inno\ClaudeCodeBridge.iss'
 $distDir = Join-Path $projectDir 'dist'
 $packageName = "ClaudeCodeBridge-$Version-windows-x64"
 $stagingDir = Join-Path $distDir $packageName
 $zipPath = Join-Path $distDir "$packageName.zip"
 $setupPath = Join-Path $distDir "ClaudeCodeBridge-$Version-Setup.exe"
+$releaseChecksumsPath = Join-Path $distDir "SHA256SUMS-v$Version.txt"
 
 foreach ($requiredPath in @(
     $packageTemplateDir
@@ -27,6 +29,7 @@ foreach ($requiredPath in @(
     $appIcon
     $settingsTemplate
     $bridgeSettingsTemplate
+    $licenseFile
     $innoScript
 )) {
     if (-not (Test-Path -LiteralPath $requiredPath)) {
@@ -96,6 +99,9 @@ Copy-Item `
 Copy-Item `
     -LiteralPath $bridgeSettingsTemplate `
     -Destination (Join-Path $stagingDir 'claude-settings.bridge.json')
+Copy-Item `
+    -LiteralPath $licenseFile `
+    -Destination (Join-Path $stagingDir 'LICENSE')
 
 $hashLines = Get-ChildItem -LiteralPath $stagingDir -File -Recurse |
     Sort-Object FullName |
@@ -161,8 +167,17 @@ if (-not (Test-Path -LiteralPath $setupPath -PathType Leaf)) {
 
 $zipHash = Get-FileHash -LiteralPath $zipPath -Algorithm SHA256
 $setupHash = Get-FileHash -LiteralPath $setupPath -Algorithm SHA256
+[System.IO.File]::WriteAllLines(
+    $releaseChecksumsPath,
+    @(
+        "$($setupHash.Hash)  $($setupPath | Split-Path -Leaf)"
+        "$($zipHash.Hash)  $($zipPath | Split-Path -Leaf)"
+    ),
+    [System.Text.UTF8Encoding]::new($false)
+)
 Write-Output "package_dir=$stagingDir"
 Write-Output "package_zip=$zipPath"
 Write-Output "zip_sha256=$($zipHash.Hash)"
 Write-Output "package_setup=$setupPath"
 Write-Output "setup_sha256=$($setupHash.Hash)"
+Write-Output "release_checksums=$releaseChecksumsPath"

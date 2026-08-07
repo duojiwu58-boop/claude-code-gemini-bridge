@@ -7,6 +7,22 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 
 ## English
 
+## [v0.1.4] - 2026-08-07
+
+### Highlights & Fixes
+- Added provider-aware routing through native OpenAI Chat Completions endpoints for Qwen/DashScope, DeepSeek, and Kimi/Moonshot while keeping Claude and unknown providers on Anthropic pass-through.
+- Removed bridge-generated identity answers: identity questions now reach the downstream model verbatim, and response text is never rewritten by the bridge.
+- Added explicit per-profile `CLAUDE_BRIDGE_TRANSPORT` and `CLAUDE_BRIDGE_UPSTREAM_URL` overrides.
+- Fixed GUI background-task lifetime handling, refresh-button recovery, and concurrent model/proxy state updates.
+- Added deterministic profile-change detection and serialized bridge-state persistence.
+- Added GPL-3.0 licensing metadata and bundled the license in the portable package and installer.
+
+### Verification
+- 37 Rust unit tests passed.
+- Delphi 11 GUI compiled with 0 warnings and 0 errors.
+- Real Qwen routing returned its downstream identity through the OpenAI-compatible endpoint.
+- Installer and portable ZIP verified with SHA-256 checksums.
+
 ## [v0.1.3] - 2026-08-04
 
 ### Highlights & Features
@@ -27,6 +43,22 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 ---
 
 ## 中文
+
+## [v0.1.4] - 2026-08-07
+
+### 核心改进与修复
+- 为 Qwen/百炼、DeepSeek、Kimi/Moonshot 增加原生 OpenAI Chat Completions 路由；Claude 和未知供应商继续使用 Anthropic 直通。
+- 删除桥接器生成身份回答的逻辑：身份问题原样发送给下游模型，桥接器不再改写回答正文。
+- 新增逐配置的 `CLAUDE_BRIDGE_TRANSPORT` 与 `CLAUDE_BRIDGE_UPSTREAM_URL` 显式覆盖选项。
+- 修复 GUI 后台任务生命周期、刷新按钮恢复，以及模型切换与代理设置的并发状态覆盖问题。
+- 增加可靠的配置变更检测，并串行化桥接状态持久化。
+- 增加 GPL-3.0 许可证元数据，并将许可证纳入便携包和安装程序。
+
+### 验证
+- 37 项 Rust 单元测试全部通过。
+- Delphi 11 GUI 编译 0 警告、0 错误。
+- 真实 Qwen 路由通过 OpenAI-compatible 端点返回其下游身份。
+- 安装程序和便携 ZIP 均通过 SHA-256 校验。
 
 ## [v0.1.3] - 2026-08-04
 

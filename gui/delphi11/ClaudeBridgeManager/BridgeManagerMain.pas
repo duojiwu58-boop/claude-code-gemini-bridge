@@ -90,6 +90,7 @@ type
     FProxyDirty: Boolean;
     FUpdatingProxy: Boolean;
     FSettingsStamp: string;
+    FWorkerCount: Integer;
     procedure FormShown(Sender: TObject);
     procedure FormResize(Sender: TObject);
     procedure RefreshClick(Sender: TObject);
@@ -587,6 +588,13 @@ procedure TMainForm.DoClose(var Action: TCloseAction);
 begin
   FClosing := True;
   FPollTimer.Enabled := False;
+  if FWorkerCount > 0 then
+  begin
+    Enabled := False;
+    FStatusBar.Panels[0].Text := '正在等待后台操作结束...';
+    Action := caNone;
+    Exit;
+  end;
   Action := caFree;
   Application.Terminate;
 end;
@@ -612,8 +620,15 @@ begin
   LQueued :=
     procedure
     begin
-      if not FClosing then
-        AProc();
+      try
+        if not FClosing then
+          AProc();
+      finally
+        if FWorkerCount > 0 then
+          Dec(FWorkerCount);
+        if FClosing and (FWorkerCount = 0) and HandleAllocated then
+          PostMessage(Handle, WM_CLOSE, 0, 0);
+      end;
     end;
   TThread.Queue(nil, LQueued);
 end;
@@ -881,16 +896,20 @@ begin
   if ABusy then
   begin
     FRefreshButton.Enabled := False;
+    FProfileList.Enabled := False;
     FSwitchButton.Enabled := False;
     FStartButton.Enabled := False;
     FStopButton.Enabled := False;
     FTestProxyButton.Enabled := False;
     FApplyProxyButton.Enabled := False;
+    FDetectProxyButton.Enabled := False;
     Screen.Cursor := crHourGlass;
   end
   else
   begin
     Screen.Cursor := crDefault;
+    FRefreshButton.Enabled := True;
+    FProfileList.Enabled := True;
     FDetectProxyButton.Enabled := True;
     RefreshStatusAsync(True);
   end;
@@ -945,6 +964,7 @@ begin
   if FClosing or FStatusInFlight then
     Exit;
   FStatusInFlight := True;
+  Inc(FWorkerCount);
   TThread.CreateAnonymousThread(
     procedure
     var
@@ -1045,6 +1065,7 @@ begin
   LEditProxy := Trim(FProxyEdit.Text);
   if not AQuiet then
     SetBusy(True);
+  Inc(FWorkerCount);
   TThread.CreateAnonymousThread(
     procedure
     var
@@ -1056,6 +1077,7 @@ begin
       LRows: TArray<TProfileRow>;
       LRow: TProfileRow;
       LStamp: string;
+      LTransport: string;
       LError: string;
       I: Integer;
     begin
@@ -1078,11 +1100,15 @@ begin
               LRow.BaseUrl := JsonText(LProfile, 'base_url');
               LRow.Proxy := JsonText(LProfile, 'proxy');
               LRow.Active := JsonBool(LProfile, 'active');
-              if JsonBool(LProfile, 'local_gemini') then
+              LTransport := JsonText(LProfile, 'transport');
+              if SameText(LTransport, 'gemini') or
+                 JsonBool(LProfile, 'local_gemini') then
               begin
                 LRow.Route := 'Gemini 转换';
                 LRow.Proxy := LEditProxy;
               end
+              else if SameText(LTransport, 'openai-chat') then
+                LRow.Route := 'OpenAI 转换'
               else
                 LRow.Route := 'Anthropic 直通';
               if LRow.Proxy = '' then
@@ -1167,9 +1193,10 @@ end;
 
 procedure TMainForm.SwitchProfileAsync(const AFileName: string);
 begin
-  if FClosing then
+  if FClosing or FBusy then
     Exit;
   SetBusy(True);
+  Inc(FWorkerCount);
   TThread.CreateAnonymousThread(
     procedure
     var
@@ -1312,6 +1339,7 @@ begin
   if FClosing then
     Exit;
   SetBusy(True);
+  Inc(FWorkerCount);
   TThread.CreateAnonymousThread(
     procedure
     var
@@ -1393,8 +1421,11 @@ procedure TMainForm.TestProxyClick(Sender: TObject);
 var
   LBody: string;
 begin
+  if FClosing or FBusy then
+    Exit;
   LBody := ProxyRequestJson;
   FTestProxyButton.Enabled := False;
+  Inc(FWorkerCount);
   TThread.CreateAnonymousThread(
     procedure
     var
@@ -1439,8 +1470,11 @@ procedure TMainForm.ApplyProxyClick(Sender: TObject);
 var
   LBody: string;
 begin
+  if FClosing or FBusy then
+    Exit;
   LBody := ProxyRequestJson;
-  FApplyProxyButton.Enabled := False;
+  SetBusy(True);
+  Inc(FWorkerCount);
   TThread.CreateAnonymousThread(
     procedure
     var
@@ -1466,7 +1500,7 @@ begin
       QueueToMain(
         procedure
         begin
-          FApplyProxyButton.Enabled := (not FBusy) and (FStatusLabel.Tag = 1);
+          SetBusy(False);
           if LError <> '' then
           begin
             AppendLog('保存 Gemini 代理失败：' + LError);

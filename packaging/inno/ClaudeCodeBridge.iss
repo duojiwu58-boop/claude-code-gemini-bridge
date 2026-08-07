@@ -1,5 +1,5 @@
 ﻿#ifndef AppVersion
-  #define AppVersion "0.1.3"
+  #define AppVersion "0.1.4"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\windows-x64"
@@ -26,6 +26,7 @@ ArchitecturesInstallIn64BitMode=x64
 MinVersion=6.1sp1
 SetupLogging=yes
 SetupIconFile={#SourceDir}\ClaudeBridgeManager.ico
+LicenseFile={#SourceDir}\LICENSE
 UninstallDisplayIcon={app}\ClaudeBridgeManager.exe
 VersionInfoVersion={#AppVersion}
 VersionInfoDescription=Claude Code Multi-Model Bridge Setup
@@ -42,6 +43,7 @@ Source: "{#SourceDir}\install.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\update-api-key.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\uninstall.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\使用说明.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\scripts\*"; DestDir: "{app}\scripts"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceDir}\scripts\stop-bridge.ps1"; Flags: dontcopy
 
