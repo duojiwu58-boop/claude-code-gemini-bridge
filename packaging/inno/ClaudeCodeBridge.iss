@@ -1,5 +1,5 @@
 ﻿#ifndef AppVersion
-  #define AppVersion "0.3.1"
+  #define AppVersion "0.3.2"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\windows-x64"
@@ -23,7 +23,7 @@ SolidCompression=yes
 PrivilegesRequired=admin
 ArchitecturesAllowed=x64
 ArchitecturesInstallIn64BitMode=x64
-MinVersion=6.1sp1
+MinVersion=10.0
 SetupLogging=yes
 SetupIconFile={#SourceDir}\ClaudeBridgeManager.ico
 LicenseFile={#SourceDir}\LICENSE

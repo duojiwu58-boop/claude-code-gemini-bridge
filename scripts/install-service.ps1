@@ -14,6 +14,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $serviceName = 'ClaudeCodeBridge'
+$serviceAccount = "NT SERVICE\$serviceName"
 $displayName = 'Claude Code Multi-Model Bridge'
 $projectDir = Split-Path -Parent $PSScriptRoot
 $buildTargetDir = Join-Path $projectDir 'target\service-build'
@@ -27,6 +28,37 @@ $logDir = Join-Path $serviceDir 'logs'
 $stateFile = Join-Path $projectDir 'bridge-state.json'
 $legacyPidFile = Join-Path $projectDir 'target\bridge.pid'
 $registryPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$serviceName"
+
+function Grant-ServicePathAccess {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+        [Parameter(Mandatory)]
+        [Security.AccessControl.FileSystemRights]$Rights
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+    $item = Get-Item -LiteralPath $Path
+    $inheritance = if ($item.PSIsContainer) {
+        [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+        [Security.AccessControl.InheritanceFlags]::ObjectInherit
+    }
+    else {
+        [Security.AccessControl.InheritanceFlags]::None
+    }
+    $acl = Get-Acl -LiteralPath $Path
+    $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+        $serviceAccount,
+        $Rights,
+        $inheritance,
+        [Security.AccessControl.PropagationFlags]::None,
+        [Security.AccessControl.AccessControlType]::Allow
+    )
+    $acl.SetAccessRule($rule)
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [Security.Principal.WindowsPrincipal]::new($identity)
@@ -167,6 +199,15 @@ else {
     }
 }
 
+& sc.exe config $serviceName obj= $serviceAccount | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to configure the isolated service account (sc.exe exit $LASTEXITCODE)."
+}
+& sc.exe sidtype $serviceName unrestricted | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to enable the service SID (sc.exe exit $LASTEXITCODE)."
+}
+
 & sc.exe config $serviceName start= delayed-auto | Out-Null
 if ($LASTEXITCODE -ne 0) {
     throw "Failed to enable delayed automatic startup (sc.exe exit $LASTEXITCODE)."
@@ -229,6 +270,32 @@ New-ItemProperty `
     -PropertyType MultiString `
     -Value $serviceEnvironment `
     -Force | Out-Null
+
+if (-not (Test-Path -LiteralPath $stateFile -PathType Leaf)) {
+    [System.IO.File]::WriteAllText(
+        $stateFile,
+        '{}',
+        [System.Text.UTF8Encoding]::new($false)
+    )
+}
+Grant-ServicePathAccess `
+    -Path $serviceDir `
+    -Rights ([Security.AccessControl.FileSystemRights]::ReadAndExecute)
+Grant-ServicePathAccess `
+    -Path $logDir `
+    -Rights ([Security.AccessControl.FileSystemRights]::Modify)
+Grant-ServicePathAccess `
+    -Path $ClaudeSettingsDir `
+    -Rights ([Security.AccessControl.FileSystemRights]::ReadAndExecute)
+Grant-ServicePathAccess `
+    -Path $resolvedProviderConfigDir `
+    -Rights ([Security.AccessControl.FileSystemRights]::ReadAndExecute)
+Grant-ServicePathAccess `
+    -Path $ApiKeyProfile `
+    -Rights ([Security.AccessControl.FileSystemRights]::Read)
+Grant-ServicePathAccess `
+    -Path $stateFile `
+    -Rights ([Security.AccessControl.FileSystemRights]::Modify)
 
 Start-Service -Name $serviceName
 $service = Get-Service -Name $serviceName

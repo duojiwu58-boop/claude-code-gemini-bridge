@@ -1,5 +1,5 @@
 ﻿param(
-    [string]$Version = '0.3.1'
+    [string]$Version = '0.3.2'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -117,6 +117,17 @@ Copy-Item `
 Copy-Item `
     -LiteralPath $licenseFile `
     -Destination (Join-Path $stagingDir 'LICENSE')
+
+$usagePath = Join-Path $stagingDir '使用说明.txt'
+$usageText = [System.IO.File]::ReadAllText(
+    $usagePath,
+    [System.Text.UTF8Encoding]::new($false)
+)
+[System.IO.File]::WriteAllText(
+    $usagePath,
+    $usageText,
+    [System.Text.UTF8Encoding]::new($true)
+)
 
 $hashLines = Get-ChildItem -LiteralPath $stagingDir -File -Recurse |
     Sort-Object FullName |

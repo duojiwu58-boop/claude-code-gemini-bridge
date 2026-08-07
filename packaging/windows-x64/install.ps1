@@ -105,6 +105,7 @@ function Get-WindowsProxyUrl {
 }
 
 $serviceName = 'ClaudeCodeBridge'
+$serviceAccount = "NT SERVICE\$serviceName"
 $displayName = 'Claude Code Multi-Model Bridge'
 $packageDir = Split-Path -Parent $PSCommandPath
 $packageExe = Join-Path $packageDir 'claude-bridge.exe'
@@ -136,6 +137,37 @@ $geminiProfile = Join-Path $providersDir 'gemini.json'
 $serviceRegistry = "HKLM:\SYSTEM\CurrentControlSet\Services\$serviceName"
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 New-Item -ItemType Directory -Path $providersDir -Force | Out-Null
+
+function Grant-ServicePathAccess {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+        [Parameter(Mandatory)]
+        [Security.AccessControl.FileSystemRights]$Rights
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+    $item = Get-Item -LiteralPath $Path
+    $inheritance = if ($item.PSIsContainer) {
+        [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+        [Security.AccessControl.InheritanceFlags]::ObjectInherit
+    }
+    else {
+        [Security.AccessControl.InheritanceFlags]::None
+    }
+    $acl = Get-Acl -LiteralPath $Path
+    $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+        $serviceAccount,
+        $Rights,
+        $inheritance,
+        [Security.AccessControl.PropagationFlags]::None,
+        [Security.AccessControl.AccessControlType]::Allow
+    )
+    $acl.SetAccessRule($rule)
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
 
 if ($Port -ne 18787) {
     throw '当前 GUI 发布版固定使用端口 18787。'
@@ -424,6 +456,15 @@ else {
     }
 }
 
+& sc.exe config $serviceName obj= $serviceAccount | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "设置隔离服务账户失败，sc.exe 返回 $LASTEXITCODE。"
+}
+& sc.exe sidtype $serviceName unrestricted | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "启用服务 SID 失败，sc.exe 返回 $LASTEXITCODE。"
+}
+
 & sc.exe config $serviceName start= delayed-auto | Out-Null
 if ($LASTEXITCODE -ne 0) {
     throw "设置自动启动失败，sc.exe 返回 $LASTEXITCODE。"
@@ -533,6 +574,25 @@ else {
     ($bridgeState | ConvertTo-Json -Depth 8 -Compress),
     $utf8NoBom
 )
+
+Grant-ServicePathAccess `
+    -Path $installDir `
+    -Rights ([Security.AccessControl.FileSystemRights]::ReadAndExecute)
+Grant-ServicePathAccess `
+    -Path $programDataDir `
+    -Rights ([Security.AccessControl.FileSystemRights]::Modify)
+Grant-ServicePathAccess `
+    -Path $claudeDir `
+    -Rights ([Security.AccessControl.FileSystemRights]::ReadAndExecute)
+Grant-ServicePathAccess `
+    -Path $providersDir `
+    -Rights ([Security.AccessControl.FileSystemRights]::ReadAndExecute)
+if (-not [string]::IsNullOrWhiteSpace($keyProfileEntry)) {
+    $serviceKeyProfile = ($keyProfileEntry -split '=', 2)[1]
+    Grant-ServicePathAccess `
+        -Path $serviceKeyProfile `
+        -Rights ([Security.AccessControl.FileSystemRights]::Read)
+}
 
 if (-not $SkipShortcuts) {
     $desktop = [Environment]::GetFolderPath('DesktopDirectory')

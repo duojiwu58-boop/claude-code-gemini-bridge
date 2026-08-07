@@ -8,13 +8,14 @@
 mod windows_service;
 
 use std::{
-    collections::{hash_map::DefaultHasher, VecDeque},
+    collections::{hash_map::DefaultHasher, HashSet, VecDeque},
     convert::Infallible,
     env, fs,
     hash::{Hash, Hasher},
+    io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -34,12 +35,15 @@ use indexmap::IndexMap;
 use reqwest::{Client, Proxy};
 use serde_json::{json, Map, Value};
 use tower_http::trace::TraceLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use uuid::Uuid;
 
 const THOUGHT_SIGNATURE_CAPACITY: usize = 4096;
 const THOUGHT_SIGNATURE_EVICTION_BATCH: usize = 512;
+const MAX_UPSTREAM_SSE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const UPSTREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 const BRIDGE_IDENTITY_MARKER: &str = "<bridge_runtime_identity>";
 const MAX_UPSTREAM_IDENTITY_CHARS: usize = 200;
@@ -230,7 +234,7 @@ struct AppState {
     providers_dir: PathBuf,
     bridge_state_path: PathBuf,
     local_bridge_base_url: String,
-    admin_state_lock: Arc<Mutex<()>>,
+    admin_state_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 fn main() {
@@ -363,7 +367,7 @@ where
         providers_dir,
         bridge_state_path,
         local_bridge_base_url,
-        admin_state_lock: Arc::new(Mutex::new(())),
+        admin_state_lock: Arc::new(tokio::sync::Mutex::new(())),
     });
 
     let app = Router::new()
@@ -468,9 +472,8 @@ async fn shutdown_signal(
 }
 
 fn is_provider_profile_file_name(file_name: &str) -> bool {
-    !file_name.eq_ignore_ascii_case("settings.json")
-        && file_name.starts_with("settings")
-        && file_name.ends_with(".json")
+    let file_name = file_name.to_ascii_lowercase();
+    file_name.starts_with("settings - ") && file_name.ends_with(".json")
 }
 
 fn is_native_provider_file_name(file_name: &str) -> bool {
@@ -743,7 +746,9 @@ fn openai_capabilities_json(capabilities: &OpenAiCapabilities) -> Value {
 }
 
 fn build_provider_client(file_name: &str, proxy_url: Option<&str>) -> Result<Client, String> {
-    let mut client_builder = Client::builder();
+    let mut client_builder = Client::builder()
+        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+        .timeout(UPSTREAM_REQUEST_TIMEOUT);
     if let Some(proxy_url) = proxy_url {
         client_builder = client_builder.proxy(
             Proxy::all(proxy_url)
@@ -880,76 +885,89 @@ fn load_legacy_provider_profiles(
 
     let mut profiles = Vec::new();
     for path in paths {
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| format!("Invalid profile file name '{}'", path.display()))?
-            .to_string();
-        let settings = read_profile_json(&path)?;
-        let env = settings
-            .get("env")
-            .and_then(Value::as_object)
-            .ok_or_else(|| format!("Profile '{file_name}' has no env object"))?;
-        let get_env = |name: &str| {
-            env.get(name)
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-        };
-        let base_url = get_env("ANTHROPIC_BASE_URL")
-            .ok_or_else(|| format!("Profile '{file_name}' has no ANTHROPIC_BASE_URL"))?;
-        let model = get_env("ANTHROPIC_MODEL")
-            .or_else(|| get_env("ANTHROPIC_DEFAULT_SONNET_MODEL"))
-            .ok_or_else(|| format!("Profile '{file_name}' has no model"))?;
-        let upstream_identity = get_env("CLAUDE_BRIDGE_UPSTREAM_IDENTITY");
-        let identity_override = get_env("CLAUDE_BRIDGE_IDENTITY_OVERRIDE")
-            .map(|value| identity_override_enabled(&value))
-            .unwrap_or(true);
-        let auth_token = get_env("ANTHROPIC_AUTH_TOKEN");
-        let api_key = get_env("ANTHROPIC_API_KEY");
-        if auth_token.is_none() && api_key.is_none() {
-            return Err(format!("Profile '{file_name}' has no API credential"));
+        match load_legacy_provider_profile(&path, local_bridge_base_url) {
+            Ok(profile) => profiles.push(profile),
+            Err(message) => warn!(
+                path = %path.display(),
+                error = %message,
+                "Skipping invalid optional legacy provider profile"
+            ),
         }
-        let proxy_url = get_env("HTTPS_PROXY")
-            .or_else(|| get_env("HTTP_PROXY"))
-            .or_else(|| get_env("ALL_PROXY"));
-        let client = build_provider_client(&file_name, proxy_url.as_deref())?;
-        let local_gemini =
-            normalize_base_url(&base_url) == normalize_base_url(local_bridge_base_url);
-        let (transport, upstream_url) = resolve_provider_transport(
-            &base_url,
-            &model,
-            local_gemini,
-            get_env("CLAUDE_BRIDGE_TRANSPORT").as_deref(),
-            get_env("CLAUDE_BRIDGE_UPSTREAM_URL").as_deref(),
-        )
-        .map_err(|err| format!("Invalid transport in profile '{file_name}': {err}"))?;
-
-        profiles.push(ProviderProfile {
-            display_name: file_name.trim_end_matches(".json").to_string(),
-            source: ProviderProfileSource::Legacy,
-            file_name,
-            model,
-            upstream_identity,
-            identity_override,
-            base_url,
-            auth_token,
-            api_key,
-            proxy_url,
-            local_gemini,
-            transport,
-            openai_capabilities: if local_gemini {
-                OpenAiCapabilities::local_gemini()
-            } else {
-                OpenAiCapabilities::default()
-            },
-            upstream_url,
-            client,
-        });
     }
 
     Ok(profiles)
+}
+
+fn load_legacy_provider_profile(
+    path: &Path,
+    local_bridge_base_url: &str,
+) -> Result<ProviderProfile, String> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("Invalid profile file name '{}'", path.display()))?
+        .to_string();
+    let settings = read_profile_json(path)?;
+    let env = settings
+        .get("env")
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("Profile '{file_name}' has no env object"))?;
+    let get_env = |name: &str| {
+        env.get(name)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    let base_url = get_env("ANTHROPIC_BASE_URL")
+        .ok_or_else(|| format!("Profile '{file_name}' has no ANTHROPIC_BASE_URL"))?;
+    let model = get_env("ANTHROPIC_MODEL")
+        .or_else(|| get_env("ANTHROPIC_DEFAULT_SONNET_MODEL"))
+        .ok_or_else(|| format!("Profile '{file_name}' has no model"))?;
+    let upstream_identity = get_env("CLAUDE_BRIDGE_UPSTREAM_IDENTITY");
+    let identity_override = get_env("CLAUDE_BRIDGE_IDENTITY_OVERRIDE")
+        .map(|value| identity_override_enabled(&value))
+        .unwrap_or(true);
+    let auth_token = get_env("ANTHROPIC_AUTH_TOKEN");
+    let api_key = get_env("ANTHROPIC_API_KEY");
+    if auth_token.is_none() && api_key.is_none() {
+        return Err(format!("Profile '{file_name}' has no API credential"));
+    }
+    let proxy_url = get_env("HTTPS_PROXY")
+        .or_else(|| get_env("HTTP_PROXY"))
+        .or_else(|| get_env("ALL_PROXY"));
+    let client = build_provider_client(&file_name, proxy_url.as_deref())?;
+    let local_gemini = normalize_base_url(&base_url) == normalize_base_url(local_bridge_base_url);
+    let (transport, upstream_url) = resolve_provider_transport(
+        &base_url,
+        &model,
+        local_gemini,
+        get_env("CLAUDE_BRIDGE_TRANSPORT").as_deref(),
+        get_env("CLAUDE_BRIDGE_UPSTREAM_URL").as_deref(),
+    )
+    .map_err(|err| format!("Invalid transport in profile '{file_name}': {err}"))?;
+
+    Ok(ProviderProfile {
+        display_name: file_name.trim_end_matches(".json").to_string(),
+        source: ProviderProfileSource::Legacy,
+        file_name,
+        model,
+        upstream_identity,
+        identity_override,
+        base_url,
+        auth_token,
+        api_key,
+        proxy_url,
+        local_gemini,
+        transport,
+        openai_capabilities: if local_gemini {
+            OpenAiCapabilities::local_gemini()
+        } else {
+            OpenAiCapabilities::default()
+        },
+        upstream_url,
+        client,
+    })
 }
 
 fn normalize_base_url(value: &str) -> String {
@@ -1070,10 +1088,9 @@ fn build_gemini_client(
     proxy_url: Option<&str>,
     timeout: Option<Duration>,
 ) -> Result<Client, String> {
-    let mut builder = Client::builder().connect_timeout(Duration::from_secs(15));
-    if let Some(timeout) = timeout {
-        builder = builder.timeout(timeout);
-    }
+    let mut builder = Client::builder()
+        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+        .timeout(timeout.unwrap_or(UPSTREAM_REQUEST_TIMEOUT));
     builder = match proxy_url.map(str::trim).filter(|value| !value.is_empty()) {
         Some(proxy_url) => builder.proxy(
             Proxy::all(proxy_url)
@@ -1164,23 +1181,92 @@ fn persist_bridge_state(
             .map(|value| Value::String(value.to_string()))
             .unwrap_or(Value::Null),
     );
-    fs::write(state_path, Value::Object(state_json).to_string()).map_err(|err| {
-        format!(
-            "Cannot persist bridge state to '{}': {err}",
-            state_path.display()
-        )
-    })
+    write_state_atomically(state_path, &Value::Object(state_json).to_string())
 }
 
 fn record_listen_in_state(state_path: &Path, listen: &str) -> Result<(), String> {
     let mut state_json = read_state_object(state_path);
     state_json.insert("listen".to_string(), Value::String(listen.to_string()));
-    fs::write(state_path, Value::Object(state_json).to_string()).map_err(|err| {
-        format!(
-            "Cannot record listen address in '{}': {err}",
+    write_state_atomically(state_path, &Value::Object(state_json).to_string())
+}
+
+fn write_state_atomically(state_path: &Path, contents: &str) -> Result<(), String> {
+    let file_name = state_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("bridge-state.json");
+    let temporary_path =
+        state_path.with_file_name(format!(".{file_name}.{}.tmp", Uuid::new_v4().simple()));
+    let write_result = (|| -> std::io::Result<()> {
+        let mut temporary = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary_path)?;
+        temporary.write_all(contents.as_bytes())?;
+        temporary.sync_all()?;
+        drop(temporary);
+        replace_file_atomically(&temporary_path, state_path)
+    })();
+    if let Err(err) = write_result {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(format!(
+            "Cannot atomically persist bridge state to '{}': {err}",
             state_path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_file_atomically(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+async fn provider_config_stamp_async(
+    providers_dir: PathBuf,
+    legacy_settings_dir: PathBuf,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || provider_config_stamp(&providers_dir, &legacy_settings_dir))
+        .await
+        .map_err(|err| format!("Cannot inspect provider configuration: {err}"))
+}
+
+async fn persist_bridge_state_async(
+    state_path: PathBuf,
+    active_profile: String,
+    proxy_url: Option<String>,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        persist_bridge_state(&state_path, &active_profile, proxy_url.as_deref())
     })
+    .await
+    .map_err(|err| format!("Cannot join bridge-state writer: {err}"))?
 }
 
 fn current_gemini_transport(state: &AppState) -> Result<GeminiTransport, String> {
@@ -1255,51 +1341,90 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Response {
                 .into_response();
         }
     };
-    let Ok(routing) = state.routing.read() else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "Cannot read provider routing state"})),
+    let (active_profile, profile_count, profile_source) = {
+        let Ok(routing) = state.routing.read() else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Cannot read provider routing state"})),
+            )
+                .into_response();
+        };
+        let active_profile = routing
+            .profiles
+            .iter()
+            .find(|profile| profile.file_name == routing.active_file)
+            .map(|profile| provider_profile_json(profile, &profile.file_name));
+        (
+            active_profile,
+            routing.profiles.len(),
+            routing.source.as_str(),
         )
-            .into_response();
     };
-    let profile = routing
-        .profiles
-        .iter()
-        .find(|profile| profile.file_name == routing.active_file);
+    let config_stamp =
+        match provider_config_stamp_async(state.providers_dir.clone(), state.settings_dir.clone())
+            .await
+        {
+            Ok(stamp) => stamp,
+            Err(message) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": message})),
+                )
+                    .into_response();
+            }
+        };
     Json(json!({
         "status": "ok",
-        "active_profile": profile.map(|profile| provider_profile_json(profile, &profile.file_name)),
-        "profile_count": routing.profiles.len(),
+        "active_profile": active_profile,
+        "profile_count": profile_count,
         "gemini_proxy": transport.proxy_url,
         "gemini_proxy_mode": if transport.proxy_url.is_some() { "proxy" } else { "direct" },
         "listen_url": state.local_bridge_base_url,
         "providers_dir": state.providers_dir.to_string_lossy(),
-        "profile_source": routing.source.as_str(),
+        "profile_source": profile_source,
         "settings_dir": state.settings_dir.to_string_lossy(),
-        "config_stamp": provider_config_stamp(&state.providers_dir, &state.settings_dir),
-        "settings_stamp": provider_config_stamp(&state.providers_dir, &state.settings_dir)
+        "config_stamp": config_stamp,
+        "settings_stamp": config_stamp
     }))
     .into_response()
 }
 
 async fn admin_profiles(State(state): State<Arc<AppState>>) -> Response {
-    let Ok(routing) = state.routing.read() else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "Cannot read provider routing state"})),
+    let (profiles, profile_source) = {
+        let Ok(routing) = state.routing.read() else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Cannot read provider routing state"})),
+            )
+                .into_response();
+        };
+        (
+            routing
+                .profiles
+                .iter()
+                .map(|profile| provider_profile_json(profile, &routing.active_file))
+                .collect::<Vec<_>>(),
+            routing.source.as_str(),
         )
-            .into_response();
     };
-    let profiles = routing
-        .profiles
-        .iter()
-        .map(|profile| provider_profile_json(profile, &routing.active_file))
-        .collect::<Vec<_>>();
+    let config_stamp =
+        match provider_config_stamp_async(state.providers_dir.clone(), state.settings_dir.clone())
+            .await
+        {
+            Ok(stamp) => stamp,
+            Err(message) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": message})),
+                )
+                    .into_response();
+            }
+        };
     Json(json!({
         "profiles": profiles,
-        "profile_source": routing.source.as_str(),
-        "config_stamp": provider_config_stamp(&state.providers_dir, &state.settings_dir),
-        "settings_stamp": provider_config_stamp(&state.providers_dir, &state.settings_dir)
+        "profile_source": profile_source,
+        "config_stamp": config_stamp,
+        "settings_stamp": config_stamp
     }))
     .into_response()
 }
@@ -1315,26 +1440,22 @@ async fn admin_set_active_profile(
         )
             .into_response();
     };
-    let Ok(_transition) = state.admin_state_lock.lock() else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "Cannot lock provider state"})),
-        )
-            .into_response();
+    let _transition = state.admin_state_lock.lock().await;
+    let selected = match state.routing.read() {
+        Ok(routing) => routing
+            .profiles
+            .iter()
+            .find(|profile| profile.file_name == file_name)
+            .cloned(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Cannot read provider routing state"})),
+            )
+                .into_response();
+        }
     };
-    let Ok(mut routing) = state.routing.write() else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "Cannot update provider routing state"})),
-        )
-            .into_response();
-    };
-    let Some(selected) = routing
-        .profiles
-        .iter()
-        .find(|profile| profile.file_name == file_name)
-        .cloned()
-    else {
+    let Some(selected) = selected else {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({"error": "Unknown provider profile"})),
@@ -1351,11 +1472,13 @@ async fn admin_set_active_profile(
                 .into_response();
         }
     };
-    if let Err(err) = persist_bridge_state(
-        &state.bridge_state_path,
-        &selected.file_name,
-        proxy_url.as_deref(),
-    ) {
+    if let Err(err) = persist_bridge_state_async(
+        state.bridge_state_path.clone(),
+        selected.file_name.clone(),
+        proxy_url,
+    )
+    .await
+    {
         error!("Cannot persist active profile and proxy state: {err}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1363,8 +1486,14 @@ async fn admin_set_active_profile(
         )
             .into_response();
     }
+    let Ok(mut routing) = state.routing.write() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "Cannot update provider routing state"})),
+        )
+            .into_response();
+    };
     routing.active_file = selected.file_name.clone();
-    drop(routing);
     Json(json!({
         "status": "ok",
         "active_profile": provider_profile_json(&selected, &selected.file_name)
@@ -1373,31 +1502,37 @@ async fn admin_set_active_profile(
 }
 
 async fn admin_reload_profiles(State(state): State<Arc<AppState>>) -> Response {
-    let loaded_profiles = match load_provider_profiles(
-        &state.providers_dir,
-        &state.settings_dir,
-        &state.local_bridge_base_url,
-    ) {
-        Ok(profiles) => profiles,
-        Err(message) => {
+    let providers_dir = state.providers_dir.clone();
+    let settings_dir = state.settings_dir.clone();
+    let local_bridge_base_url = state.local_bridge_base_url.clone();
+    let loaded_profiles = match tokio::task::spawn_blocking(move || {
+        load_provider_profiles(&providers_dir, &settings_dir, &local_bridge_base_url)
+    })
+    .await
+    {
+        Ok(Ok(profiles)) => profiles,
+        Ok(Err(message)) => {
             return (StatusCode::BAD_REQUEST, Json(json!({"error": message}))).into_response();
         }
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Cannot join profile loader: {err}")})),
+            )
+                .into_response();
+        }
     };
-    let Ok(_transition) = state.admin_state_lock.lock() else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "Cannot lock provider state"})),
-        )
-            .into_response();
+    let _transition = state.admin_state_lock.lock().await;
+    let active_file = match state.routing.read() {
+        Ok(routing) => routing.active_file.clone(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Cannot read provider routing state"})),
+            )
+                .into_response();
+        }
     };
-    let Ok(mut routing) = state.routing.write() else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "Cannot update provider routing state"})),
-        )
-            .into_response();
-    };
-    let active_file = routing.active_file.clone();
     let selected = if loaded_profiles
         .profiles
         .iter()
@@ -1405,7 +1540,13 @@ async fn admin_reload_profiles(State(state): State<Arc<AppState>>) -> Response {
     {
         active_file
     } else {
-        select_initial_profile(&loaded_profiles.profiles, &state.bridge_state_path)
+        loaded_profiles
+            .profiles
+            .iter()
+            .find(|profile| profile.local_gemini)
+            .or_else(|| loaded_profiles.profiles.first())
+            .map(|profile| profile.file_name.clone())
+            .unwrap_or_default()
     };
     let count = loaded_profiles.profiles.len();
     let proxy_url = match current_gemini_transport(&state) {
@@ -1419,7 +1560,8 @@ async fn admin_reload_profiles(State(state): State<Arc<AppState>>) -> Response {
         }
     };
     if let Err(err) =
-        persist_bridge_state(&state.bridge_state_path, &selected, proxy_url.as_deref())
+        persist_bridge_state_async(state.bridge_state_path.clone(), selected.clone(), proxy_url)
+            .await
     {
         error!("Cannot persist profiles and proxy state: {err}");
         return (
@@ -1428,6 +1570,13 @@ async fn admin_reload_profiles(State(state): State<Arc<AppState>>) -> Response {
         )
             .into_response();
     }
+    let Ok(mut routing) = state.routing.write() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "Cannot update provider routing state"})),
+        )
+            .into_response();
+    };
     routing.profiles = loaded_profiles.profiles;
     routing.source = loaded_profiles.source;
     routing.active_file = selected;
@@ -1466,13 +1615,7 @@ async fn admin_set_gemini_proxy(
             return (StatusCode::BAD_REQUEST, Json(json!({"error": message}))).into_response();
         }
     };
-    let Ok(_transition) = state.admin_state_lock.lock() else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "Cannot lock provider state"})),
-        )
-            .into_response();
-    };
+    let _transition = state.admin_state_lock.lock().await;
     let active_profile = match state.routing.read() {
         Ok(routing) => routing.active_file.clone(),
         Err(_) => {
@@ -1483,11 +1626,13 @@ async fn admin_set_gemini_proxy(
                 .into_response();
         }
     };
-    if let Err(message) = persist_bridge_state(
-        &state.bridge_state_path,
-        &active_profile,
-        proxy_url.as_deref(),
-    ) {
+    if let Err(message) = persist_bridge_state_async(
+        state.bridge_state_path.clone(),
+        active_profile,
+        proxy_url.clone(),
+    )
+    .await
+    {
         error!("{message}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1845,7 +1990,7 @@ async fn anthropic_messages(
             state.model.clone(),
             state.thought_signatures.clone(),
             estimated_input_tokens,
-            OpenAiCapabilities::default(),
+            local_capabilities.clone(),
         );
     }
 
@@ -1860,15 +2005,18 @@ async fn anthropic_messages(
             );
         }
     };
-    let message =
-        match translate_anthropic_response(&upstream_body, &state.model, &state.thought_signatures)
-        {
-            Ok(value) => value,
-            Err(message) => {
-                error!("Cannot translate Gemini response: {message}");
-                return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", &message);
-            }
-        };
+    let message = match translate_anthropic_response_with_capabilities(
+        &upstream_body,
+        &state.model,
+        &state.thought_signatures,
+        &local_capabilities,
+    ) {
+        Ok(value) => value,
+        Err(message) => {
+            error!("Cannot translate Gemini response: {message}");
+            return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", &message);
+        }
+    };
     Json(message).into_response()
 }
 
@@ -1882,7 +2030,14 @@ async fn forward_anthropic_profile(
     client_headers: &HeaderMap,
     mut request: Value,
 ) -> Response {
-    request["model"] = json!(profile.model);
+    let Some(request_object) = request.as_object_mut() else {
+        return anthropic_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Anthropic request body must be a JSON object",
+        );
+    };
+    request_object.insert("model".to_string(), Value::String(profile.model.clone()));
     let upstream_url = profile.upstream_url.clone();
     let upstream_request = profile.client.post(&upstream_url).json(&request);
     let upstream_request =
@@ -1911,6 +2066,10 @@ async fn forward_anthropic_profile(
         .or_else(|| upstream.headers().get("x-request-id"))
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
+    // The response body owns the reqwest stream. If Claude Code disconnects,
+    // Hyper drops this body and the upstream response stream with it, which
+    // cancels further socket reads. The client-wide timeout also bounds
+    // providers that ignore the closed connection and never finish a body.
     let body = Body::from_stream(upstream.bytes_stream());
     let mut builder = Response::builder()
         .status(status)
@@ -2067,23 +2226,25 @@ fn apply_anthropic_forward_headers(
 struct SseDataDecoder {
     buffer: Vec<u8>,
     data_lines: Vec<String>,
+    data_bytes: usize,
 }
 
 impl SseDataDecoder {
     fn push_bytes(&mut self, bytes: &[u8]) -> Result<Vec<String>, String> {
-        self.buffer.extend_from_slice(bytes);
         let mut payloads = Vec::new();
-
-        while let Some(newline_index) = self.buffer.iter().position(|byte| *byte == b'\n') {
-            let mut line_bytes: Vec<u8> = self.buffer.drain(..=newline_index).collect();
-            line_bytes.pop();
+        let mut cursor = 0;
+        while let Some(relative_newline) = bytes[cursor..].iter().position(|byte| *byte == b'\n') {
+            let newline = cursor + relative_newline;
+            self.extend_buffer(&bytes[cursor..newline])?;
+            let mut line_bytes = std::mem::take(&mut self.buffer);
             if line_bytes.last() == Some(&b'\r') {
                 line_bytes.pop();
             }
-            let line = String::from_utf8(line_bytes)
-                .map_err(|err| format!("Invalid UTF-8 in Gemini SSE stream: {err}"))?;
-            self.process_line(&line, &mut payloads);
+            let line = String::from_utf8_lossy(&line_bytes);
+            self.process_line(&line, &mut payloads)?;
+            cursor = newline + 1;
         }
+        self.extend_buffer(&bytes[cursor..])?;
 
         Ok(payloads)
     }
@@ -2095,31 +2256,56 @@ impl SseDataDecoder {
             if line_bytes.last() == Some(&b'\r') {
                 line_bytes.pop();
             }
-            let line = String::from_utf8(line_bytes)
-                .map_err(|err| format!("Invalid UTF-8 at end of Gemini SSE stream: {err}"))?;
-            self.process_line(&line, &mut payloads);
+            let line = String::from_utf8_lossy(&line_bytes);
+            self.process_line(&line, &mut payloads)?;
         }
         self.flush_data(&mut payloads);
         Ok(payloads)
     }
 
-    fn process_line(&mut self, line: &str, payloads: &mut Vec<String>) {
+    fn extend_buffer(&mut self, bytes: &[u8]) -> Result<(), String> {
+        if self.buffer.len().saturating_add(bytes.len()) > MAX_UPSTREAM_SSE_BUFFER_BYTES {
+            return Err(format!(
+                "OpenAI-compatible SSE line exceeds {} bytes",
+                MAX_UPSTREAM_SSE_BUFFER_BYTES
+            ));
+        }
+        self.buffer.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn process_line(&mut self, line: &str, payloads: &mut Vec<String>) -> Result<(), String> {
         if line.is_empty() {
             self.flush_data(payloads);
-            return;
+            return Ok(());
         }
         if line.starts_with(':') {
-            return;
+            return Ok(());
         }
         if let Some(data) = line.strip_prefix("data:") {
-            self.data_lines
-                .push(data.strip_prefix(' ').unwrap_or(data).to_string());
+            let data = data.strip_prefix(' ').unwrap_or(data);
+            let separator_bytes = usize::from(!self.data_lines.is_empty());
+            if self
+                .data_bytes
+                .saturating_add(separator_bytes)
+                .saturating_add(data.len())
+                > MAX_UPSTREAM_SSE_BUFFER_BYTES
+            {
+                return Err(format!(
+                    "OpenAI-compatible SSE event exceeds {} bytes",
+                    MAX_UPSTREAM_SSE_BUFFER_BYTES
+                ));
+            }
+            self.data_bytes += separator_bytes + data.len();
+            self.data_lines.push(data.to_string());
         }
+        Ok(())
     }
 
     fn flush_data(&mut self, payloads: &mut Vec<String>) {
         if !self.data_lines.is_empty() {
             payloads.push(std::mem::take(&mut self.data_lines).join("\n"));
+            self.data_bytes = 0;
         }
     }
 }
@@ -2304,6 +2490,12 @@ fn usage_token(usage: &Value, fields: &[&str]) -> Option<u64> {
         .find_map(|field| usage.get(*field).and_then(Value::as_u64))
 }
 
+fn safety_refusal_text(block_reason: &str) -> String {
+    format!(
+        "Gemini Safety Intercept: Request was blocked by safety guardrails (Reason: {block_reason})."
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TaggedContentState {
     Detecting,
@@ -2327,6 +2519,7 @@ struct AnthropicStreamTranslator {
     input_tokens: u64,
     output_tokens: u64,
     refusal_seen: bool,
+    safety_block_seen: bool,
     finished: bool,
 }
 
@@ -2372,6 +2565,7 @@ impl AnthropicStreamTranslator {
             input_tokens: estimated_input_tokens,
             output_tokens: 0,
             refusal_seen: false,
+            safety_block_seen: false,
             finished: false,
         }
     }
@@ -2406,6 +2600,20 @@ impl AnthropicStreamTranslator {
             .map_err(|err| format!("Invalid JSON in OpenAI-compatible SSE stream: {err}"))?;
         if chunk.get("error").is_some() {
             return Err(safe_error_message(&chunk));
+        }
+
+        if let Some(block_reason) = chunk
+            .pointer("/promptFeedback/blockReason")
+            .and_then(Value::as_str)
+        {
+            self.refusal_seen = true;
+            if self.safety_block_seen {
+                return Ok(Vec::new());
+            }
+            self.safety_block_seen = true;
+            let mut events = Vec::new();
+            self.emit_text_delta(&mut events, &safety_refusal_text(block_reason))?;
+            return Ok(events);
         }
 
         if let Some(usage) = chunk.get("usage") {
@@ -2620,13 +2828,31 @@ impl AnthropicStreamTranslator {
             .get("id")
             .and_then(Value::as_str)
             .filter(|id| !id.trim().is_empty());
+        let incoming_name = tool_call
+            .pointer("/function/name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty());
         let key = if let Some(index) = index {
             format!("index:{index}")
         } else if let Some(id) = incoming_id {
             format!("id:{id}")
-        } else if self.tool_calls.len() == 1 {
+        } else if incoming_name.is_some() {
+            let unnamed_existing = self.tool_calls.len() == 1
+                && self
+                    .tool_calls
+                    .get_index(0)
+                    .is_some_and(|(_, call)| call.name.is_empty());
+            if unnamed_existing {
+                self.tool_calls
+                    .get_index(0)
+                    .map(|(key, _)| key.clone())
+                    .unwrap_or_else(|| self.next_tool_key())
+            } else {
+                self.next_tool_key()
+            }
+        } else if !self.tool_calls.is_empty() {
             self.tool_calls
-                .get_index(0)
+                .get_index(self.tool_calls.len() - 1)
                 .map(|(key, _)| key.clone())
                 .unwrap_or_else(|| self.next_tool_key())
         } else {
@@ -2645,7 +2871,7 @@ impl AnthropicStreamTranslator {
         if let Some(id) = incoming_id {
             entry.id = id.to_string();
         }
-        if let Some(name) = tool_call.pointer("/function/name").and_then(Value::as_str) {
+        if let Some(name) = incoming_name {
             if entry.name.is_empty() {
                 entry.name = name.to_string();
             } else if entry.name != name && !name.is_empty() {
@@ -2693,23 +2919,36 @@ impl AnthropicStreamTranslator {
             )?;
         }
 
+        let tool_calls_allowed = !self.refusal_seen
+            && anthropic_stop_reason(self.finish_reason.as_deref(), !self.tool_calls.is_empty())
+                == "tool_use";
+        let valid_tool_calls = if tool_calls_allowed {
+            self.tool_calls
+                .values()
+                .filter_map(|tool_call| {
+                    match parse_tool_arguments_with_json(&tool_call.arguments) {
+                        Ok((_, normalized)) => Some((tool_call, normalized)),
+                        Err(message) => {
+                            warn!(
+                                tool_call_id = %tool_call.id,
+                                error = %message,
+                                "Skipping invalid streamed tool call"
+                            );
+                            None
+                        }
+                    }
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let stop_reason = if self.refusal_seen {
             "refusal"
         } else {
-            anthropic_stop_reason(self.finish_reason.as_deref(), !self.tool_calls.is_empty())
+            anthropic_stop_reason(self.finish_reason.as_deref(), !valid_tool_calls.is_empty())
         };
-        let emit_tool_calls = stop_reason == "tool_use";
-        if emit_tool_calls {
-            let normalized_arguments = self
-                .tool_calls
-                .values()
-                .map(|tool_call| {
-                    parse_tool_arguments_with_json(&tool_call.arguments)
-                        .map(|(_, normalized)| normalized)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-
-            for (tool_call, arguments) in self.tool_calls.values().zip(&normalized_arguments) {
+        if stop_reason == "tool_use" {
+            for (tool_call, arguments) in &valid_tool_calls {
                 let index = self.next_content_index;
                 self.next_content_index += 1;
                 let name = if tool_call.name.is_empty() {
@@ -3072,8 +3311,12 @@ fn remember_thought_signature(
     call_id: &str,
     signature: &str,
 ) {
-    let Ok(mut cache) = thought_signatures.write() else {
-        return;
+    let mut cache = match thought_signatures.write() {
+        Ok(cache) => cache,
+        Err(poisoned) => {
+            error!("Thought-signature cache write lock was poisoned; recovering cached state");
+            poisoned.into_inner()
+        }
     };
 
     // Refresh an existing entry to the newest position. At capacity, evict a
@@ -3087,6 +3330,20 @@ fn remember_thought_signature(
         }
     }
     cache.insert(call_id.to_string(), signature.to_string());
+}
+
+fn recalled_thought_signature(
+    thought_signatures: &ThoughtSignatureCache,
+    call_id: &str,
+) -> Option<String> {
+    let cache = match thought_signatures.read() {
+        Ok(cache) => cache,
+        Err(poisoned) => {
+            error!("Thought-signature cache read lock was poisoned; recovering cached state");
+            poisoned.into_inner()
+        }
+    };
+    cache.get(call_id).cloned()
 }
 
 fn sanitize_identity_label(value: &str) -> Option<String> {
@@ -3367,6 +3624,7 @@ fn translate_anthropic_request_with_capabilities(
 ) -> Result<Value, String> {
     let mut messages = Vec::new();
     let mut runtime_identity_reminder = None;
+    let mut pending_tool_call_ids = HashSet::new();
 
     if let Some(system) = request.get("system") {
         let text = value_to_text(system);
@@ -3392,9 +3650,19 @@ fn translate_anthropic_request_with_capabilities(
 
         match role {
             "assistant" => {
-                translate_anthropic_assistant_message(content, &mut messages, thought_signatures);
+                translate_anthropic_assistant_message(
+                    content,
+                    &mut messages,
+                    thought_signatures,
+                    &mut pending_tool_call_ids,
+                );
             }
-            "user" => translate_anthropic_user_message(content, &mut messages, capabilities),
+            "user" => translate_anthropic_user_message(
+                content,
+                &mut messages,
+                capabilities,
+                &mut pending_tool_call_ids,
+            ),
             "system" | "developer" => {
                 let text = value_to_text(content);
                 if !text.is_empty() {
@@ -3501,7 +3769,9 @@ fn translate_anthropic_assistant_message(
     content: &Value,
     messages: &mut Vec<Value>,
     thought_signatures: &ThoughtSignatureCache,
+    pending_tool_call_ids: &mut HashSet<String>,
 ) {
+    pending_tool_call_ids.clear();
     if let Some(text) = content.as_str() {
         if !text.is_empty() {
             messages.push(json!({"role": "assistant", "content": text}));
@@ -3529,6 +3799,7 @@ fn translate_anthropic_assistant_message(
                     .get("id")
                     .and_then(Value::as_str)
                     .unwrap_or("toolu_unknown");
+                pending_tool_call_ids.insert(call_id.to_string());
                 let name = part
                     .get("name")
                     .and_then(Value::as_str)
@@ -3545,11 +3816,7 @@ fn translate_anthropic_assistant_message(
                         "arguments": arguments
                     }
                 });
-                if let Some(signature) = thought_signatures
-                    .read()
-                    .ok()
-                    .and_then(|cache| cache.get(call_id).cloned())
-                {
+                if let Some(signature) = recalled_thought_signature(thought_signatures, call_id) {
                     translated["extra_content"] = json!({
                         "google": {"thought_signature": signature}
                     });
@@ -3581,15 +3848,18 @@ fn translate_anthropic_user_message(
     content: &Value,
     messages: &mut Vec<Value>,
     capabilities: &OpenAiCapabilities,
+    pending_tool_call_ids: &mut HashSet<String>,
 ) {
     if let Some(text) = content.as_str() {
         if !text.is_empty() {
             messages.push(json!({"role": "user", "content": text}));
         }
+        pending_tool_call_ids.clear();
         return;
     }
 
     let Some(parts) = content.as_array() else {
+        pending_tool_call_ids.clear();
         return;
     };
     let mut tool_results = Vec::new();
@@ -3602,6 +3872,13 @@ fn translate_anthropic_user_message(
                     .get("tool_use_id")
                     .and_then(Value::as_str)
                     .unwrap_or("toolu_unknown");
+                if !pending_tool_call_ids.remove(tool_use_id) {
+                    warn!(
+                        tool_call_id = %tool_use_id,
+                        "Skipping orphan Anthropic tool result"
+                    );
+                    continue;
+                }
                 let (result_content, media_parts) = translate_anthropic_tool_result_content(
                     part.get("content").unwrap_or(&Value::Null),
                     part.get("is_error").and_then(Value::as_bool) == Some(true),
@@ -3620,12 +3897,12 @@ fn translate_anthropic_user_message(
                 }
             }
             Some("image") => {
-                if let Some(media_part) = translate_anthropic_base64_media(part) {
+                if let Some(media_part) = translate_anthropic_media(part) {
                     user_parts.push(media_part);
                 }
             }
             Some("document") => {
-                if let Some(media_part) = translate_anthropic_base64_media(part) {
+                if let Some(media_part) = translate_anthropic_media(part) {
                     user_parts.push(media_part);
                 }
             }
@@ -3639,6 +3916,7 @@ fn translate_anthropic_user_message(
     // content regardless of their original content-block order.
     messages.extend(tool_results);
     flush_anthropic_user_parts(messages, &mut user_parts);
+    pending_tool_call_ids.clear();
 }
 
 fn translate_anthropic_tool_result_content(
@@ -3663,7 +3941,7 @@ fn translate_anthropic_tool_result_content(
                     }
                 }
                 Some(block_type @ ("image" | "document")) => {
-                    if let Some(media_part) = translate_anthropic_base64_media(part) {
+                    if let Some(media_part) = translate_anthropic_media(part) {
                         has_media = true;
                         translated_parts.push(media_part.clone());
                         result_text.push(
@@ -3714,18 +3992,32 @@ fn translate_anthropic_tool_result_content(
     (Value::String(result_text), Vec::new())
 }
 
-fn translate_anthropic_base64_media(part: &Value) -> Option<Value> {
+fn translate_anthropic_media(part: &Value) -> Option<Value> {
     let block_type = part.get("type").and_then(Value::as_str)?;
     let source = part.get("source")?;
+    if block_type != "image" && block_type != "document" {
+        return None;
+    }
+
+    if source.get("type").and_then(Value::as_str) == Some("url") {
+        if block_type != "image" {
+            return None;
+        }
+        let url = source
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|url| !url.trim().is_empty())?;
+        return Some(json!({
+            "type": "image_url",
+            "image_url": {"url": url}
+        }));
+    }
     if source.get("type").and_then(Value::as_str) != Some("base64") {
         return None;
     }
 
     let media_type = source.get("media_type").and_then(Value::as_str)?;
     if block_type == "document" && media_type != "application/pdf" {
-        return None;
-    }
-    if block_type != "image" && block_type != "document" {
         return None;
     }
     let data = source.get("data").and_then(Value::as_str)?;
@@ -3833,6 +4125,7 @@ fn translate_anthropic_tool_choice(choice: &Value) -> Option<Value> {
     }
 }
 
+#[cfg(test)]
 fn translate_anthropic_response(
     upstream: &Value,
     model: &str,
@@ -3873,9 +4166,7 @@ fn translate_anthropic_response_with_capabilities(
                 "model": model,
                 "content": [{
                     "type": "text",
-                    "text": format!(
-                        "Gemini Safety Intercept: Request was blocked by safety guardrails (Reason: {block_reason})."
-                    )
+                    "text": safety_refusal_text(block_reason)
                 }],
                 "stop_reason": "refusal",
                 "stop_sequence": Value::Null,
@@ -3945,7 +4236,17 @@ fn translate_anthropic_response_with_capabilities(
                 .and_then(Value::as_str)
                 .unwrap_or("unknown_function");
             let arguments = tool_arguments_text(tool_call.pointer("/function/arguments"));
-            let input = parse_tool_arguments(&arguments)?;
+            let input = match parse_tool_arguments(&arguments) {
+                Ok(input) => input,
+                Err(message) => {
+                    warn!(
+                        tool_call_id = %call_id,
+                        error = %message,
+                        "Skipping invalid non-streaming tool call"
+                    );
+                    continue;
+                }
+            };
 
             if let Some(signature) = tool_call
                 .pointer("/extra_content/google/thought_signature")
@@ -4077,6 +4378,7 @@ fn translate_input_items(
     thought_signatures: &ThoughtSignatureCache,
 ) {
     let mut pending_tool_calls = Vec::new();
+    let mut pending_tool_call_ids = HashSet::new();
 
     let flush_tool_calls = |messages: &mut Vec<Value>, pending: &mut Vec<Value>| {
         if !pending.is_empty() {
@@ -4104,16 +4406,13 @@ fn translate_input_items(
                     .get("arguments")
                     .and_then(Value::as_str)
                     .unwrap_or("{}");
+                pending_tool_call_ids.insert(call_id.to_string());
                 let mut translated_call = json!({
                     "id": call_id,
                     "type": "function",
                     "function": {"name": name, "arguments": arguments}
                 });
-                if let Some(signature) = thought_signatures
-                    .read()
-                    .ok()
-                    .and_then(|cache| cache.get(call_id).cloned())
-                {
+                if let Some(signature) = recalled_thought_signature(thought_signatures, call_id) {
                     translated_call["extra_content"] = json!({
                         "google": {"thought_signature": signature}
                     });
@@ -4126,6 +4425,13 @@ fn translate_input_items(
                     .get("call_id")
                     .and_then(Value::as_str)
                     .unwrap_or("call_unknown");
+                if !pending_tool_call_ids.remove(call_id) {
+                    warn!(
+                        tool_call_id = %call_id,
+                        "Skipping orphan Responses tool output"
+                    );
+                    continue;
+                }
                 let output = value_to_text(item.get("output").unwrap_or(&Value::Null));
                 messages.push(json!({
                     "role": "tool",
@@ -4136,6 +4442,7 @@ fn translate_input_items(
             Some("reasoning") => {}
             _ => {
                 flush_tool_calls(messages, &mut pending_tool_calls);
+                pending_tool_call_ids.clear();
                 let role = item
                     .get("role")
                     .and_then(Value::as_str)
@@ -4585,6 +4892,8 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        fs::write(settings_dir.join("settings.local.json"), b"{invalid").unwrap();
+        fs::write(settings_dir.join("settings - draft.json"), b"{invalid").unwrap();
 
         let loaded =
             load_provider_profiles(&providers_dir, &settings_dir, "http://127.0.0.1:18787")
@@ -4843,6 +5152,22 @@ mod tests {
     }
 
     #[test]
+    fn omits_orphan_responses_tool_outputs() {
+        let request = json!({
+            "input": [
+                {"type": "function_call_output", "call_id": "missing", "output": "ignored"},
+                {"role": "user", "content": [{"type": "input_text", "text": "continue"}]}
+            ]
+        });
+        let signatures = RwLock::new(IndexMap::new());
+
+        let translated = translate_request(&request, "fallback", &signatures).unwrap();
+        let messages = translated["messages"].as_array().unwrap();
+
+        assert!(messages.iter().all(|message| message["role"] != "tool"));
+    }
+
+    #[test]
     fn produces_completed_response_event() {
         let request = json!({"model": "gemini-3.6-flash", "input": "hello"});
         let upstream = json!({
@@ -4979,6 +5304,26 @@ mod tests {
     }
 
     #[test]
+    fn omits_orphan_anthropic_tool_results() {
+        let request = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "missing", "content": "ignored"},
+                    {"type": "text", "text": "continue"}
+                ]
+            }]
+        });
+        let signatures = RwLock::new(IndexMap::new());
+
+        let translated = translate_anthropic_request(&request, "qwen", &signatures).unwrap();
+        let messages = translated["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+    }
+
+    #[test]
     fn sanitizes_anthropic_tool_json_schema_recursively() {
         let tool = json!({
             "name": "inspect",
@@ -5036,9 +5381,19 @@ mod tests {
     #[test]
     fn translates_multimodal_tool_results_and_pdf_user_documents() {
         let request = json!({
-            "messages": [{
-                "role": "user",
-                "content": [
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_media",
+                        "name": "capture",
+                        "input": {}
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [
                     {
                         "type": "tool_result",
                         "tool_use_id": "toolu_media",
@@ -5055,6 +5410,13 @@ mod tests {
                         ]
                     },
                     {
+                        "type": "image",
+                        "source": {
+                            "type": "url",
+                            "url": "https://example.com/screenshot.png"
+                        }
+                    },
+                    {
                         "type": "document",
                         "source": {
                             "type": "base64",
@@ -5062,8 +5424,9 @@ mod tests {
                             "data": "cGRm"
                         }
                     }
-                ]
-            }]
+                    ]
+                }
+            ]
         });
 
         let signatures = RwLock::new(IndexMap::new());
@@ -5071,15 +5434,20 @@ mod tests {
             translate_anthropic_request(&request, "gemini-3.6-flash", &signatures).unwrap();
         let messages = translated["messages"].as_array().unwrap();
 
-        assert_eq!(messages[0]["role"], "tool");
-        assert_eq!(messages[0]["content"][0]["text"], "Screenshot captured");
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["content"][0]["text"], "Screenshot captured");
         assert_eq!(
-            messages[0]["content"][1]["image_url"]["url"],
+            messages[1]["content"][1]["image_url"]["url"],
             "data:image/png;base64,aW1hZ2U="
         );
-        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[2]["role"], "user");
         assert_eq!(
-            messages[1]["content"][0]["image_url"]["url"],
+            messages[2]["content"][0]["image_url"]["url"],
+            "https://example.com/screenshot.png"
+        );
+        assert_eq!(
+            messages[2]["content"][1]["image_url"]["url"],
             "data:application/pdf;base64,cGRm"
         );
     }
@@ -5217,6 +5585,22 @@ mod tests {
     }
 
     #[test]
+    fn recovers_poisoned_thought_signature_cache() {
+        let signatures = RwLock::new(IndexMap::new());
+        let poison_result = std::panic::catch_unwind(|| {
+            let _guard = signatures.write().unwrap();
+            panic!("poison thought signature cache");
+        });
+        assert!(poison_result.is_err());
+
+        remember_thought_signature(&signatures, "call_1", "signature_1");
+        assert_eq!(
+            recalled_thought_signature(&signatures, "call_1").as_deref(),
+            Some("signature_1")
+        );
+    }
+
+    #[test]
     fn token_estimate_gives_non_ascii_text_more_headroom() {
         let request = json!({
             "messages": [{
@@ -5263,6 +5647,21 @@ mod tests {
         assert_eq!(payloads.len(), 2);
         assert!(payloads[0].contains("你好"));
         assert_eq!(payloads[1], "[DONE]");
+    }
+
+    #[test]
+    fn bounds_sse_frames_and_replaces_invalid_utf8() {
+        let mut decoder = SseDataDecoder::default();
+        let oversized = vec![b'x'; MAX_UPSTREAM_SSE_BUFFER_BYTES + 1];
+        assert!(decoder.push_bytes(&oversized).is_err());
+
+        let mut decoder = SseDataDecoder::default();
+        let payloads = decoder
+            .push_bytes(b"data: {\"text\":\"bad \xff byte\"}\n\n")
+            .unwrap();
+        assert_eq!(payloads.len(), 1);
+        assert!(payloads[0].contains('\u{fffd}'));
+        assert!(serde_json::from_str::<Value>(&payloads[0]).is_ok());
     }
 
     #[test]
@@ -5417,24 +5816,35 @@ mod tests {
     #[test]
     fn standard_tool_results_keep_tool_content_text_only_and_move_media_to_user() {
         let request = json!({
-            "messages": [{
-                "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": "toolu_media",
-                    "content": [
-                        {"type": "text", "text": "Screenshot captured"},
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/png",
-                                "data": "aW1hZ2U="
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_media",
+                        "name": "capture",
+                        "input": {}
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_media",
+                        "content": [
+                            {"type": "text", "text": "Screenshot captured"},
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "aW1hZ2U="
+                                }
                             }
-                        }
-                    ]
-                }]
-            }]
+                        ]
+                    }]
+                }
+            ]
         });
         let signatures = RwLock::new(IndexMap::new());
         let translated = translate_anthropic_request_with_capabilities(
@@ -5445,16 +5855,16 @@ mod tests {
         )
         .unwrap();
 
-        assert!(translated["messages"][0]["content"].is_string());
-        assert!(translated["messages"][0]["content"]
+        assert!(translated["messages"][1]["content"].is_string());
+        assert!(translated["messages"][1]["content"]
             .as_str()
             .unwrap()
             .contains("[Image result attached]"));
-        assert_eq!(translated["messages"][1]["role"], "user");
-        assert_eq!(translated["messages"][1]["content"][0]["type"], "image_url");
+        assert_eq!(translated["messages"][2]["role"], "user");
+        assert_eq!(translated["messages"][2]["content"][0]["type"], "image_url");
 
         let gemini = translate_anthropic_request(&request, "gemini", &signatures).unwrap();
-        assert!(gemini["messages"][0]["content"].is_array());
+        assert!(gemini["messages"][1]["content"].is_array());
     }
 
     #[test]
@@ -5700,6 +6110,20 @@ mod tests {
     }
 
     #[test]
+    fn streams_prompt_feedback_as_anthropic_refusal() {
+        let signatures = Arc::new(RwLock::new(IndexMap::new()));
+        let mut translator = AnthropicStreamTranslator::new("gemini".to_string(), signatures, 0);
+
+        let events = translator
+            .process_payload(r#"{"promptFeedback":{"blockReason":"SAFETY"},"choices":[]}"#)
+            .unwrap();
+        let finish = translator.finish().unwrap();
+
+        assert!(format!("{events:?}").contains("Gemini Safety Intercept"));
+        assert!(format!("{finish:?}").contains("refusal"));
+    }
+
+    #[test]
     fn streams_thinking_regardless_of_model_name() {
         let signatures = Arc::new(RwLock::new(IndexMap::new()));
         let mut translator =
@@ -5793,6 +6217,28 @@ mod tests {
     }
 
     #[test]
+    fn separates_sequential_anonymous_streamed_tool_calls() {
+        let signatures = Arc::new(RwLock::new(IndexMap::new()));
+        let mut translator =
+            AnthropicStreamTranslator::new("nonstandard-model".to_string(), signatures, 0);
+
+        translator
+            .process_payload(
+                r#"{"choices":[{"delta":{"tool_calls":[{"function":{"name":"first","arguments":"{}"}}]},"finish_reason":null}]}"#,
+            )
+            .unwrap();
+        translator
+            .process_payload(
+                r#"{"choices":[{"delta":{"tool_calls":[{"function":{"name":"second","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+            )
+            .unwrap();
+
+        assert_eq!(translator.tool_calls.len(), 2);
+        assert_eq!(translator.tool_calls[0].name, "first");
+        assert_eq!(translator.tool_calls[1].name, "second");
+    }
+
+    #[test]
     fn max_tokens_suppresses_truncated_non_streaming_tool_call() {
         let upstream = json!({
             "choices": [{
@@ -5842,30 +6288,68 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_completed_tool_arguments() {
+    fn skips_invalid_completed_tool_arguments_without_losing_valid_content() {
         let upstream = json!({
             "choices": [{
                 "message": {
                     "role": "assistant",
-                    "content": null,
-                    "tool_calls": [{
-                        "id": "toolu_invalid",
-                        "type": "function",
-                        "function": {
-                            "name": "shell",
-                            "arguments": "{\"cmd\":\"unterminated"
+                    "content": "I found two actions.",
+                    "tool_calls": [
+                        {
+                            "id": "toolu_valid",
+                            "type": "function",
+                            "function": {
+                                "name": "inspect",
+                                "arguments": "{\"path\":\"src\"}"
+                            }
+                        },
+                        {
+                            "id": "toolu_invalid",
+                            "type": "function",
+                            "function": {
+                                "name": "shell",
+                                "arguments": "{\"cmd\":\"unterminated"
+                            },
+                            "extra_content": {
+                                "google": {"thought_signature": "must-not-be-cached"}
+                            }
                         }
-                    }]
+                    ]
                 },
-                "finish_reason": "tool_calls"
+                "finish_reason": "stop"
             }]
         });
         let signatures = RwLock::new(IndexMap::new());
 
-        let error =
-            translate_anthropic_response(&upstream, "gemini-3.6-flash", &signatures).unwrap_err();
+        let message =
+            translate_anthropic_response(&upstream, "gemini-3.6-flash", &signatures).unwrap();
+        let content = message["content"].as_array().unwrap();
 
-        assert!(error.contains("invalid tool arguments JSON"));
+        assert_eq!(content[0]["text"], "I found two actions.");
+        assert_eq!(content[1]["type"], "tool_use");
+        assert_eq!(content[1]["id"], "toolu_valid");
+        assert_eq!(content.len(), 2);
+        assert_eq!(message["stop_reason"], "tool_use");
+        assert!(!signatures.read().unwrap().contains_key("toolu_invalid"));
+    }
+
+    #[test]
+    fn skips_invalid_streamed_tool_arguments_without_losing_valid_content() {
+        let signatures = Arc::new(RwLock::new(IndexMap::new()));
+        let mut translator =
+            AnthropicStreamTranslator::new("openrouter-model".to_string(), signatures.clone(), 0);
+        let mut events = translator
+            .process_payload(
+                r#"{"choices":[{"delta":{"content":"I found two actions.","tool_calls":[{"index":0,"id":"toolu_valid","function":{"name":"inspect","arguments":"{\"path\":\"src\"}"}},{"index":1,"id":"toolu_invalid","function":{"name":"shell","arguments":"{\"cmd\":\"unterminated"},"extra_content":{"google":{"thought_signature":"must-not-be-cached"}}}]},"finish_reason":"stop"}]}"#,
+            )
+            .unwrap();
+
+        events.extend(translator.finish().unwrap());
+        let debug = format!("{events:?}");
+        assert!(debug.contains("I found two actions."));
+        assert!(debug.contains("toolu_valid"));
+        assert!(!debug.contains("toolu_invalid"));
+        assert!(!signatures.read().unwrap().contains_key("toolu_invalid"));
     }
 
     #[test]
@@ -5926,6 +6410,31 @@ mod tests {
             Some(DEFAULT_ANTHROPIC_VERSION)
         );
         assert!(!request.headers().contains_key("anthropic-beta"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_forwarding_rejects_non_object_request_bodies() {
+        let profile = ProviderProfile {
+            file_name: "anthropic.json".to_string(),
+            display_name: "Anthropic".to_string(),
+            source: ProviderProfileSource::Native,
+            model: "claude-test".to_string(),
+            upstream_identity: None,
+            identity_override: false,
+            base_url: "https://example.invalid".to_string(),
+            auth_token: None,
+            api_key: Some("secret".to_string()),
+            proxy_url: None,
+            local_gemini: false,
+            transport: ProviderTransport::Anthropic,
+            openai_capabilities: OpenAiCapabilities::default(),
+            upstream_url: "https://example.invalid/v1/messages".to_string(),
+            client: Client::builder().build().unwrap(),
+        };
+
+        let response = forward_anthropic_profile(profile, &HeaderMap::new(), json!(5)).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
