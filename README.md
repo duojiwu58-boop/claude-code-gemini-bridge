@@ -9,7 +9,7 @@
 ![Claude Code model center showing Gemini and Anthropic-compatible profiles with zero-restart switching](gui/delphi11/ClaudeBridgeManager/assets/ClaudeBridgeManager-screenshot.png)
 
 *The bundled model center keeps Claude Code on one stable local endpoint while Gemini, DeepSeek, Kimi, Claude, Qwen, proxy settings, and other compatible profiles can be switched live. The next request uses the selected route—no VS Code reload or Claude Code restart required.*  
-*配套的模型中心 GUI 让 Claude Code 始终连接到固定的本地端点，双击即可在 Gemini、DeepSeek、Kimi、Claude、Qwen 以及代理设置之间即时热切换。下一个请求立即生效——无需重新加载 VS Code 或重启 Claude Code。*
+*配套的模型中心 GUI 让 Claude Code 始终连接到固定的本地端点，双击即可在 Gemini、DeepSeek、Kimi、Claude、Qwen 等模型之间即时热切换；各 Provider 的代理随 profile 配置生效。下一个请求立即生效——无需重新加载 VS Code 或重启 Claude Code。*
 
 ---
 
@@ -141,7 +141,7 @@ Gemini / DeepSeek / Kimi / Qwen / OpenRouter / 其他兼容模型
    }
    ```
 
-   > **代理特别提醒：** 每个原生 OpenAI Provider 都使用独立的 HTTP 客户端，不会自动继承旧配置里的 `HTTPS_PROXY`、桥接服务的 `GEMINI_BRIDGE_PROXY`、GUI 中的 Gemini 专用代理或 Windows 系统代理。直连可用时可以省略 `proxy`；如果配置能够加载，但真实调用出现连接超时、连接重置或无法访问上游，请首先检查并填写这一字段。修改后在模型中心点击“刷新配置”，并确认列表的“代理”列显示了正确地址。
+   > **代理特别提醒：** 每个原生 OpenAI Provider 都使用独立的 HTTP 客户端，不会自动继承旧配置里的 `HTTPS_PROXY`、桥接服务的 `GEMINI_BRIDGE_PROXY` 或 Windows 系统代理。直连可用时可以省略 `proxy`；如果配置能够加载，但真实调用出现连接超时、连接重置或无法访问上游，请首先检查并填写这一字段。修改后在模型中心点击“刷新配置”，并确认列表的“代理”列显示了正确地址。
 
 3. 字段与官网示例一一对应：
 
@@ -283,8 +283,8 @@ Most users do **not** need Rust, Delphi, Inno Setup, or a local build environmen
 
 **[GitHub Releases — installer and portable ZIP](https://github.com/duojiwu58-boop/claude-code-gemini-bridge/releases/latest)**
 
-- **`ClaudeCodeBridge-0.3.2-Setup.exe` (recommended):** installs the native Windows service, model-switcher GUI, Start Menu shortcuts, automatic startup, recovery policy, configuration tools, and uninstaller.
-- **`ClaudeCodeBridge-0.3.2-windows-x64.zip`:** contains the same prebuilt service and GUI for portable/manual deployment. Extract it and run `Install.cmd` when service installation is desired.
+- **`ClaudeCodeBridge-0.3.3-Setup.exe` (recommended):** installs the native Windows service, model-switcher GUI, Start Menu shortcuts, automatic startup, recovery policy, configuration tools, and uninstaller.
+- **`ClaudeCodeBridge-0.3.3-windows-x64.zip`:** contains the same prebuilt service and GUI for portable/manual deployment. Extract it and run `Install.cmd` when service installation is desired.
 
 After installation, open **Claude Code 模型中心**, select or double-click a model, and the next Claude Code request uses it immediately—no VS Code reload or Claude Code restart is required.
 
@@ -377,8 +377,8 @@ Claude Code 始终连接本地固定的 `http://127.0.0.1:18787`。双击配套�
 
 👉 **[前往 GitHub Releases 下载安装包与免安装 ZIP](https://github.com/duojiwu58-boop/claude-code-gemini-bridge/releases/latest)**
 
-- **`ClaudeCodeBridge-0.3.2-Setup.exe`（推荐）**：一键安装程序，注册 Windows 系统服务、配置开机自启、创建开始菜单快捷方式并附带 GUI 切换器。
-- **`ClaudeCodeBridge-0.3.2-windows-x64.zip`**：绿色免安装包，解压即用。
+- **`ClaudeCodeBridge-0.3.3-Setup.exe`（推荐）**：一键安装程序，注册 Windows 系统服务、配置开机自启、创建开始菜单快捷方式并附带 GUI 切换器。
+- **`ClaudeCodeBridge-0.3.3-windows-x64.zip`**：绿色免安装包，解压即用。
 
 ---
 

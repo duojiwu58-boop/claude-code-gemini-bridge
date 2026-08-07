@@ -8,14 +8,12 @@ uses
   Winapi.CommCtrl,
   Winapi.UxTheme,
   System.SysUtils,
-  System.StrUtils,
   System.Classes,
   System.Generics.Collections,
   System.JSON,
   System.UITypes,
   System.Math,
   System.IOUtils,
-  System.Win.Registry,
   System.Net.URLClient,
   System.Net.HttpClient,
   Vcl.Forms,
@@ -41,7 +39,6 @@ type
     HasProfile: Boolean;
     Model: string;
     FileName: string;
-    Proxy: string;
     Stamp: string;
     SettingsDir: string;
     Detail: string;
@@ -66,13 +63,6 @@ type
     FListTitleLabel: TLabel;
     FListHintLabel: TLabel;
     FProfileList: TListView;
-    FProxyPanel: TPanel;
-    FProxyLabel: TLabel;
-    FProxyHintLabel: TLabel;
-    FProxyEdit: TEdit;
-    FDetectProxyButton: TButton;
-    FTestProxyButton: TButton;
-    FApplyProxyButton: TButton;
     FLogPanel: TPanel;
     FLogTitleLabel: TLabel;
     FLogMemo: TMemo;
@@ -87,8 +77,6 @@ type
     FStatusInFlight: Boolean;
     FProfilesBusy: Boolean;
     FProfilesLoaded: Boolean;
-    FProxyDirty: Boolean;
-    FUpdatingProxy: Boolean;
     FSettingsStamp: string;
     FWorkerCount: Integer;
     procedure FormShown(Sender: TObject);
@@ -97,14 +85,10 @@ type
     procedure SwitchClick(Sender: TObject);
     procedure StartClick(Sender: TObject);
     procedure StopClick(Sender: TObject);
-    procedure DetectProxyClick(Sender: TObject);
-    procedure TestProxyClick(Sender: TObject);
-    procedure ApplyProxyClick(Sender: TObject);
     procedure PollTimer(Sender: TObject);
     procedure ProfileDblClick(Sender: TObject);
     procedure ListSelectItem(Sender: TObject; Item: TListItem;
       Selected: Boolean);
-    procedure ProxyEditChange(Sender: TObject);
     procedure BuildUi;
     procedure ApplyWindowsAppearance;
     procedure AppendLog(const AText: string);
@@ -119,9 +103,6 @@ type
     procedure FillProfileList(const ARows: TArray<TProfileRow>);
     procedure AdjustProfileColumns;
     procedure SetBridgeState(const AOnline: Boolean; const ADetail: string);
-    procedure UpdateProxyFromStatus(const AServerProxy: string);
-    function ProxyRequestJson: string;
-    function DetectWindowsProxy: string;
     function NewHttpClient(const AResponseTimeout: Integer): THTTPClient;
     function GetJsonWith(AClient: THTTPClient; const APath: string): TJSONObject;
     function PostJsonWith(AClient: THTTPClient; const APath,
@@ -237,7 +218,7 @@ begin
   FHintLabel := TLabel.Create(Self);
   FHintLabel.Parent := FTopPanel;
   FHintLabel.SetBounds(25, 57, 500, 22);
-  FHintLabel.Caption := '统一管理模型路由、Gemini 代理和桥接服务';
+  FHintLabel.Caption := '统一管理模型路由、Provider 配置和桥接服务';
   FHintLabel.Font.Name := 'Segoe UI';
   FHintLabel.Font.Color := $00606060;
 
@@ -316,57 +297,6 @@ begin
   FContentPanel.Color := $00F5F5F5;
   FContentPanel.ParentBackground := False;
   FContentPanel.Padding.SetBounds(16, 14, 16, 14);
-
-  FProxyPanel := TPanel.Create(Self);
-  FProxyPanel.Parent := FContentPanel;
-  FProxyPanel.Align := alBottom;
-  FProxyPanel.AlignWithMargins := True;
-  FProxyPanel.Margins.SetBounds(0, 12, 0, 0);
-  FProxyPanel.Height := 100;
-  FProxyPanel.BevelOuter := bvNone;
-  FProxyPanel.Color := clWhite;
-  FProxyPanel.ParentBackground := False;
-
-  FProxyHintLabel := TLabel.Create(Self);
-  FProxyHintLabel.Parent := FProxyPanel;
-  FProxyHintLabel.SetBounds(16, 12, 560, 22);
-  FProxyHintLabel.Caption :=
-    'Gemini 网络代理  ·  留空保存表示直连';
-  FProxyHintLabel.Font.Name := 'Segoe UI';
-  FProxyHintLabel.Font.Style := [fsBold];
-  FProxyHintLabel.Font.Color := $00303030;
-
-  FProxyLabel := TLabel.Create(Self);
-  FProxyLabel.Parent := FProxyPanel;
-  FProxyLabel.SetBounds(16, 50, 112, 20);
-  FProxyLabel.Caption := '代理地址';
-  FProxyLabel.Font.Name := 'Segoe UI';
-  FProxyLabel.Font.Color := $00505050;
-
-  FProxyEdit := TEdit.Create(Self);
-  FProxyEdit.Parent := FProxyPanel;
-  FProxyEdit.SetBounds(104, 44, 448, 28);
-  FProxyEdit.Font.Name := 'Segoe UI';
-  FProxyEdit.TextHint := '例如 http://127.0.0.1:8080';
-  FProxyEdit.OnChange := ProxyEditChange;
-
-  FDetectProxyButton := TButton.Create(Self);
-  FDetectProxyButton.Parent := FProxyPanel;
-  FDetectProxyButton.SetBounds(566, 42, 118, 32);
-  FDetectProxyButton.Caption := '检测系统代理';
-  FDetectProxyButton.OnClick := DetectProxyClick;
-
-  FTestProxyButton := TButton.Create(Self);
-  FTestProxyButton.Parent := FProxyPanel;
-  FTestProxyButton.SetBounds(692, 42, 100, 32);
-  FTestProxyButton.Caption := '测试连接';
-  FTestProxyButton.OnClick := TestProxyClick;
-
-  FApplyProxyButton := TButton.Create(Self);
-  FApplyProxyButton.Parent := FProxyPanel;
-  FApplyProxyButton.SetBounds(800, 42, 156, 32);
-  FApplyProxyButton.Caption := '保存并立即生效';
-  FApplyProxyButton.OnClick := ApplyProxyClick;
 
   FLogPanel := TPanel.Create(Self);
   FLogPanel.Parent := FContentPanel;
@@ -488,7 +418,6 @@ procedure TMainForm.FormResize(Sender: TObject);
 const
   CONTROL_GAP = 8;
   EDGE_MARGIN = 24;
-  PROXY_EDGE_MARGIN = 16;
 begin
   if Assigned(FStopButton) and Assigned(FTopPanel) then
   begin
@@ -500,18 +429,6 @@ begin
       FStartButton.Left - CONTROL_GAP - FSwitchButton.Width;
     FRefreshButton.Left :=
       FSwitchButton.Left - CONTROL_GAP - FRefreshButton.Width;
-  end;
-
-  if Assigned(FApplyProxyButton) and Assigned(FProxyPanel) then
-  begin
-    FApplyProxyButton.Left :=
-      FProxyPanel.ClientWidth - PROXY_EDGE_MARGIN - FApplyProxyButton.Width;
-    FTestProxyButton.Left :=
-      FApplyProxyButton.Left - CONTROL_GAP - FTestProxyButton.Width;
-    FDetectProxyButton.Left :=
-      FTestProxyButton.Left - CONTROL_GAP - FDetectProxyButton.Width;
-    FProxyEdit.Width :=
-      FDetectProxyButton.Left - CONTROL_GAP - FProxyEdit.Left;
   end;
 
   if Assigned(FStatusBar) then
@@ -555,7 +472,6 @@ var
   LCornerPreference: Integer;
 begin
   SetWindowTheme(FProfileList.Handle, 'Explorer', nil);
-  SetWindowTheme(FProxyEdit.Handle, 'Explorer', nil);
   SendMessage(
     FProfileList.Handle,
     LVM_SETEXTENDEDLISTVIEWSTYLE,
@@ -795,102 +711,6 @@ begin
   end;
 end;
 
-procedure TMainForm.UpdateProxyFromStatus(const AServerProxy: string);
-begin
-  if SameText(Trim(FProxyEdit.Text), Trim(AServerProxy)) then
-  begin
-    FProxyDirty := False;
-    Exit;
-  end;
-  if FProxyDirty or FProxyEdit.Focused then
-    Exit;
-  FUpdatingProxy := True;
-  try
-    FProxyEdit.Text := AServerProxy;
-  finally
-    FUpdatingProxy := False;
-  end;
-end;
-
-procedure TMainForm.ProxyEditChange(Sender: TObject);
-begin
-  if not FUpdatingProxy then
-    FProxyDirty := True;
-end;
-
-function TMainForm.ProxyRequestJson: string;
-var
-  LRequest: TJSONObject;
-  LProxy: string;
-begin
-  LRequest := TJSONObject.Create;
-  try
-    LProxy := Trim(FProxyEdit.Text);
-    if LProxy = '' then
-      LRequest.AddPair('proxy', TJSONNull.Create)
-    else
-      LRequest.AddPair('proxy', LProxy);
-    Result := LRequest.ToJSON;
-  finally
-    LRequest.Free;
-  end;
-end;
-
-function TMainForm.DetectWindowsProxy: string;
-var
-  LRegistry: TRegistry;
-  LProxyServer: string;
-  LParts: TStringList;
-  LPart: string;
-  LHttpProxy: string;
-  I: Integer;
-begin
-  Result := '';
-  LRegistry := TRegistry.Create(KEY_READ);
-  try
-    LRegistry.RootKey := HKEY_CURRENT_USER;
-    if not LRegistry.OpenKeyReadOnly(
-      '\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
-    ) then
-      Exit;
-    if not LRegistry.ValueExists('ProxyEnable') or
-       (LRegistry.ReadInteger('ProxyEnable') = 0) or
-       not LRegistry.ValueExists('ProxyServer') then
-      Exit;
-    LProxyServer := Trim(LRegistry.ReadString('ProxyServer'));
-  finally
-    LRegistry.Free;
-  end;
-  if LProxyServer = '' then
-    Exit;
-
-  LParts := TStringList.Create;
-  try
-    LParts.StrictDelimiter := True;
-    LParts.Delimiter := ';';
-    LParts.DelimitedText := LProxyServer;
-    for I := 0 to LParts.Count - 1 do
-    begin
-      LPart := Trim(LParts[I]);
-      if StartsText('https=', LPart) then
-      begin
-        Result := Trim(Copy(LPart, 7, MaxInt));
-        Break;
-      end;
-      if StartsText('http=', LPart) then
-        LHttpProxy := Trim(Copy(LPart, 6, MaxInt));
-    end;
-    if Result = '' then
-      Result := LHttpProxy;
-    if (Result = '') and (LParts.Count = 1) then
-      Result := Trim(LParts[0]);
-  finally
-    LParts.Free;
-  end;
-  if (Result <> '') and (Pos('://', Result) = 0) then
-    Result := 'http://' + Result;
-end;
-
 procedure TMainForm.SetBusy(const ABusy: Boolean);
 begin
   FBusy := ABusy;
@@ -901,9 +721,6 @@ begin
     FSwitchButton.Enabled := False;
     FStartButton.Enabled := False;
     FStopButton.Enabled := False;
-    FTestProxyButton.Enabled := False;
-    FApplyProxyButton.Enabled := False;
-    FDetectProxyButton.Enabled := False;
     Screen.Cursor := crHourGlass;
   end
   else
@@ -911,7 +728,6 @@ begin
     Screen.Cursor := crDefault;
     FRefreshButton.Enabled := True;
     FProfileList.Enabled := True;
-    FDetectProxyButton.Enabled := True;
     RefreshStatusAsync(True);
   end;
 end;
@@ -931,8 +747,6 @@ begin
     FSwitchButton.Enabled := True;
     FStopButton.Enabled := True;
     FStartButton.Enabled := False;
-    FTestProxyButton.Enabled := True;
-    FApplyProxyButton.Enabled := True;
   end
   else
   begin
@@ -945,8 +759,6 @@ begin
     FSwitchButton.Enabled := False;
     FStopButton.Enabled := False;
     FStartButton.Enabled := True;
-    FTestProxyButton.Enabled := False;
-    FApplyProxyButton.Enabled := False;
   end;
   if FBusy then
   begin
@@ -954,8 +766,6 @@ begin
     FSwitchButton.Enabled := False;
     FStartButton.Enabled := False;
     FStopButton.Enabled := False;
-    FTestProxyButton.Enabled := False;
-    FApplyProxyButton.Enabled := False;
   end;
   FStatusBar.Panels[0].Text := ADetail;
 end;
@@ -988,7 +798,6 @@ begin
               LSnapshot.Model := JsonText(LProfile, 'model');
               LSnapshot.FileName := JsonText(LProfile, 'file');
             end;
-            LSnapshot.Proxy := JsonText(LJson, 'gemini_proxy');
             LSnapshot.Stamp := JsonText(LJson, 'config_stamp');
             if LSnapshot.Stamp = '' then
               LSnapshot.Stamp := JsonText(LJson, 'settings_stamp');
@@ -1025,7 +834,6 @@ var
 begin
   if ASnapshot.Online then
   begin
-    UpdateProxyFromStatus(ASnapshot.Proxy);
     if ASnapshot.HasProfile then
     begin
       FActiveFile := ASnapshot.FileName;
@@ -1061,13 +869,10 @@ begin
 end;
 
 procedure TMainForm.StartProfilesRefresh(const AQuiet: Boolean);
-var
-  LEditProxy: string;
 begin
   if FClosing or FProfilesBusy then
     Exit;
   FProfilesBusy := True;
-  LEditProxy := Trim(FProxyEdit.Text);
   if not AQuiet then
     SetBusy(True);
   Inc(FWorkerCount);
@@ -1112,10 +917,7 @@ begin
               LTransport := JsonText(LProfile, 'transport');
               if SameText(LTransport, 'gemini') or
                  JsonBool(LProfile, 'local_gemini') then
-              begin
-                LRow.Route := 'Gemini 转换';
-                LRow.Proxy := LEditProxy;
-              end
+                LRow.Route := 'Gemini 转换'
               else if SameText(LTransport, 'openai-chat') then
                 LRow.Route := 'OpenAI 转换'
               else
@@ -1406,128 +1208,6 @@ end;
 procedure TMainForm.StopClick(Sender: TObject);
 begin
   StartStopAsync(False);
-end;
-
-procedure TMainForm.DetectProxyClick(Sender: TObject);
-var
-  LProxy: string;
-begin
-  LProxy := DetectWindowsProxy;
-  if LProxy = '' then
-  begin
-    AppendLog('未检测到已启用的 Windows 系统代理。');
-    MessageDlg(
-      '未检测到已启用的 Windows 系统代理。',
-      mtInformation,
-      [mbOK],
-      0
-    );
-    Exit;
-  end;
-  FProxyEdit.Text := LProxy;
-  AppendLog('已检测到系统代理：' + LProxy);
-end;
-
-procedure TMainForm.TestProxyClick(Sender: TObject);
-var
-  LBody: string;
-begin
-  if FClosing or FBusy then
-    Exit;
-  LBody := ProxyRequestJson;
-  FTestProxyButton.Enabled := False;
-  Inc(FWorkerCount);
-  TThread.CreateAnonymousThread(
-    procedure
-    var
-      LClient: THTTPClient;
-      LResult: TJSONObject;
-      LModel: string;
-      LError: string;
-    begin
-      LError := '';
-      try
-        LClient := NewHttpClient(ACTION_RESPONSE_TIMEOUT_MS);
-        try
-          LResult := PostJsonWith(LClient, '/admin/gemini-proxy/test', LBody);
-          LModel := JsonText(LResult, 'model');
-          LResult.Free;
-        finally
-          LClient.Free;
-        end;
-      except
-        on E: Exception do
-          LError := E.Message;
-      end;
-      QueueToMain(
-        procedure
-        begin
-          FTestProxyButton.Enabled := (not FBusy) and (FStatusLabel.Tag = 1);
-          if LError <> '' then
-          begin
-            AppendLog('Gemini 连接测试失败：' + LError);
-            MessageDlg(LError, mtError, [mbOK], 0);
-          end
-          else
-          begin
-            AppendLog('Gemini 连接测试成功，模型：' + LModel);
-            MessageDlg('Gemini 连接测试成功。', mtInformation, [mbOK], 0);
-          end;
-        end);
-    end).Start;
-end;
-
-procedure TMainForm.ApplyProxyClick(Sender: TObject);
-var
-  LBody: string;
-begin
-  if FClosing or FBusy then
-    Exit;
-  LBody := ProxyRequestJson;
-  SetBusy(True);
-  Inc(FWorkerCount);
-  TThread.CreateAnonymousThread(
-    procedure
-    var
-      LClient: THTTPClient;
-      LResult: TJSONObject;
-      LProxy: string;
-      LError: string;
-    begin
-      LError := '';
-      try
-        LClient := NewHttpClient(ACTION_RESPONSE_TIMEOUT_MS);
-        try
-          LResult := PostJsonWith(LClient, '/admin/gemini-proxy', LBody);
-          LProxy := JsonText(LResult, 'gemini_proxy');
-          LResult.Free;
-        finally
-          LClient.Free;
-        end;
-      except
-        on E: Exception do
-          LError := E.Message;
-      end;
-      QueueToMain(
-        procedure
-        begin
-          SetBusy(False);
-          if LError <> '' then
-          begin
-            AppendLog('保存 Gemini 代理失败：' + LError);
-            MessageDlg(LError, mtError, [mbOK], 0);
-          end
-          else
-          begin
-            FProxyDirty := False;
-            if LProxy = '' then
-              AppendLog('Gemini 已切换为直连。')
-            else
-              AppendLog('Gemini 代理已保存并立即生效：' + LProxy);
-            StartProfilesRefresh(True);
-          end;
-        end);
-    end).Start;
 end;
 
 procedure TMainForm.PollTimer(Sender: TObject);

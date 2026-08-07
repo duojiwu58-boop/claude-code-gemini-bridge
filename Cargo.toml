@@ -1,6 +1,6 @@
 [package]
 name = "claude-bridge"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 description = "Claude Code <-> Gemini deep-compatibility bridge with live model switching"
 repository = "https://github.com/duojiwu58-boop/claude-code-gemini-bridge"

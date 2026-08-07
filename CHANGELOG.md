@@ -7,6 +7,19 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 
 ## English
 
+## [v0.3.3] - 2026-08-07
+
+### Stable GUI Cleanup
+- Removed the Gemini-specific HTTP proxy editor, Windows proxy detection, connection test, and apply controls from the model center. Proxy routing is now configured only in each Provider profile.
+- The model list's proxy column now consistently displays the selected profile's own `proxy` value, including Gemini profiles, instead of being overwritten by bridge-global Gemini state.
+- Expanded the model list into the space previously occupied by the dedicated proxy panel and updated GUI/README wording to match the profile-owned configuration model.
+- Updated the GUI file and product version to `0.3.3.0`.
+
+### Verification
+- 66 Rust unit tests passed.
+- Delphi 11 Release GUI compiled with 0 warnings and 0 errors, and the rebuilt GUI passed a local startup/responsiveness smoke test.
+- Static-CRT bridge build, portable ZIP, Inno Setup installer, and SHA-256 manifests completed successfully.
+
 ## [v0.3.2] - 2026-08-07
 
 ### OpenAI Compatibility and Tool Reliability
@@ -128,6 +141,19 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 ---
 
 ## 中文
+
+## [v0.3.3] - 2026-08-07
+
+### 稳定版 GUI 清理
+- 从模型中心移除 Gemini 专用 HTTP 代理编辑框、Windows 代理检测、连接测试和保存控件；代理路由现在只在各 Provider profile 中配置。
+- 模型列表的“代理”列统一显示对应 profile 自己的 `proxy`，Gemini profile 也不再被桥接器全局 Gemini 状态覆盖。
+- 模型列表扩展到原专用代理面板占用的空间，并同步更新 GUI 与 README 文案，使其符合 profile 自主管理配置的模式。
+- GUI 文件版本和产品版本更新为 `0.3.3.0`。
+
+### 验证
+- 66 项 Rust 单元测试全部通过。
+- Delphi 11 Release GUI 以 0 警告、0 错误完成编译，重新生成的 GUI 已通过本机启动与响应性冒烟测试。
+- 静态 CRT Bridge 构建、便携 ZIP、Inno Setup 安装程序和 SHA-256 清单均成功完成。
 
 ## [v0.3.2] - 2026-08-07
 
