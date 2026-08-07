@@ -916,7 +916,9 @@ begin
               LRow.Proxy := JsonText(LProfile, 'proxy');
               LRow.Active := JsonBool(LProfile, 'active');
               LTransport := JsonText(LProfile, 'transport');
-              if SameText(LTransport, 'gemini') or
+              if SameText(LTransport, 'gemini-interactions') then
+                LRow.Route := 'Gemini 原生'
+              else if SameText(LTransport, 'gemini') or
                  JsonBool(LProfile, 'local_gemini') then
                 LRow.Route := 'Gemini 转换'
               else if SameText(LTransport, 'openai-chat') then
