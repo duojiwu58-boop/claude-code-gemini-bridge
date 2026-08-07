@@ -74,7 +74,7 @@ fn run_service() -> Result<(), String> {
     let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)
         .map_err(|err| format!("Cannot register Windows service control handler: {err}"))?;
     if let Ok(mut slot) = status_slot.lock() {
-        *slot = Some(status_handle.clone());
+        *slot = Some(status_handle);
     }
     status_handle
         .set_service_status(service_status(
@@ -90,7 +90,7 @@ fn run_service() -> Result<(), String> {
         .enable_all()
         .build()
         .map_err(|err| format!("Cannot create service Tokio runtime: {err}"))?;
-    let running_status_handle = status_handle.clone();
+    let running_status_handle = status_handle;
     let bridge_result = runtime.block_on(super::run_bridge(
         shutdown_tx,
         shutdown_rx,

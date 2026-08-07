@@ -9,6 +9,8 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 
 ## [Unreleased]
 
+## [v0.5.0] - 2026-08-08
+
 ### Native Stateful Gemini Interactions
 - Added the independent `gemini-interactions` transport for Google's native `/v1beta/interactions` API, using `x-goog-api-key` authentication and `store: true`. The existing OpenAI Chat-compatible Gemini route remains available as a fallback.
 - Added bounded, branch-safe conversation continuation. Exact transcript matches reuse `previous_interaction_id`; Claude/MCP tool-result turns recover the interaction through the opaque tool call ID.
@@ -30,6 +32,11 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 ### Verification
 - 82 Rust tests passed, including MCP Origin checks and an end-to-end mock image-generation tool call.
 - Live Windows-service verification generated valid 1K and 2K JPEG images, returned MCP previews, and confirmed writes by `NT SERVICE\ClaudeCodeBridge` to the current user's Pictures directory.
+
+### Release Verification
+- Final `v0.5.0` verification reran all 89 Rust tests, `rustfmt`, and strict Clippy successfully.
+- Delphi 11 Release GUI compiled as `0.5.0.0` with 0 warnings and 0 errors.
+- The static-CRT bridge, portable ZIP, Inno Setup installer, and SHA-256 manifest were rebuilt and verified successfully.
 
 ## [v0.4.0] - 2026-08-07
 
@@ -189,6 +196,8 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 
 ## [未发布]
 
+## [v0.5.0] - 2026-08-08
+
 ### Gemini 原生有状态 Interactions
 - 新增独立的 `gemini-interactions` transport，直接调用 Google 原生 `/v1beta/interactions` API，使用 `x-goog-api-key` 鉴权并固定启用 `store: true`；原有 OpenAI Chat 兼容路径继续作为回退方案保留。
 - 新增有界且分支安全的会话续接：对完全匹配的对话记录复用 `previous_interaction_id`；Claude/MCP 工具结果回合通过不透明的 tool call ID 找回对应 interaction。
@@ -210,6 +219,11 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 ### 验证
 - 82 项 Rust 测试全部通过，包括 MCP Origin 校验和端到端 mock 生图工具调用。
 - Windows 服务真实生成 1K、2K JPEG 图片并正确返回 MCP 预览，确认 `NT SERVICE\ClaudeCodeBridge` 可以写入当前用户的“图片”目录。
+
+### 发布验证
+- `v0.5.0` 最终验证重新运行全部 89 项 Rust 测试、`rustfmt` 与严格 Clippy，均成功通过。
+- Delphi 11 Release GUI 以 `0.5.0.0` 编译通过，0 警告、0 错误。
+- 静态 CRT bridge、便携 ZIP、Inno Setup 安装程序及 SHA-256 清单均已重新构建并验证成功。
 
 ## [v0.4.0] - 2026-08-07
 
