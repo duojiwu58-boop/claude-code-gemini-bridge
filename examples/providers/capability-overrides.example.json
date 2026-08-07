@@ -7,13 +7,17 @@
     "stream_options": false,
     "parallel_tool_calls": true,
     "reasoning_effort": false,
+    "default_reasoning_effort": "high",
     "reasoning_fields": [
       "reasoning_content",
       "thinking"
     ],
     "thinking_tags": true,
+    "include_thoughts": false,
+    "sampling_parameters": true,
     "tool_result_media": "separate_user",
     "tool_schema": "preserve",
-    "max_tokens_field": "max_completion_tokens"
+    "max_tokens_field": "max_completion_tokens",
+    "gemini_builtin_tools": []
   }
 }

@@ -41,6 +41,44 @@ The enhancement layer is **field-driven, not model-name-driven**. For example, `
 
 > **一句话理解：OpenAI 兼容决定“能不能接入”，能力感知适配决定“接入后能发挥到什么程度”。**
 
+### Gemini maximum-capability path: native stateful Interactions
+
+For Gemini 3.6 Flash, the recommended route is now `protocol: "gemini-interactions"`.
+It calls Google's native `/v1beta/interactions` endpoint with `store: true`, streams
+the current `step.*` event protocol, and continues exact branches through
+`previous_interaction_id`. Google therefore owns the preceding thought/signature
+state instead of requiring the bridge to reconstruct it through an OpenAI-compatible
+chat history.
+
+The bridge indexes tool continuations by Google's opaque call ID and ordinary turns
+by a SHA-256 fingerprint of the provider, system prompt, and complete message prefix.
+Only an exact match uses delta-only continuation; edited history, cache eviction, or a
+service restart falls back to full `steps`. The profile can also combine Claude Code's
+client-side tools with Google's server-side `google_search`, `url_context`, and
+`code_execution` tools. This mode deliberately stores request/response state at Google;
+use the OpenAI profile instead if server-side retention is unacceptable.
+
+```json
+{
+  "model": "gemini-3.6-flash",
+  "base_url": "https://generativelanguage.googleapis.com/v1beta",
+  "api_key": "<GEMINI_API_KEY>",
+  "protocol": "gemini-interactions",
+  "capabilities": {
+    "default_reasoning_effort": "high",
+    "include_thoughts": true,
+    "sampling_parameters": false,
+    "gemini_builtin_tools": ["google_search", "url_context", "code_execution"]
+  }
+}
+```
+
+对 Gemini 3.6 Flash，当前推荐使用 `gemini-interactions` 原生有状态通道。桥接器
+固定发送 `store: true`，按精确会话分支续传 `previous_interaction_id`，并将新的
+`thought`、`model_output`、`function_call` 与 `step.delta` 流转换为 Claude Code
+需要的 Anthropic 内容块。Google 负责保存历史思考与签名；这比在 OpenAI Chat
+历史中重放签名更可靠，但也意味着请求/响应状态会保存在 Google 服务端。
+
 ## Not a proxy: a semantic compatibility runtime / 不只是代理，而是语义兼容运行时
 
 Most API bridges are symmetrical field converters: rename a request, forward it, then rename the response. That can make a chat demo work, but Claude Code is not merely a chat client. Its agent loop depends on ordered content blocks, streamed state transitions, tool-call lifecycles, multimodal results, stop reasons, usage accounting, retry classes, context-limit signals, and sometimes provider-specific state that must survive into the next turn.
@@ -511,7 +549,7 @@ cargo run --release
 | 兼容性维度 | 普通转发网关行为 | 本项目（Claude Code Gemini Bridge） |
 | --- | --- | --- |
 | **流式传输 (SSE)** | 缓存整个上游响应，或假设每个网络数据包都是一个完整 SSE 事件 | 设置 Gemini `stream: true`，跨 UTF-8 与网络缓冲区增量解码 SSE，并在 Anthropic 事件生效时即时推送 |
-| **扩展思维链 (Thinking)** | 直接丢弃 Gemini 的 `reasoning_content` / `thinking` | 解析输出 Anthropic `thinking` 块与 `thinking_delta` 流事件，并在文本或工具到达时自动闭合 |
+| **扩展思维链 (Thinking)** | 直接丢弃 Gemini 的 `reasoning_content` / `thinking` | 解析输出 Anthropic `thinking` 块与 `thinking_delta` 流事件，并兼容 Gemini 的 `<thought>` 与常见 `<think>` 标签 |
 | **工具参数拼接** | 直接转发不完整的 JSON 碎片 | 增量拼接流式碎片，保留并行调用顺序，校验完整 JSON 对象无误后再发出 Anthropic `tool_use` 块 |
 | **Gemini 思考签名** | 首次工具调用后丢失 `extra_content.google.thought_signature` | 通过按 Tool Call ID 缓存签名并在下一轮交互中精准还原注入，防止 Gemini 报 400 错 |
 | **工具结果顺序** | 原样保留 Claude 顺序，忽略 Gemini 对 Assistant 工具调用后必须紧跟 Tool 结果的硬性要求 | 在保留工具调用标识的同时，调整 `role: tool` 结果紧跟 Assistant，其余 User 文本/图片后置 |

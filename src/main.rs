@@ -8,7 +8,7 @@
 mod windows_service;
 
 use std::{
-    collections::{hash_map::DefaultHasher, HashSet, VecDeque},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque},
     convert::Infallible,
     env, fs,
     hash::{Hash, Hasher},
@@ -46,6 +46,8 @@ use uuid::Uuid;
 
 const THOUGHT_SIGNATURE_CAPACITY: usize = 4096;
 const THOUGHT_SIGNATURE_EVICTION_BATCH: usize = 512;
+const INTERACTION_CONTINUATION_CAPACITY: usize = 4096;
+const INTERACTION_CONTINUATION_EVICTION_BATCH: usize = 512;
 const VISION_CACHE_CAPACITY: usize = 128;
 const VISION_PROXY_TIMEOUT: Duration = Duration::from_secs(90);
 const VISION_MAX_OUTPUT_TOKENS: u64 = 4096;
@@ -81,12 +83,26 @@ const CLAUDE_CO_AUTHOR_LINE: &str = "Co-Authored-By: Claude <noreply@anthropic.c
 
 type ThoughtSignatureCache = RwLock<IndexMap<String, String>>;
 type VisionObservationCache = tokio::sync::Mutex<IndexMap<String, String>>;
+type InteractionContinuationState = RwLock<InteractionContinuationCache>;
+
+#[derive(Clone)]
+struct InteractionCallContinuation {
+    interaction_id: String,
+    name: String,
+}
+
+#[derive(Default)]
+struct InteractionContinuationCache {
+    calls: IndexMap<String, InteractionCallContinuation>,
+    transcripts: IndexMap<String, String>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProviderTransport {
     LocalGemini,
     Anthropic,
     OpenAiChat,
+    GeminiInteractions,
 }
 
 impl ProviderTransport {
@@ -95,6 +111,7 @@ impl ProviderTransport {
             Self::LocalGemini => "gemini",
             Self::Anthropic => "anthropic",
             Self::OpenAiChat => "openai-chat",
+            Self::GeminiInteractions => "gemini-interactions",
         }
     }
 }
@@ -151,11 +168,15 @@ struct OpenAiCapabilities {
     stream_options: bool,
     parallel_tool_calls: bool,
     reasoning_effort: bool,
+    default_reasoning_effort: Option<String>,
     reasoning_fields: Vec<String>,
     thinking_tags: bool,
+    include_thoughts: bool,
+    sampling_parameters: bool,
     tool_result_media: ToolResultMediaMode,
     tool_schema: ToolSchemaMode,
     max_tokens_field: MaxTokensField,
+    gemini_builtin_tools: Vec<String>,
 }
 
 impl Default for OpenAiCapabilities {
@@ -164,8 +185,11 @@ impl Default for OpenAiCapabilities {
             stream_options: true,
             parallel_tool_calls: true,
             reasoning_effort: true,
+            default_reasoning_effort: None,
             reasoning_fields: vec!["reasoning_content".to_string(), "thinking".to_string()],
             thinking_tags: true,
+            include_thoughts: false,
+            sampling_parameters: true,
             // OpenAI-compatible tool messages are most portable when their
             // content remains a string. Media is moved to a following user
             // message unless a provider explicitly accepts inline media.
@@ -174,6 +198,7 @@ impl Default for OpenAiCapabilities {
             // accept the complete Anthropic schema can opt into preservation.
             tool_schema: ToolSchemaMode::Sanitize,
             max_tokens_field: MaxTokensField::MaxTokens,
+            gemini_builtin_tools: Vec::new(),
         }
     }
 }
@@ -181,6 +206,16 @@ impl Default for OpenAiCapabilities {
 impl OpenAiCapabilities {
     fn local_gemini() -> Self {
         Self {
+            tool_result_media: ToolResultMediaMode::Inline,
+            ..Self::default()
+        }
+    }
+
+    fn gemini_interactions() -> Self {
+        Self {
+            default_reasoning_effort: Some("high".to_string()),
+            include_thoughts: true,
+            sampling_parameters: false,
             tool_result_media: ToolResultMediaMode::Inline,
             ..Self::default()
         }
@@ -270,6 +305,7 @@ struct AppState {
     upstream_url: String,
     model: String,
     thought_signatures: Arc<ThoughtSignatureCache>,
+    interaction_continuations: Arc<InteractionContinuationState>,
     vision_cache: Arc<VisionObservationCache>,
     routing: Arc<RwLock<ProviderRoutingState>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
@@ -422,6 +458,7 @@ where
         upstream_url,
         model,
         thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
+        interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
         vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
         routing: Arc::new(RwLock::new(ProviderRoutingState {
             profiles: loaded_profiles.profiles,
@@ -793,6 +830,38 @@ fn capability_string(
     Ok(None)
 }
 
+fn capability_string_array(
+    object: &Map<String, Value>,
+    names: &[&str],
+    default: Vec<String>,
+    file_name: &str,
+) -> Result<Vec<String>, String> {
+    for name in names {
+        let Some(value) = object.get(*name) else {
+            continue;
+        };
+        let values = value.as_array().ok_or_else(|| {
+            format!("Provider profile '{file_name}' capability '{name}' must be an array")
+        })?;
+        return values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        format!(
+                            "Provider profile '{file_name}' capability '{name}' must contain only non-empty strings"
+                        )
+                    })
+            })
+            .collect();
+    }
+    Ok(default)
+}
+
 #[cfg(test)]
 fn parse_openai_capabilities(
     profile: &Map<String, Value>,
@@ -843,6 +912,21 @@ fn parse_openai_capabilities_with_defaults(
         }
     };
 
+    let default_reasoning_effort = capability_string(
+        object,
+        &["default_reasoning_effort", "defaultReasoningEffort"],
+        file_name,
+    )?
+    .or_else(|| defaults.default_reasoning_effort.clone());
+    if default_reasoning_effort
+        .as_deref()
+        .is_some_and(|effort| !matches!(effort, "minimal" | "low" | "medium" | "high"))
+    {
+        return Err(format!(
+            "Provider profile '{file_name}' capability 'default_reasoning_effort' must be minimal, low, medium, or high"
+        ));
+    }
+
     let tool_schema = match capability_string(
         object,
         &["tool_schema", "toolSchema"],
@@ -892,6 +976,22 @@ fn parse_openai_capabilities_with_defaults(
             ))
         }
     };
+    let gemini_builtin_tools = capability_string_array(
+        object,
+        &["gemini_builtin_tools", "geminiBuiltinTools"],
+        defaults.gemini_builtin_tools.clone(),
+        file_name,
+    )?;
+    for tool in &gemini_builtin_tools {
+        if !matches!(
+            tool.as_str(),
+            "google_search" | "url_context" | "code_execution"
+        ) {
+            return Err(format!(
+                "Provider profile '{file_name}' capability 'gemini_builtin_tools' contains unsupported tool '{tool}' (expected google_search, url_context, or code_execution)"
+            ));
+        }
+    }
 
     Ok(OpenAiCapabilities {
         stream_options: capability_bool(
@@ -912,6 +1012,7 @@ fn parse_openai_capabilities_with_defaults(
             defaults.reasoning_effort,
             file_name,
         )?,
+        default_reasoning_effort,
         reasoning_fields,
         thinking_tags: capability_bool(
             object,
@@ -919,9 +1020,22 @@ fn parse_openai_capabilities_with_defaults(
             defaults.thinking_tags,
             file_name,
         )?,
+        include_thoughts: capability_bool(
+            object,
+            &["include_thoughts", "includeThoughts"],
+            defaults.include_thoughts,
+            file_name,
+        )?,
+        sampling_parameters: capability_bool(
+            object,
+            &["sampling_parameters", "samplingParameters"],
+            defaults.sampling_parameters,
+            file_name,
+        )?,
         tool_result_media,
         tool_schema,
         max_tokens_field,
+        gemini_builtin_tools,
     })
 }
 
@@ -930,11 +1044,15 @@ fn openai_capabilities_json(capabilities: &OpenAiCapabilities) -> Value {
         "stream_options": capabilities.stream_options,
         "parallel_tool_calls": capabilities.parallel_tool_calls,
         "reasoning_effort": capabilities.reasoning_effort,
+        "default_reasoning_effort": capabilities.default_reasoning_effort,
         "reasoning_fields": capabilities.reasoning_fields,
         "thinking_tags": capabilities.thinking_tags,
+        "include_thoughts": capabilities.include_thoughts,
+        "sampling_parameters": capabilities.sampling_parameters,
         "tool_result_media": capabilities.tool_result_media.as_str(),
         "tool_schema": capabilities.tool_schema.as_str(),
-        "max_tokens_field": capabilities.max_tokens_field.as_str()
+        "max_tokens_field": capabilities.max_tokens_field.as_str(),
+        "gemini_builtin_tools": capabilities.gemini_builtin_tools
     })
 }
 
@@ -990,16 +1108,19 @@ fn load_native_provider_profiles(
             "openai" | "openai-chat" | "chat-completions" => ProviderTransport::OpenAiChat,
             "anthropic" | "messages" => ProviderTransport::Anthropic,
             "gemini" | "local-gemini" => ProviderTransport::LocalGemini,
+            "gemini-interactions" | "interactions" => ProviderTransport::GeminiInteractions,
             other => {
                 return Err(format!(
-                    "Provider profile '{file_name}' has unsupported protocol '{other}' (expected openai, anthropic, or gemini)"
+                    "Provider profile '{file_name}' has unsupported protocol '{other}' (expected openai, anthropic, gemini-interactions, or gemini)"
                 ))
             }
         };
-        let capability_defaults = if transport == ProviderTransport::LocalGemini {
-            OpenAiCapabilities::local_gemini()
-        } else {
-            OpenAiCapabilities::default()
+        let capability_defaults = match transport {
+            ProviderTransport::LocalGemini => OpenAiCapabilities::local_gemini(),
+            ProviderTransport::GeminiInteractions => OpenAiCapabilities::gemini_interactions(),
+            ProviderTransport::Anthropic | ProviderTransport::OpenAiChat => {
+                OpenAiCapabilities::default()
+            }
         };
         let openai_capabilities =
             parse_openai_capabilities_with_defaults(object, &file_name, capability_defaults)?;
@@ -1015,6 +1136,7 @@ fn load_native_provider_profiles(
             profile_string(object, &["endpoint"]).unwrap_or_else(|| match transport {
                 ProviderTransport::OpenAiChat => openai_compatible_chat_endpoint(&base_url),
                 ProviderTransport::Anthropic => anthropic_messages_endpoint(&base_url),
+                ProviderTransport::GeminiInteractions => gemini_interactions_endpoint(&base_url),
                 ProviderTransport::LocalGemini => base_url.clone(),
             });
         let api_key = profile_string(object, &["api_key", "apiKey"]);
@@ -1055,7 +1177,10 @@ fn load_native_provider_profiles(
             } else {
                 None
             },
-            api_key: if transport == ProviderTransport::Anthropic {
+            api_key: if matches!(
+                transport,
+                ProviderTransport::Anthropic | ProviderTransport::GeminiInteractions
+            ) {
                 api_key
             } else {
                 None
@@ -1210,8 +1335,14 @@ fn resolve_provider_transport(
                 .map(str::to_owned)
                 .unwrap_or_else(|| openai_chat_endpoint(base_url)),
         )),
+        "gemini-interactions" | "interactions" => Ok((
+            ProviderTransport::GeminiInteractions,
+            configured_upstream_url
+                .map(str::to_owned)
+                .unwrap_or_else(|| gemini_interactions_endpoint(base_url)),
+        )),
         other => Err(format!(
-            "unsupported CLAUDE_BRIDGE_TRANSPORT '{other}' (expected auto, anthropic, or openai-chat)"
+            "unsupported CLAUDE_BRIDGE_TRANSPORT '{other}' (expected auto, anthropic, gemini-interactions, or openai-chat)"
         )),
     }
 }
@@ -1222,6 +1353,15 @@ fn anthropic_messages_endpoint(base_url: &str) -> String {
         base_url.to_string()
     } else {
         format!("{base_url}/v1/messages")
+    }
+}
+
+fn gemini_interactions_endpoint(base_url: &str) -> String {
+    let base_url = base_url.trim().trim_end_matches('/');
+    if base_url.ends_with("/interactions") {
+        base_url.to_string()
+    } else {
+        format!("{base_url}/interactions")
     }
 }
 
@@ -2162,9 +2302,49 @@ fn anthropic_vision_request(source: &ProviderProfile, job: &VisionJob) -> Value 
     })
 }
 
+fn gemini_interactions_vision_request(source: &ProviderProfile, job: &VisionJob) -> Value {
+    let mut content = vec![json!({
+        "type": "text",
+        "text": if job.context.is_empty() {
+            "Extract all relevant visual evidence from the attached media.".to_string()
+        } else {
+            format!("Original user request/context:\n{}", job.context)
+        }
+    })];
+    content.extend(
+        job.media
+            .iter()
+            .filter_map(interaction_content_from_anthropic),
+    );
+    json!({
+        "model": display_model_name(&source.model),
+        "system_instruction": vision_system_prompt(),
+        "input": [{"type": "user_input", "content": content}],
+        "store": false,
+        "stream": false,
+        "generation_config": {
+            "max_output_tokens": VISION_MAX_OUTPUT_TOKENS,
+            "thinking_level": "high"
+        }
+    })
+}
+
 fn parse_vision_observation(transport: ProviderTransport, body: &Value) -> String {
     match transport {
         ProviderTransport::Anthropic => value_to_text(body.get("content").unwrap_or(&Value::Null)),
+        ProviderTransport::GeminiInteractions => body
+            .get("steps")
+            .and_then(Value::as_array)
+            .map(|steps| {
+                steps
+                    .iter()
+                    .filter(|step| step.get("type").and_then(Value::as_str) == Some("model_output"))
+                    .map(|step| value_to_text(step.get("content").unwrap_or(&Value::Null)))
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default(),
         ProviderTransport::LocalGemini | ProviderTransport::OpenAiChat => {
             let message = body.pointer("/choices/0/message").unwrap_or(&Value::Null);
             let content = value_to_text(message.get("content").unwrap_or(&Value::Null));
@@ -2282,6 +2462,23 @@ async fn analyze_vision_job(
                 &HeaderMap::new(),
             );
             send_vision_request(request, source).await?
+        }
+        ProviderTransport::GeminiInteractions => {
+            let api_key = source.api_key.as_ref().ok_or_else(|| {
+                VisionProxyError::gateway(format!(
+                    "Vision provider '{}' has no API credential",
+                    source.file_name
+                ))
+            })?;
+            send_vision_request(
+                source
+                    .client
+                    .post(&source.upstream_url)
+                    .header("x-goog-api-key", api_key)
+                    .json(&gemini_interactions_vision_request(source, job)),
+                source,
+            )
+            .await?
         }
     };
 
@@ -2982,6 +3179,14 @@ async fn anthropic_messages(
             )
             .await;
         }
+        ProviderTransport::GeminiInteractions => {
+            return forward_gemini_interactions_profile(
+                active_profile,
+                request,
+                state.interaction_continuations.clone(),
+            )
+            .await;
+        }
         ProviderTransport::LocalGemini => {}
     }
 
@@ -3149,6 +3354,739 @@ async fn forward_anthropic_profile(
     })
 }
 
+fn interaction_call_cache_key(profile_file: &str, call_id: &str) -> String {
+    format!("{profile_file}\0{call_id}")
+}
+
+fn interaction_transcript_cache_key(
+    profile_file: &str,
+    system: Option<&Value>,
+    messages: &[Value],
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(profile_file.as_bytes());
+    digest.update([0]);
+    if let Some(system) = system {
+        if let Ok(bytes) = serde_json::to_vec(system) {
+            digest.update(bytes);
+        }
+    }
+    digest.update([0]);
+    if let Ok(bytes) = serde_json::to_vec(messages) {
+        digest.update(bytes);
+    }
+    format!("{profile_file}:{:x}", digest.finalize())
+}
+
+fn evict_interaction_cache(cache: &mut InteractionContinuationCache) {
+    if cache.calls.len() > INTERACTION_CONTINUATION_CAPACITY {
+        let remove = INTERACTION_CONTINUATION_EVICTION_BATCH.min(cache.calls.len());
+        cache.calls.drain(..remove);
+    }
+    if cache.transcripts.len() > INTERACTION_CONTINUATION_CAPACITY {
+        let remove = INTERACTION_CONTINUATION_EVICTION_BATCH.min(cache.transcripts.len());
+        cache.transcripts.drain(..remove);
+    }
+}
+
+fn remember_interaction_continuation(
+    continuations: &InteractionContinuationState,
+    profile_file: &str,
+    request: &Value,
+    interaction_id: &str,
+    assistant_content: &[Value],
+    calls: &[(String, String)],
+) {
+    if interaction_id.is_empty() {
+        return;
+    }
+    let Some(source_messages) = request.get("messages").and_then(Value::as_array) else {
+        return;
+    };
+    let mut messages = source_messages.clone();
+    messages.push(json!({
+        "role": "assistant",
+        "content": assistant_content
+    }));
+    let transcript_key =
+        interaction_transcript_cache_key(profile_file, request.get("system"), &messages);
+    let Ok(mut cache) = continuations.write() else {
+        warn!("Cannot lock Gemini Interactions continuation cache for writing");
+        return;
+    };
+    cache
+        .transcripts
+        .insert(transcript_key, interaction_id.to_string());
+    for (call_id, name) in calls {
+        cache.calls.insert(
+            interaction_call_cache_key(profile_file, call_id),
+            InteractionCallContinuation {
+                interaction_id: interaction_id.to_string(),
+                name: name.clone(),
+            },
+        );
+    }
+    evict_interaction_cache(&mut cache);
+}
+
+fn interaction_content_from_anthropic(part: &Value) -> Option<Value> {
+    match part.get("type").and_then(Value::as_str) {
+        Some("text") => part
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| json!({"type": "text", "text": text})),
+        Some(block_type @ ("image" | "document")) => {
+            let source = part.get("source")?;
+            let mut content = Map::new();
+            content.insert("type".to_string(), json!(block_type));
+            match source.get("type").and_then(Value::as_str) {
+                Some("base64") => {
+                    content.insert(
+                        "data".to_string(),
+                        source.get("data").cloned().unwrap_or(Value::Null),
+                    );
+                    content.insert(
+                        "mime_type".to_string(),
+                        source.get("media_type").cloned().unwrap_or(Value::Null),
+                    );
+                }
+                Some("url") if block_type == "image" => {
+                    content.insert(
+                        "uri".to_string(),
+                        source.get("url").cloned().unwrap_or(Value::Null),
+                    );
+                }
+                _ => return None,
+            }
+            Some(Value::Object(content))
+        }
+        _ => None,
+    }
+}
+
+fn interaction_tool_result_value(content: &Value) -> Value {
+    if let Some(parts) = content.as_array() {
+        let translated: Vec<Value> = parts
+            .iter()
+            .filter_map(interaction_content_from_anthropic)
+            .collect();
+        if !translated.is_empty() {
+            return Value::Array(translated);
+        }
+    }
+    if let Some(text) = content.as_str() {
+        Value::String(text.to_string())
+    } else {
+        Value::String(value_to_text(content))
+    }
+}
+
+fn interaction_user_steps(content: &Value, tool_names: &HashMap<String, String>) -> Vec<Value> {
+    if let Some(text) = content.as_str() {
+        return if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![json!({"type": "user_input", "content": [{"type": "text", "text": text}]})]
+        };
+    }
+    let Some(parts) = content.as_array() else {
+        return Vec::new();
+    };
+    let mut steps = Vec::new();
+    let mut user_content = Vec::new();
+    for part in parts {
+        if part.get("type").and_then(Value::as_str) == Some("tool_result") {
+            if !user_content.is_empty() {
+                steps.push(json!({
+                    "type": "user_input",
+                    "content": std::mem::take(&mut user_content)
+                }));
+            }
+            let call_id = part
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .unwrap_or("toolu_unknown");
+            let name = tool_names
+                .get(call_id)
+                .cloned()
+                .unwrap_or_else(|| "unknown_function".to_string());
+            steps.push(json!({
+                "type": "function_result",
+                "call_id": call_id,
+                "name": name,
+                "is_error": part.get("is_error").and_then(Value::as_bool).unwrap_or(false),
+                "result": interaction_tool_result_value(part.get("content").unwrap_or(&Value::Null))
+            }));
+        } else if let Some(translated) = interaction_content_from_anthropic(part) {
+            user_content.push(translated);
+        }
+    }
+    if !user_content.is_empty() {
+        steps.push(json!({"type": "user_input", "content": user_content}));
+    }
+    steps
+}
+
+fn interaction_assistant_steps(
+    content: &Value,
+    tool_names: &mut HashMap<String, String>,
+) -> Vec<Value> {
+    if let Some(text) = content.as_str() {
+        return if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![json!({"type": "model_output", "content": [{"type": "text", "text": text}]})]
+        };
+    }
+    let Some(parts) = content.as_array() else {
+        return Vec::new();
+    };
+    let mut steps = Vec::new();
+    let mut text_content = Vec::new();
+    let flush_text = |steps: &mut Vec<Value>, text_content: &mut Vec<Value>| {
+        if !text_content.is_empty() {
+            steps.push(json!({
+                "type": "model_output",
+                "content": std::mem::take(text_content)
+            }));
+        }
+    };
+    for part in parts {
+        match part.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        text_content.push(json!({"type": "text", "text": text}));
+                    }
+                }
+            }
+            Some("thinking") => {
+                flush_text(&mut steps, &mut text_content);
+                let thinking = part
+                    .get("thinking")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let mut thought = json!({
+                    "type": "thought",
+                    "summary": if thinking.is_empty() {
+                        Vec::<Value>::new()
+                    } else {
+                        vec![json!({"type": "text", "text": thinking})]
+                    }
+                });
+                if let Some(signature) = part.get("signature").and_then(Value::as_str) {
+                    thought["signature"] = json!(signature);
+                }
+                steps.push(thought);
+            }
+            Some("redacted_thinking") => {
+                flush_text(&mut steps, &mut text_content);
+                steps.push(json!({
+                    "type": "thought",
+                    "signature": part.get("data").cloned().unwrap_or(Value::Null),
+                    "summary": []
+                }));
+            }
+            Some("tool_use") => {
+                flush_text(&mut steps, &mut text_content);
+                let call_id = part
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("toolu_unknown");
+                let name = part
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown_function");
+                tool_names.insert(call_id.to_string(), name.to_string());
+                steps.push(json!({
+                    "type": "function_call",
+                    "id": call_id,
+                    "name": name,
+                    "arguments": part.get("input").cloned().unwrap_or_else(|| json!({}))
+                }));
+            }
+            _ => {}
+        }
+    }
+    flush_text(&mut steps, &mut text_content);
+    steps
+}
+
+fn interaction_steps_from_messages(messages: &[Value]) -> Vec<Value> {
+    let mut steps = Vec::new();
+    let mut tool_names = HashMap::new();
+    for message in messages {
+        let content = message.get("content").unwrap_or(&Value::Null);
+        match message.get("role").and_then(Value::as_str) {
+            Some("assistant") => {
+                steps.extend(interaction_assistant_steps(content, &mut tool_names));
+            }
+            Some("user") => steps.extend(interaction_user_steps(content, &tool_names)),
+            _ => {}
+        }
+    }
+    steps
+}
+
+fn translated_interaction_tools(request: &Value, capabilities: &OpenAiCapabilities) -> Vec<Value> {
+    let mut translated = Vec::new();
+    if let Some(tools) = request.get("tools").and_then(Value::as_array) {
+        for tool in tools {
+            let Some(name) = tool.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let mut schema = tool
+                .get("input_schema")
+                .cloned()
+                .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+            if capabilities.tool_schema == ToolSchemaMode::Sanitize {
+                sanitize_json_schema(&mut schema);
+            }
+            let mut translated_tool = json!({
+                "type": "function",
+                "name": name,
+                "parameters": schema
+            });
+            if let Some(description) = tool.get("description") {
+                translated_tool["description"] = description.clone();
+            }
+            translated.push(translated_tool);
+        }
+    }
+    translated.extend(
+        capabilities
+            .gemini_builtin_tools
+            .iter()
+            .map(|tool| json!({"type": tool})),
+    );
+    translated
+}
+
+fn interaction_tool_choice(choice: &Value) -> Option<Value> {
+    match choice.get("type").and_then(Value::as_str)? {
+        "auto" => Some(json!("auto")),
+        "any" => Some(json!("any")),
+        "none" => Some(json!("none")),
+        "tool" => choice
+            .get("name")
+            .and_then(Value::as_str)
+            .map(|name| json!({"allowed_tools": {"mode": "any", "tools": [name]}})),
+        _ => None,
+    }
+}
+
+fn interaction_thinking_level(
+    request: &Value,
+    capabilities: &OpenAiCapabilities,
+) -> Option<String> {
+    request
+        .get("thinking")
+        .and_then(|thinking| {
+            thinking
+                .get("budget_tokens")
+                .and_then(Value::as_u64)
+                .map(|budget| {
+                    if budget >= 8_192 {
+                        "high"
+                    } else if budget >= 2_048 {
+                        "medium"
+                    } else {
+                        "low"
+                    }
+                })
+                .or_else(|| {
+                    (thinking.get("type").and_then(Value::as_str) == Some("adaptive"))
+                        .then_some("high")
+                })
+        })
+        .map(str::to_owned)
+        .or_else(|| capabilities.default_reasoning_effort.clone())
+}
+
+fn interaction_continuation_for_request(
+    profile_file: &str,
+    request: &Value,
+    messages: &[Value],
+    continuations: &InteractionContinuationState,
+) -> Option<(String, HashMap<String, String>, &'static str)> {
+    let last = messages.last()?;
+    if last.get("role").and_then(Value::as_str) != Some("user") {
+        return None;
+    }
+    let mut result_ids = Vec::new();
+    if let Some(parts) = last.get("content").and_then(Value::as_array) {
+        for part in parts {
+            if part.get("type").and_then(Value::as_str) == Some("tool_result") {
+                if let Some(call_id) = part.get("tool_use_id").and_then(Value::as_str) {
+                    result_ids.push(call_id.to_string());
+                }
+            }
+        }
+    }
+    let cache = continuations.read().ok()?;
+    if !result_ids.is_empty() {
+        let mut interaction_id = None;
+        let mut names = HashMap::new();
+        for call_id in result_ids {
+            let continuation = cache
+                .calls
+                .get(&interaction_call_cache_key(profile_file, &call_id))?;
+            if interaction_id
+                .as_ref()
+                .is_some_and(|existing| existing != &continuation.interaction_id)
+            {
+                return None;
+            }
+            interaction_id = Some(continuation.interaction_id.clone());
+            names.insert(call_id, continuation.name.clone());
+        }
+        return interaction_id.map(|id| (id, names, "tool_call_id"));
+    }
+    if messages.len() <= 1 {
+        return None;
+    }
+    let key = interaction_transcript_cache_key(
+        profile_file,
+        request.get("system"),
+        &messages[..messages.len() - 1],
+    );
+    cache
+        .transcripts
+        .get(&key)
+        .cloned()
+        .map(|id| (id, HashMap::new(), "transcript"))
+}
+
+fn translate_gemini_interactions_request(
+    request: &Value,
+    profile: &ProviderProfile,
+    continuations: &InteractionContinuationState,
+) -> Result<Value, String> {
+    let messages = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Missing required array field 'messages'".to_string())?;
+    if messages.is_empty() {
+        return Err("Gemini Interactions requires at least one message".to_string());
+    }
+    let continuation =
+        interaction_continuation_for_request(&profile.file_name, request, messages, continuations);
+    let input = if let Some((_, tool_names, _)) = &continuation {
+        interaction_user_steps(
+            messages
+                .last()
+                .and_then(|message| message.get("content"))
+                .unwrap_or(&Value::Null),
+            tool_names,
+        )
+    } else {
+        interaction_steps_from_messages(messages)
+    };
+    if input.is_empty() {
+        return Err("Gemini Interactions request produced no supported input steps".to_string());
+    }
+
+    let mut generation_config = Map::new();
+    if let Some(max_tokens) = request.get("max_tokens").and_then(Value::as_u64) {
+        generation_config.insert("max_output_tokens".to_string(), json!(max_tokens));
+    }
+    if let Some(stop_sequences) = request.get("stop_sequences").and_then(Value::as_array) {
+        if !stop_sequences.is_empty() {
+            generation_config.insert(
+                "stop_sequences".to_string(),
+                Value::Array(stop_sequences.clone()),
+            );
+        }
+    }
+    if let Some(level) = interaction_thinking_level(request, &profile.openai_capabilities) {
+        generation_config.insert("thinking_level".to_string(), json!(level));
+    }
+    generation_config.insert(
+        "thinking_summaries".to_string(),
+        json!(if profile.openai_capabilities.include_thoughts {
+            "auto"
+        } else {
+            "none"
+        }),
+    );
+    if let Some(choice) = request.get("tool_choice").and_then(interaction_tool_choice) {
+        generation_config.insert("tool_choice".to_string(), choice);
+    }
+
+    let mut body = Map::new();
+    body.insert(
+        "model".to_string(),
+        json!(display_model_name(&profile.model)),
+    );
+    body.insert("input".to_string(), Value::Array(input));
+    body.insert("store".to_string(), Value::Bool(true));
+    body.insert(
+        "stream".to_string(),
+        Value::Bool(
+            request
+                .get("stream")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ),
+    );
+    body.insert(
+        "generation_config".to_string(),
+        Value::Object(generation_config),
+    );
+    let tools = translated_interaction_tools(request, &profile.openai_capabilities);
+    if !tools.is_empty() {
+        body.insert("tools".to_string(), Value::Array(tools));
+    }
+    if let Some((previous_id, _, continuation_kind)) = continuation {
+        info!(
+            provider = %profile.file_name,
+            continuation = continuation_kind,
+            "Continuing stored Gemini interaction"
+        );
+        body.insert("previous_interaction_id".to_string(), json!(previous_id));
+    } else {
+        let system = value_to_text(request.get("system").unwrap_or(&Value::Null));
+        if !system.is_empty() {
+            body.insert("system_instruction".to_string(), json!(system));
+        }
+    }
+    Ok(Value::Object(body))
+}
+
+struct InteractionResponseTranslation {
+    message: Value,
+    interaction_id: String,
+    assistant_content: Vec<Value>,
+    calls: Vec<(String, String)>,
+}
+
+fn is_gemini_server_tool_step(step_type: &str) -> bool {
+    matches!(
+        step_type,
+        "google_search_call"
+            | "google_search_result"
+            | "url_context_call"
+            | "url_context_result"
+            | "code_execution_call"
+            | "code_execution_result"
+    )
+}
+
+fn translate_gemini_interactions_response(
+    upstream: &Value,
+    model: &str,
+) -> Result<InteractionResponseTranslation, String> {
+    let interaction_id = upstream
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "Gemini Interactions response has no id: {}",
+                safe_error_message(upstream)
+            )
+        })?
+        .to_string();
+    let status = upstream
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
+    if matches!(status, "failed" | "cancelled") {
+        return Err(safe_error_message(upstream));
+    }
+    let steps = upstream
+        .get("steps")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Gemini Interactions response has no steps array".to_string())?;
+    let mut content = Vec::new();
+    let mut calls = Vec::new();
+    for step in steps {
+        match step.get("type").and_then(Value::as_str) {
+            Some("thought") => {
+                let thinking = value_to_text(step.get("summary").unwrap_or(&Value::Null));
+                if thinking.is_empty() {
+                    continue;
+                }
+                let mut block = json!({"type": "thinking", "thinking": thinking});
+                if let Some(signature) = step.get("signature").and_then(Value::as_str) {
+                    block["signature"] = json!(signature);
+                }
+                content.push(block);
+            }
+            Some("model_output") => {
+                if let Some(parts) = step.get("content").and_then(Value::as_array) {
+                    for part in parts {
+                        if part.get("type").and_then(Value::as_str) == Some("text") {
+                            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                                if !text.is_empty() {
+                                    content.push(json!({"type": "text", "text": text}));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Some("function_call") => {
+                let call_id = step
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("toolu_{}", Uuid::new_v4().simple()));
+                let name = step
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown_function")
+                    .to_string();
+                let input = step.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                calls.push((call_id.clone(), name.clone()));
+                content.push(json!({
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": name,
+                    "input": input
+                }));
+            }
+            Some(step_type) if is_gemini_server_tool_step(step_type) => {
+                info!(step_type, "Gemini server-side tool step completed");
+            }
+            _ => {}
+        }
+    }
+    let usage = upstream.get("usage").unwrap_or(&Value::Null);
+    let input_tokens = usage_token(usage, &["total_input_tokens"]).unwrap_or(0);
+    let output_tokens = usage_token(usage, &["total_output_tokens"]).unwrap_or(0);
+    let stop_reason = if !calls.is_empty() || status == "requires_action" {
+        "tool_use"
+    } else if status == "incomplete" {
+        "max_tokens"
+    } else {
+        "end_turn"
+    };
+    let message = json!({
+        "id": format!("msg_{}", Uuid::new_v4().simple()),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content,
+        "stop_reason": stop_reason,
+        "stop_sequence": Value::Null,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens
+        }
+    });
+    Ok(InteractionResponseTranslation {
+        message,
+        interaction_id,
+        assistant_content: content,
+        calls,
+    })
+}
+
+async fn forward_gemini_interactions_profile(
+    profile: ProviderProfile,
+    request: Value,
+    continuations: Arc<InteractionContinuationState>,
+) -> Response {
+    let interaction_request =
+        match translate_gemini_interactions_request(&request, &profile, &continuations) {
+            Ok(value) => value,
+            Err(message) => {
+                return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message)
+            }
+        };
+    let stream_requested = request
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let estimated_input_tokens =
+        u64::try_from(estimate_anthropic_input_tokens(&request)).unwrap_or(u64::MAX);
+    let Some(api_key) = profile.api_key.as_ref() else {
+        return anthropic_error(
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "The active Gemini Interactions profile has no API key",
+        );
+    };
+    let upstream = match profile
+        .client
+        .post(&profile.upstream_url)
+        .header("x-goog-api-key", api_key)
+        .json(&interaction_request)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            error!(
+                "Provider '{}' Gemini Interactions request to '{}' failed: {err}",
+                profile.file_name, profile.upstream_url
+            );
+            return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", &err.to_string());
+        }
+    };
+    let status = upstream.status();
+    if !status.is_success() {
+        let response_text = match read_response_text_limited(upstream).await {
+            Ok(text) => text,
+            Err(err) => format!("Cannot read provider error response: {err}"),
+        };
+        let message = serde_json::from_str::<Value>(&response_text)
+            .ok()
+            .map(|value| safe_error_message(&value))
+            .unwrap_or(response_text);
+        error!(
+            "Provider '{}' Gemini Interactions returned HTTP {status}: {message}",
+            profile.file_name
+        );
+        let response_status =
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let (response_status, error_type) = openai_error_contract(response_status, &message);
+        return anthropic_error(response_status, error_type, &message);
+    }
+    let model = display_model_name(&profile.model);
+    if stream_requested {
+        return gemini_interactions_stream_response(
+            upstream,
+            model,
+            profile.file_name,
+            request,
+            continuations,
+            estimated_input_tokens,
+        );
+    }
+    let upstream_body = match read_response_json_limited(upstream).await {
+        Ok(value) => value,
+        Err(err) => {
+            return anthropic_error(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                &format!("Gemini Interactions returned invalid JSON: {err}"),
+            )
+        }
+    };
+    let translated = match translate_gemini_interactions_response(&upstream_body, &model) {
+        Ok(value) => value,
+        Err(message) => {
+            error!(
+                "Cannot translate provider '{}' Gemini Interactions response: {message}",
+                profile.file_name
+            );
+            return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", &message);
+        }
+    };
+    remember_interaction_continuation(
+        &continuations,
+        &profile.file_name,
+        &request,
+        &translated.interaction_id,
+        &translated.assistant_content,
+        &translated.calls,
+    );
+    Json(translated.message).into_response()
+}
+
 async fn forward_openai_profile(
     profile: ProviderProfile,
     request: Value,
@@ -3282,6 +4220,572 @@ fn apply_anthropic_forward_headers(
         upstream_request = upstream_request.header("anthropic-beta", value);
     }
     upstream_request
+}
+
+enum InteractionStreamingBlock {
+    Thought {
+        thinking: String,
+        signature: Option<String>,
+    },
+    Text {
+        text: String,
+    },
+    Tool {
+        id: String,
+        name: String,
+        arguments: String,
+    },
+}
+
+struct ActiveInteractionStreamingBlock {
+    anthropic_index: usize,
+    block: InteractionStreamingBlock,
+}
+
+struct GeminiInteractionsStreamTranslator {
+    message_id: String,
+    model: String,
+    profile_file: String,
+    request: Value,
+    continuations: Arc<InteractionContinuationState>,
+    interaction_id: Option<String>,
+    status: Option<String>,
+    usage: Value,
+    input_tokens: u64,
+    next_content_index: usize,
+    active_blocks: IndexMap<usize, ActiveInteractionStreamingBlock>,
+    assistant_content: Vec<Value>,
+    calls: Vec<(String, String)>,
+    completed: bool,
+    finished: bool,
+}
+
+impl GeminiInteractionsStreamTranslator {
+    fn new(
+        model: String,
+        profile_file: String,
+        request: Value,
+        continuations: Arc<InteractionContinuationState>,
+        estimated_input_tokens: u64,
+    ) -> Self {
+        Self {
+            message_id: format!("msg_{}", Uuid::new_v4().simple()),
+            model,
+            profile_file,
+            request,
+            continuations,
+            interaction_id: None,
+            status: None,
+            usage: json!({}),
+            input_tokens: estimated_input_tokens,
+            next_content_index: 0,
+            active_blocks: IndexMap::new(),
+            assistant_content: Vec::new(),
+            calls: Vec::new(),
+            completed: false,
+            finished: false,
+        }
+    }
+
+    fn start_events(&self) -> Result<Vec<Event>, String> {
+        let mut events = Vec::new();
+        push_anthropic_event(
+            &mut events,
+            "message_start",
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": self.message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": self.model,
+                    "content": [],
+                    "stop_reason": Value::Null,
+                    "stop_sequence": Value::Null,
+                    "usage": {
+                        "input_tokens": self.input_tokens,
+                        "output_tokens": 0
+                    }
+                }
+            }),
+        )?;
+        Ok(events)
+    }
+
+    fn process_payload(&mut self, payload: &str) -> Result<Vec<Event>, String> {
+        if payload.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let event: Value = serde_json::from_str(payload)
+            .map_err(|err| format!("Invalid JSON in Gemini Interactions SSE stream: {err}"))?;
+        if event.get("error").is_some()
+            || event.get("event_type").and_then(Value::as_str) == Some("error")
+        {
+            return Err(safe_error_message(&event));
+        }
+        let event_type = event
+            .get("event_type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match event_type {
+            "interaction.created"
+            | "interaction.in_progress"
+            | "interaction.requires_action"
+            | "interaction.status_update" => {
+                if let Some(interaction) = event.get("interaction") {
+                    self.capture_interaction(interaction, false);
+                } else {
+                    if let Some(id) = event.get("interaction_id").and_then(Value::as_str) {
+                        self.interaction_id = Some(id.to_string());
+                    }
+                    if let Some(status) = event.get("status").and_then(Value::as_str) {
+                        self.status = Some(status.to_string());
+                    }
+                }
+                Ok(Vec::new())
+            }
+            "interaction.completed" => {
+                if let Some(interaction) = event.get("interaction") {
+                    self.capture_interaction(interaction, true);
+                } else {
+                    self.completed = true;
+                }
+                Ok(Vec::new())
+            }
+            "step.start" => self.start_step(&event),
+            "step.delta" => self.delta_step(&event),
+            "step.stop" => self.stop_step(&event),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn capture_interaction(&mut self, interaction: &Value, completed: bool) {
+        if let Some(id) = interaction.get("id").and_then(Value::as_str) {
+            self.interaction_id = Some(id.to_string());
+        }
+        if let Some(status) = interaction.get("status").and_then(Value::as_str) {
+            self.status = Some(status.to_string());
+        }
+        if let Some(usage) = interaction.get("usage") {
+            self.usage = usage.clone();
+            self.input_tokens =
+                usage_token(usage, &["total_input_tokens"]).unwrap_or(self.input_tokens);
+        }
+        self.completed |= completed;
+    }
+
+    fn start_step(&mut self, event: &Value) -> Result<Vec<Event>, String> {
+        let index = event
+            .get("index")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| "Gemini Interactions step.start has no valid index".to_string())?;
+        let step = event.get("step").unwrap_or(&Value::Null);
+        let Some(step_type) = step.get("type").and_then(Value::as_str) else {
+            return Ok(Vec::new());
+        };
+        let anthropic_index = self.next_content_index;
+        let (block, content_block) = match step_type {
+            "thought" => (
+                InteractionStreamingBlock::Thought {
+                    thinking: String::new(),
+                    signature: None,
+                },
+                json!({"type": "thinking", "thinking": ""}),
+            ),
+            "model_output" => (
+                InteractionStreamingBlock::Text {
+                    text: String::new(),
+                },
+                json!({"type": "text", "text": ""}),
+            ),
+            "function_call" => {
+                let id = step
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("toolu_{}", Uuid::new_v4().simple()));
+                let name = step
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown_function")
+                    .to_string();
+                (
+                    InteractionStreamingBlock::Tool {
+                        id: id.clone(),
+                        name: name.clone(),
+                        arguments: String::new(),
+                    },
+                    json!({"type": "tool_use", "id": id, "name": name, "input": {}}),
+                )
+            }
+            _ => {
+                if is_gemini_server_tool_step(step_type) {
+                    info!(
+                        provider = %self.profile_file,
+                        step_type,
+                        "Gemini server-side tool step started"
+                    );
+                }
+                return Ok(Vec::new());
+            }
+        };
+        self.next_content_index += 1;
+        self.active_blocks.insert(
+            index,
+            ActiveInteractionStreamingBlock {
+                anthropic_index,
+                block,
+            },
+        );
+        let mut events = Vec::new();
+        push_anthropic_event(
+            &mut events,
+            "content_block_start",
+            json!({
+                "type": "content_block_start",
+                "index": anthropic_index,
+                "content_block": content_block
+            }),
+        )?;
+        Ok(events)
+    }
+
+    fn delta_step(&mut self, event: &Value) -> Result<Vec<Event>, String> {
+        let Some(index) = event
+            .get("index")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            return Ok(Vec::new());
+        };
+        let Some(active) = self.active_blocks.get_mut(&index) else {
+            return Ok(Vec::new());
+        };
+        let delta = event.get("delta").unwrap_or(&Value::Null);
+        let delta_type = delta
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let mut events = Vec::new();
+        match &mut active.block {
+            InteractionStreamingBlock::Thought {
+                thinking,
+                signature,
+            } => match delta_type {
+                "thought_summary" => {
+                    let text = value_to_text(delta.get("content").unwrap_or(&Value::Null));
+                    if !text.is_empty() {
+                        thinking.push_str(&text);
+                        push_anthropic_event(
+                            &mut events,
+                            "content_block_delta",
+                            json!({
+                                "type": "content_block_delta",
+                                "index": active.anthropic_index,
+                                "delta": {"type": "thinking_delta", "thinking": text}
+                            }),
+                        )?;
+                    }
+                }
+                "thought_signature" => {
+                    if let Some(value) = delta.get("signature").and_then(Value::as_str) {
+                        *signature = Some(value.to_string());
+                        push_anthropic_event(
+                            &mut events,
+                            "content_block_delta",
+                            json!({
+                                "type": "content_block_delta",
+                                "index": active.anthropic_index,
+                                "delta": {"type": "signature_delta", "signature": value}
+                            }),
+                        )?;
+                    }
+                }
+                _ => {}
+            },
+            InteractionStreamingBlock::Text { text } => {
+                if delta_type == "text" || delta.get("text").is_some() {
+                    if let Some(value) = delta.get("text").and_then(Value::as_str) {
+                        if !value.is_empty() {
+                            text.push_str(value);
+                            push_anthropic_event(
+                                &mut events,
+                                "content_block_delta",
+                                json!({
+                                    "type": "content_block_delta",
+                                    "index": active.anthropic_index,
+                                    "delta": {"type": "text_delta", "text": value}
+                                }),
+                            )?;
+                        }
+                    }
+                }
+            }
+            InteractionStreamingBlock::Tool { arguments, .. } => {
+                if delta_type == "arguments_delta" || delta_type == "arguments" {
+                    if let Some(value) = delta
+                        .get("arguments")
+                        .or_else(|| delta.get("partial_arguments"))
+                        .and_then(Value::as_str)
+                    {
+                        arguments.push_str(value);
+                        push_anthropic_event(
+                            &mut events,
+                            "content_block_delta",
+                            json!({
+                                "type": "content_block_delta",
+                                "index": active.anthropic_index,
+                                "delta": {"type": "input_json_delta", "partial_json": value}
+                            }),
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(events)
+    }
+
+    fn stop_step(&mut self, event: &Value) -> Result<Vec<Event>, String> {
+        let Some(index) = event
+            .get("index")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            return Ok(Vec::new());
+        };
+        let Some(active) = self.active_blocks.shift_remove(&index) else {
+            return Ok(Vec::new());
+        };
+        match active.block {
+            InteractionStreamingBlock::Thought {
+                thinking,
+                signature,
+            } => {
+                let mut block = json!({"type": "thinking", "thinking": thinking});
+                if let Some(signature) = signature {
+                    block["signature"] = json!(signature);
+                }
+                self.assistant_content.push(block);
+            }
+            InteractionStreamingBlock::Text { text } => {
+                self.assistant_content
+                    .push(json!({"type": "text", "text": text}));
+            }
+            InteractionStreamingBlock::Tool {
+                id,
+                name,
+                arguments,
+            } => {
+                let input = parse_tool_arguments(if arguments.is_empty() {
+                    "{}"
+                } else {
+                    &arguments
+                })?;
+                self.calls.push((id.clone(), name.clone()));
+                self.assistant_content.push(json!({
+                    "type": "tool_use",
+                    "id": id,
+                    "name": name,
+                    "input": input
+                }));
+            }
+        }
+        let mut events = Vec::new();
+        push_anthropic_event(
+            &mut events,
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": active.anthropic_index}),
+        )?;
+        Ok(events)
+    }
+
+    fn finish(&mut self) -> Result<Vec<Event>, String> {
+        if self.finished {
+            return Ok(Vec::new());
+        }
+        if !self.completed {
+            return Err(
+                "Gemini Interactions stream ended before interaction.completed".to_string(),
+            );
+        }
+        if !self.active_blocks.is_empty() {
+            return Err("Gemini Interactions stream ended with an unfinished step".to_string());
+        }
+        let interaction_id = self.interaction_id.as_deref().ok_or_else(|| {
+            "Gemini Interactions stream completed without an interaction id".to_string()
+        })?;
+        remember_interaction_continuation(
+            &self.continuations,
+            &self.profile_file,
+            &self.request,
+            interaction_id,
+            &self.assistant_content,
+            &self.calls,
+        );
+        let status = self.status.as_deref().unwrap_or("completed");
+        let stop_reason = if !self.calls.is_empty() || status == "requires_action" {
+            "tool_use"
+        } else if status == "incomplete" {
+            "max_tokens"
+        } else {
+            "end_turn"
+        };
+        let output_tokens = usage_token(&self.usage, &["total_output_tokens"]).unwrap_or(0);
+        self.finished = true;
+        let mut events = Vec::new();
+        push_anthropic_event(
+            &mut events,
+            "message_delta",
+            json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": Value::Null},
+                "usage": {"output_tokens": output_tokens}
+            }),
+        )?;
+        push_anthropic_event(&mut events, "message_stop", json!({"type": "message_stop"}))?;
+        Ok(events)
+    }
+}
+
+fn gemini_interactions_event_stream<S, B, E>(
+    byte_stream: S,
+    model: String,
+    profile_file: String,
+    request: Value,
+    continuations: Arc<InteractionContinuationState>,
+    estimated_input_tokens: u64,
+) -> impl Stream<Item = Result<Event, Infallible>>
+where
+    S: Stream<Item = Result<B, E>> + Send + 'static,
+    B: AsRef<[u8]> + Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    let byte_stream = Box::pin(byte_stream);
+    let translator = GeminiInteractionsStreamTranslator::new(
+        model,
+        profile_file,
+        request,
+        continuations,
+        estimated_input_tokens,
+    );
+    let initial_events = match translator.start_events() {
+        Ok(events) => VecDeque::from(events),
+        Err(message) => VecDeque::from([anthropic_stream_error_event(&message)]),
+    };
+    stream::unfold(
+        (
+            byte_stream,
+            SseDataDecoder::default(),
+            translator,
+            initial_events,
+            false,
+        ),
+        |(mut byte_stream, mut decoder, mut translator, mut pending, mut ended)| async move {
+            loop {
+                if let Some(event) = pending.pop_front() {
+                    return Some((
+                        Ok::<Event, Infallible>(event),
+                        (byte_stream, decoder, translator, pending, ended),
+                    ));
+                }
+                if ended {
+                    return None;
+                }
+                match byte_stream.next().await {
+                    Some(Ok(bytes)) => match decoder.push_bytes(bytes.as_ref()) {
+                        Ok(payloads) => {
+                            for payload in payloads {
+                                if payload.trim() == "[DONE]" {
+                                    match translator.finish() {
+                                        Ok(events) => pending.extend(events),
+                                        Err(message) => pending
+                                            .push_back(anthropic_stream_error_event(&message)),
+                                    }
+                                    ended = true;
+                                    break;
+                                }
+                                match translator.process_payload(&payload) {
+                                    Ok(events) => pending.extend(events),
+                                    Err(message) => {
+                                        pending.push_back(anthropic_stream_error_event(&message));
+                                        ended = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(message) => {
+                            pending.push_back(anthropic_stream_error_event(&message));
+                            ended = true;
+                        }
+                    },
+                    Some(Err(err)) => {
+                        pending.push_back(anthropic_stream_error_event(&format!(
+                            "Gemini Interactions stream failed: {err}"
+                        )));
+                        ended = true;
+                    }
+                    None => {
+                        let mut processing_failed = false;
+                        match decoder.finish() {
+                            Ok(payloads) => {
+                                for payload in payloads {
+                                    if payload.trim() == "[DONE]" {
+                                        continue;
+                                    }
+                                    match translator.process_payload(&payload) {
+                                        Ok(events) => pending.extend(events),
+                                        Err(message) => {
+                                            pending
+                                                .push_back(anthropic_stream_error_event(&message));
+                                            processing_failed = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(message) => {
+                                pending.push_back(anthropic_stream_error_event(&message));
+                                processing_failed = true;
+                            }
+                        }
+                        if !processing_failed {
+                            match translator.finish() {
+                                Ok(events) => pending.extend(events),
+                                Err(message) => {
+                                    pending.push_back(anthropic_stream_error_event(&message))
+                                }
+                            }
+                        }
+                        ended = true;
+                    }
+                }
+            }
+        },
+    )
+}
+
+fn gemini_interactions_stream_response(
+    upstream: reqwest::Response,
+    model: String,
+    profile_file: String,
+    request: Value,
+    continuations: Arc<InteractionContinuationState>,
+    estimated_input_tokens: u64,
+) -> Response {
+    let event_stream = gemini_interactions_event_stream(
+        upstream.bytes_stream(),
+        model,
+        profile_file,
+        request,
+        continuations,
+        estimated_input_tokens,
+    );
+    Sse::new(event_stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
 }
 
 #[derive(Default)]
@@ -3529,17 +5033,20 @@ fn text_from_fields(value: &Value, fields: &[String]) -> Option<String> {
 }
 
 fn split_tagged_thinking(text: &str) -> Option<(&str, &str)> {
-    const OPEN_TAG: &str = "<think>";
-    const CLOSE_TAG: &str = "</think>";
     let trimmed = text.trim_start();
-    let prefix = trimmed.get(..OPEN_TAG.len())?;
-    if !prefix.eq_ignore_ascii_case(OPEN_TAG) {
-        return None;
+    for (open_tag, close_tag) in [("<think>", "</think>"), ("<thought>", "</thought>")] {
+        let Some(prefix) = trimmed.get(..open_tag.len()) else {
+            continue;
+        };
+        if !prefix.eq_ignore_ascii_case(open_tag) {
+            continue;
+        }
+        let body = &trimmed[open_tag.len()..];
+        let lowered = body.to_ascii_lowercase();
+        let end = lowered.find(close_tag)?;
+        return Some((&body[..end], &body[end + close_tag.len()..]));
     }
-    let body = &trimmed[OPEN_TAG.len()..];
-    let lowered = body.to_ascii_lowercase();
-    let end = lowered.find(CLOSE_TAG)?;
-    Some((&body[..end], &body[end + CLOSE_TAG.len()..]))
+    None
 }
 
 fn tool_arguments_text(value: Option<&Value>) -> String {
@@ -3565,7 +5072,7 @@ fn safety_refusal_text(block_reason: &str) -> String {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TaggedContentState {
     Detecting,
-    Thinking,
+    Thinking(&'static str),
     Text,
 }
 
@@ -3579,6 +5086,7 @@ struct AnthropicStreamTranslator {
     text_block_index: Option<usize>,
     tagged_content_state: TaggedContentState,
     tagged_content_buffer: String,
+    assistant_thought_signature: Option<String>,
     tool_calls: IndexMap<String, StreamingToolCall>,
     next_anonymous_tool: usize,
     finish_reason: Option<String>,
@@ -3626,6 +5134,7 @@ impl AnthropicStreamTranslator {
             text_block_index: None,
             tagged_content_state,
             tagged_content_buffer: String::new(),
+            assistant_thought_signature: None,
             tool_calls: IndexMap::new(),
             next_anonymous_tool: 0,
             finish_reason: None,
@@ -3708,6 +5217,12 @@ impl AnthropicStreamTranslator {
         };
 
         let mut events = Vec::new();
+        if let Some(signature) = delta
+            .pointer("/extra_content/google/thought_signature")
+            .and_then(Value::as_str)
+        {
+            self.assistant_thought_signature = Some(signature.to_string());
+        }
         let reasoning_text = text_from_fields(delta, &self.capabilities.reasoning_fields);
         if let Some(reasoning_text) = reasoning_text {
             self.emit_thinking_delta(&mut events, &reasoning_text)?;
@@ -3782,24 +5297,33 @@ impl AnthropicStreamTranslator {
     }
 
     fn process_content_delta(&mut self, events: &mut Vec<Event>, text: &str) -> Result<(), String> {
-        const OPEN_TAG: &str = "<think>";
         match self.tagged_content_state {
             TaggedContentState::Text => self.emit_text_delta(events, text),
-            TaggedContentState::Thinking => self.process_tagged_thinking(events, text),
+            TaggedContentState::Thinking(close_tag) => {
+                self.process_tagged_thinking(events, text, close_tag)
+            }
             TaggedContentState::Detecting => {
                 self.tagged_content_buffer.push_str(text);
                 let trimmed = self.tagged_content_buffer.trim_start();
                 let lowered = trimmed.to_ascii_lowercase();
-                if OPEN_TAG.starts_with(&lowered) && self.tagged_content_buffer.len() <= 64 {
+                let tags = [("<think>", "</think>"), ("<thought>", "</thought>")];
+                if tags
+                    .iter()
+                    .any(|(open_tag, _)| open_tag.starts_with(&lowered))
+                    && self.tagged_content_buffer.len() <= 64
+                {
                     return Ok(());
                 }
-                if lowered.starts_with(OPEN_TAG) {
+                if let Some((open_tag, close_tag)) = tags
+                    .into_iter()
+                    .find(|(open_tag, _)| lowered.starts_with(open_tag))
+                {
                     let leading_bytes = self.tagged_content_buffer.len() - trimmed.len();
                     let rest =
-                        self.tagged_content_buffer[leading_bytes + OPEN_TAG.len()..].to_string();
+                        self.tagged_content_buffer[leading_bytes + open_tag.len()..].to_string();
                     self.tagged_content_buffer.clear();
-                    self.tagged_content_state = TaggedContentState::Thinking;
-                    return self.process_tagged_thinking(events, &rest);
+                    self.tagged_content_state = TaggedContentState::Thinking(close_tag);
+                    return self.process_tagged_thinking(events, &rest, close_tag);
                 }
 
                 self.tagged_content_state = TaggedContentState::Text;
@@ -3813,13 +5337,13 @@ impl AnthropicStreamTranslator {
         &mut self,
         events: &mut Vec<Event>,
         text: &str,
+        close_tag: &'static str,
     ) -> Result<(), String> {
-        const CLOSE_TAG: &str = "</think>";
         self.tagged_content_buffer.push_str(text);
         let lowered = self.tagged_content_buffer.to_ascii_lowercase();
-        if let Some(end) = lowered.find(CLOSE_TAG) {
+        if let Some(end) = lowered.find(close_tag) {
             let thinking = self.tagged_content_buffer[..end].to_string();
-            let remaining = self.tagged_content_buffer[end + CLOSE_TAG.len()..].to_string();
+            let remaining = self.tagged_content_buffer[end + close_tag.len()..].to_string();
             self.tagged_content_buffer.clear();
             self.emit_thinking_delta(events, &thinking)?;
             self.tagged_content_state = TaggedContentState::Text;
@@ -3829,9 +5353,9 @@ impl AnthropicStreamTranslator {
             return Ok(());
         }
 
-        let retained = (1..CLOSE_TAG.len())
+        let retained = (1..close_tag.len())
             .rev()
-            .find(|length| lowered.ends_with(&CLOSE_TAG[..*length]))
+            .find(|length| lowered.ends_with(&close_tag[..*length]))
             .unwrap_or(0);
         let emit_length = self.tagged_content_buffer.len() - retained;
         if emit_length > 0 {
@@ -3848,7 +5372,7 @@ impl AnthropicStreamTranslator {
         }
         let buffered = std::mem::take(&mut self.tagged_content_buffer);
         match self.tagged_content_state {
-            TaggedContentState::Thinking => self.emit_thinking_delta(events, &buffered),
+            TaggedContentState::Thinking(_) => self.emit_thinking_delta(events, &buffered),
             TaggedContentState::Detecting | TaggedContentState::Text => {
                 self.tagged_content_state = TaggedContentState::Text;
                 self.emit_text_delta(events, &buffered)
@@ -3858,6 +5382,17 @@ impl AnthropicStreamTranslator {
 
     fn stop_thinking_block(&mut self, events: &mut Vec<Event>) -> Result<(), String> {
         if let Some(index) = self.thinking_block_index.take() {
+            if let Some(signature) = self.assistant_thought_signature.take() {
+                push_anthropic_event(
+                    events,
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {"type": "signature_delta", "signature": signature}
+                    }),
+                )?;
+            }
             push_anthropic_event(
                 events,
                 "content_block_stop",
@@ -4811,11 +6346,13 @@ fn translate_anthropic_request_with_capabilities(
             MaxTokensField::Omit => {}
         }
     }
-    if let Some(temperature) = request.get("temperature").and_then(Value::as_f64) {
-        body.insert("temperature".to_string(), json!(temperature));
-    }
-    if let Some(top_p) = request.get("top_p").and_then(Value::as_f64) {
-        body.insert("top_p".to_string(), json!(top_p));
+    if capabilities.sampling_parameters {
+        if let Some(temperature) = request.get("temperature").and_then(Value::as_f64) {
+            body.insert("temperature".to_string(), json!(temperature));
+        }
+        if let Some(top_p) = request.get("top_p").and_then(Value::as_f64) {
+            body.insert("top_p".to_string(), json!(top_p));
+        }
     }
     if let Some(stop_sequences) = request.get("stop_sequences").and_then(Value::as_array) {
         if !stop_sequences.is_empty() {
@@ -4869,6 +6406,21 @@ fn translate_anthropic_request_with_capabilities(
                 body.insert("reasoning_effort".to_string(), json!(effort));
             }
         }
+        if !body.contains_key("reasoning_effort") {
+            if let Some(effort) = &capabilities.default_reasoning_effort {
+                body.insert("reasoning_effort".to_string(), json!(effort));
+            }
+        }
+    }
+    if capabilities.include_thoughts {
+        let mut thinking_config = json!({"include_thoughts": true});
+        if let Some(effort) = body.remove("reasoning_effort") {
+            thinking_config["thinking_level"] = effort;
+        }
+        body.insert(
+            "extra_body".to_string(),
+            json!({"google": {"thinking_config": thinking_config}}),
+        );
     }
 
     Ok(Value::Object(body))
@@ -4893,6 +6445,7 @@ fn translate_anthropic_assistant_message(
     };
     let mut text_parts = Vec::new();
     let mut tool_calls = Vec::new();
+    let mut assistant_signature = None;
 
     for part in parts {
         match part.get("type").and_then(Value::as_str) {
@@ -4932,7 +6485,15 @@ fn translate_anthropic_assistant_message(
                 }
                 tool_calls.push(translated);
             }
-            Some("thinking") | Some("redacted_thinking") => {}
+            Some("thinking") => {
+                assistant_signature = part
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+            Some("redacted_thinking") => {
+                assistant_signature = part.get("data").and_then(Value::as_str).map(str::to_owned);
+            }
             _ => {}
         }
     }
@@ -4948,6 +6509,8 @@ fn translate_anthropic_assistant_message(
         });
         if !tool_calls.is_empty() {
             translated["tool_calls"] = Value::Array(tool_calls);
+        } else if let Some(signature) = assistant_signature {
+            translated["extra_content"] = json!({"google": {"thought_signature": signature}});
         }
         messages.push(translated);
     }
@@ -5298,15 +6861,27 @@ fn translate_anthropic_response_with_capabilities(
         .and_then(Value::as_str);
     let allow_tool_calls = anthropic_stop_reason(finish_reason, true) == "tool_use";
     let mut content = Vec::new();
+    let mut assistant_signature = upstream_message
+        .pointer("/extra_content/google/thought_signature")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let reasoning_text = text_from_fields(upstream_message, &capabilities.reasoning_fields);
     if let Some(reasoning_text) = reasoning_text {
-        content.push(json!({"type": "thinking", "thinking": reasoning_text}));
+        let mut block = json!({"type": "thinking", "thinking": reasoning_text});
+        if let Some(signature) = assistant_signature.take() {
+            block["signature"] = json!(signature);
+        }
+        content.push(block);
     }
     let text = value_to_text(upstream_message.get("content").unwrap_or(&Value::Null));
     if capabilities.thinking_tags {
         if let Some((thinking, answer)) = split_tagged_thinking(&text) {
             if !thinking.is_empty() {
-                content.push(json!({"type": "thinking", "thinking": thinking}));
+                let mut block = json!({"type": "thinking", "thinking": thinking});
+                if let Some(signature) = assistant_signature.take() {
+                    block["signature"] = json!(signature);
+                }
+                content.push(block);
             }
             if !answer.is_empty() {
                 content.push(json!({"type": "text", "text": answer}));
@@ -6514,6 +8089,9 @@ mod tests {
             upstream_url: "https://example.invalid/gemini".to_string(),
             model: "fallback".to_string(),
             thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
+            interaction_continuations: Arc::new(RwLock::new(
+                InteractionContinuationCache::default(),
+            )),
             vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
             routing: Arc::new(RwLock::new(ProviderRoutingState {
                 profiles: vec![target.clone(), source],
@@ -6598,6 +8176,9 @@ mod tests {
             upstream_url: "https://example.invalid/gemini".to_string(),
             model: "fallback".to_string(),
             thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
+            interaction_continuations: Arc::new(RwLock::new(
+                InteractionContinuationCache::default(),
+            )),
             vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
             routing: Arc::new(RwLock::new(ProviderRoutingState {
                 profiles: Vec::new(),
@@ -6812,6 +8393,43 @@ mod tests {
     }
 
     #[test]
+    fn gemini_capabilities_enable_max_thinking_without_deprecated_sampling() {
+        let request = json!({
+            "stream": true,
+            "max_tokens": 65_536,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "messages": [{"role": "user", "content": "inspect the repository"}]
+        });
+        let capabilities = OpenAiCapabilities {
+            default_reasoning_effort: Some("high".to_string()),
+            include_thoughts: true,
+            sampling_parameters: false,
+            ..OpenAiCapabilities::default()
+        };
+        let signatures = RwLock::new(IndexMap::new());
+        let translated = translate_anthropic_request_with_capabilities(
+            &request,
+            "gemini-3.6-flash",
+            &signatures,
+            &capabilities,
+        )
+        .unwrap();
+
+        assert!(translated.get("reasoning_effort").is_none());
+        assert_eq!(
+            translated["extra_body"]["google"]["thinking_config"]["include_thoughts"],
+            true
+        );
+        assert_eq!(
+            translated["extra_body"]["google"]["thinking_config"]["thinking_level"],
+            "high"
+        );
+        assert!(translated.get("temperature").is_none());
+        assert!(translated.get("top_p").is_none());
+    }
+
+    #[test]
     fn rejects_invalid_provider_capability_types() {
         let profile = json!({"capabilities": {"tool_schema": 7}});
         let error =
@@ -6973,6 +8591,44 @@ mod tests {
             translated["messages"][0]["tool_calls"][0]["extra_content"]["google"]
                 ["thought_signature"],
             "encrypted-signature"
+        );
+    }
+
+    #[test]
+    fn preserves_gemini_text_thought_signature_for_next_turn() {
+        let signatures = RwLock::new(IndexMap::new());
+        let upstream = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "<thought>brief analysis</thought>OK",
+                    "extra_content": {
+                        "google": {
+                            "thought": true,
+                            "thought_signature": "text-signature"
+                        }
+                    }
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let response =
+            translate_anthropic_response(&upstream, "gemini-3.6-flash", &signatures).unwrap();
+        assert_eq!(response["content"][0]["type"], "thinking");
+        assert_eq!(response["content"][1]["text"], "OK");
+
+        let next_request = json!({
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": response["content"].clone()},
+                {"role": "user", "content": "continue"}
+            ]
+        });
+        let translated =
+            translate_anthropic_request(&next_request, "gemini-3.6-flash", &signatures).unwrap();
+        assert_eq!(
+            translated["messages"][1]["extra_content"]["google"]["thought_signature"],
+            "text-signature"
         );
     }
 
@@ -7653,13 +9309,13 @@ mod tests {
             AnthropicStreamTranslator::new("reasoning-model".to_string(), signatures, 0);
 
         let opening = translator
-            .process_payload(r#"{"choices":[{"delta":{"content":"<thi"},"finish_reason":null}]}"#)
+            .process_payload(r#"{"choices":[{"delta":{"content":"<thou"},"finish_reason":null}]}"#)
             .unwrap();
         assert!(opening.is_empty());
 
         let thinking = translator
             .process_payload(
-                r#"{"choices":[{"delta":{"content":"nk>inspect files</thi"},"finish_reason":null}]}"#,
+                r#"{"choices":[{"delta":{"content":"ght>inspect files</thou"},"finish_reason":null}]}"#,
             )
             .unwrap();
         let thinking_debug = format!("{thinking:?}");
@@ -7668,11 +9324,13 @@ mod tests {
 
         let answer = translator
             .process_payload(
-                r#"{"choices":[{"delta":{"content":"nk>Done"},"finish_reason":"stop"}]}"#,
+                r#"{"choices":[{"delta":{"content":"ght>Done","extra_content":{"google":{"thought_signature":"stream-text-signature"}}},"finish_reason":"stop"}]}"#,
             )
             .unwrap();
         let answer_debug = format!("{answer:?}");
         assert!(answer_debug.contains("content_block_stop"));
+        assert!(answer_debug.contains("signature_delta"));
+        assert!(answer_debug.contains("stream-text-signature"));
         assert!(answer_debug.contains("text_delta"));
         assert!(answer_debug.contains("Done"));
     }
@@ -8733,5 +10391,192 @@ mod tests {
         );
         profile.identity_override = false;
         assert_eq!(upstream_identity_label(&profile, "gemini-3.6-flash"), None);
+    }
+
+    fn interactions_test_profile(file_name: &str) -> ProviderProfile {
+        let mut capabilities = OpenAiCapabilities::gemini_interactions();
+        capabilities.gemini_builtin_tools = vec![
+            "google_search".to_string(),
+            "url_context".to_string(),
+            "code_execution".to_string(),
+        ];
+        ProviderProfile {
+            file_name: file_name.to_string(),
+            display_name: "Gemini Interactions".to_string(),
+            source: ProviderProfileSource::Native,
+            model: "gemini-3.6-flash".to_string(),
+            upstream_identity: None,
+            identity_override: true,
+            base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
+            auth_token: None,
+            api_key: Some("test-key".to_string()),
+            proxy_url: None,
+            local_gemini: false,
+            transport: ProviderTransport::GeminiInteractions,
+            openai_capabilities: capabilities,
+            vision: VisionConfig::default(),
+            upstream_url: "https://generativelanguage.googleapis.com/v1beta/interactions"
+                .to_string(),
+            client: Client::builder().build().unwrap(),
+        }
+    }
+
+    #[test]
+    fn builds_stateful_interactions_delta_only_after_exact_transcript_match() {
+        let profile = interactions_test_profile("gemini-interactions.json");
+        let continuations = RwLock::new(InteractionContinuationCache::default());
+        let first = json!({
+            "system": "You are a coding assistant.",
+            "max_tokens": 4096,
+            "stream": true,
+            "messages": [{"role": "user", "content": "Remember alpha."}],
+            "tools": [{
+                "name": "read_file",
+                "description": "Read a file",
+                "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}
+            }]
+        });
+        let initial =
+            translate_gemini_interactions_request(&first, &profile, &continuations).unwrap();
+        assert_eq!(initial["store"], true);
+        assert!(initial.get("previous_interaction_id").is_none());
+        assert_eq!(initial["generation_config"]["thinking_level"], "high");
+        assert_eq!(initial["generation_config"]["thinking_summaries"], "auto");
+        assert_eq!(initial["tools"].as_array().unwrap().len(), 4);
+        assert_eq!(initial["input"][0]["type"], "user_input");
+
+        let assistant_content = vec![json!({"type": "text", "text": "Stored alpha."})];
+        remember_interaction_continuation(
+            &continuations,
+            &profile.file_name,
+            &first,
+            "interaction-1",
+            &assistant_content,
+            &[],
+        );
+        let second = json!({
+            "system": "You are a coding assistant.",
+            "max_tokens": 4096,
+            "stream": true,
+            "messages": [
+                {"role": "user", "content": "Remember alpha."},
+                {"role": "assistant", "content": assistant_content},
+                {"role": "user", "content": "What did I ask you to remember?"}
+            ]
+        });
+        let continued =
+            translate_gemini_interactions_request(&second, &profile, &continuations).unwrap();
+        assert_eq!(continued["previous_interaction_id"], "interaction-1");
+        assert_eq!(continued["input"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            continued["input"][0]["content"][0]["text"],
+            "What did I ask you to remember?"
+        );
+        assert!(continued.get("system_instruction").is_none());
+
+        let mut edited = second.clone();
+        edited["messages"][1]["content"][0]["text"] = json!("Edited history.");
+        let fallback =
+            translate_gemini_interactions_request(&edited, &profile, &continuations).unwrap();
+        assert!(fallback.get("previous_interaction_id").is_none());
+        assert_eq!(fallback["input"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn continues_interactions_tool_result_by_opaque_call_id() {
+        let profile = interactions_test_profile("gemini-interactions.json");
+        let continuations = RwLock::new(InteractionContinuationCache::default());
+        let first = json!({
+            "messages": [{"role": "user", "content": "Read Cargo.toml"}]
+        });
+        let assistant_content = vec![json!({
+            "type": "tool_use",
+            "id": "call-opaque-1",
+            "name": "read_file",
+            "input": {"path": "Cargo.toml"}
+        })];
+        remember_interaction_continuation(
+            &continuations,
+            &profile.file_name,
+            &first,
+            "interaction-tool-1",
+            &assistant_content,
+            &[("call-opaque-1".to_string(), "read_file".to_string())],
+        );
+        let result_request = json!({
+            "messages": [
+                {"role": "user", "content": "Read Cargo.toml"},
+                {"role": "assistant", "content": assistant_content},
+                {"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call-opaque-1",
+                    "content": "package data"
+                }]}
+            ]
+        });
+        let translated =
+            translate_gemini_interactions_request(&result_request, &profile, &continuations)
+                .unwrap();
+        assert_eq!(translated["previous_interaction_id"], "interaction-tool-1");
+        assert_eq!(translated["input"][0]["type"], "function_result");
+        assert_eq!(translated["input"][0]["call_id"], "call-opaque-1");
+        assert_eq!(translated["input"][0]["name"], "read_file");
+        assert_eq!(translated["input"][0]["result"], "package data");
+    }
+
+    #[test]
+    fn translates_interactions_stream_and_remembers_tool_continuation() {
+        let continuations = Arc::new(RwLock::new(InteractionContinuationCache::default()));
+        let request = json!({
+            "messages": [{"role": "user", "content": "Use lookup"}],
+            "stream": true
+        });
+        let mut translator = GeminiInteractionsStreamTranslator::new(
+            "gemini-3.6-flash".to_string(),
+            "gemini-interactions.json".to_string(),
+            request,
+            continuations.clone(),
+            10,
+        );
+        assert_eq!(translator.start_events().unwrap().len(), 1);
+        translator
+            .process_payload(r#"{"event_type":"interaction.created","interaction":{"id":"interaction-stream-1","status":"in_progress"}}"#)
+            .unwrap();
+        translator
+            .process_payload(r#"{"event_type":"step.start","index":0,"step":{"type":"thought"}}"#)
+            .unwrap();
+        translator
+            .process_payload(r#"{"event_type":"step.delta","index":0,"delta":{"type":"thought_summary","content":{"type":"text","text":"Checking."}}}"#)
+            .unwrap();
+        translator
+            .process_payload(r#"{"event_type":"step.delta","index":0,"delta":{"type":"thought_signature","signature":"sig-1"}}"#)
+            .unwrap();
+        translator
+            .process_payload(r#"{"event_type":"step.stop","index":0}"#)
+            .unwrap();
+        translator
+            .process_payload(r#"{"event_type":"step.start","index":1,"step":{"type":"function_call","id":"call-stream-1","name":"lookup","arguments":{}}}"#)
+            .unwrap();
+        translator
+            .process_payload(r#"{"event_type":"step.delta","index":1,"delta":{"type":"arguments_delta","arguments":"{\"key\":\"alpha\"}"}}"#)
+            .unwrap();
+        translator
+            .process_payload(r#"{"event_type":"step.stop","index":1}"#)
+            .unwrap();
+        translator
+            .process_payload(r#"{"event_type":"interaction.completed","interaction":{"id":"interaction-stream-1","status":"requires_action","usage":{"total_input_tokens":10,"total_output_tokens":5}}}"#)
+            .unwrap();
+        assert_eq!(translator.finish().unwrap().len(), 2);
+        assert_eq!(translator.assistant_content[0]["type"], "thinking");
+        assert_eq!(translator.assistant_content[0]["signature"], "sig-1");
+        assert_eq!(translator.assistant_content[1]["type"], "tool_use");
+        assert_eq!(translator.assistant_content[1]["input"]["key"], "alpha");
+        let cache = continuations.read().unwrap();
+        let call = cache
+            .calls
+            .get("gemini-interactions.json\0call-stream-1")
+            .unwrap();
+        assert_eq!(call.interaction_id, "interaction-stream-1");
+        assert_eq!(call.name, "lookup");
     }
 }

@@ -9,6 +9,17 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 
 ## [Unreleased]
 
+### Native Stateful Gemini Interactions
+- Added the independent `gemini-interactions` transport for Google's native `/v1beta/interactions` API, using `x-goog-api-key` authentication and `store: true`. The existing OpenAI Chat-compatible Gemini route remains available as a fallback.
+- Added bounded, branch-safe conversation continuation. Exact transcript matches reuse `previous_interaction_id`; Claude/MCP tool-result turns recover the interaction through the opaque tool call ID. Cache misses and service restarts safely fall back to sending the complete conversation.
+- Implemented the current step-based unary and streaming schemas, including thought summaries and signatures, model output, custom function calls/results, streamed function arguments, images and documents, and Anthropic Messages/SSE translation.
+- Added high-thinking defaults, deprecated-sampling suppression, and optional Google server-side tools through `gemini_builtin_tools`: `google_search`, `url_context`, and `code_execution`.
+- Updated the Gemini provider examples and documentation, including the privacy implication that Google stores request and response state when this transport is enabled.
+
+### Interactions Verification
+- 87 Rust tests passed, covering continuation isolation, tool-result linking, request conversion, response conversion, and streaming translation.
+- Live Windows-service verification confirmed transcript and tool-call continuations, a Claude Code custom-tool loop, all three Google server-side tools, service health, and deployed-binary integrity.
+
 ### Gemini Image Generation
 - Added a loopback Streamable HTTP MCP endpoint exposing `generate_image`, backed by the high-quality `gemini-3.1-flash-image` model with high thinking and 1K/2K/4K output options.
 - Generated images are returned as MCP image previews and saved under `Pictures\ClaudeCodeBridge` in the user's Windows known Pictures folder, including redirected/OneDrive locations. The service never accepts arbitrary output paths from the model.
@@ -176,6 +187,17 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 ## 中文
 
 ## [未发布]
+
+### Gemini 原生有状态 Interactions
+- 新增独立的 `gemini-interactions` transport，直接调用 Google 原生 `/v1beta/interactions` API，使用 `x-goog-api-key` 鉴权并固定启用 `store: true`；原有 OpenAI Chat 兼容路径继续作为回退方案保留。
+- 新增有界且分支安全的会话续接：对完全匹配的对话记录复用 `previous_interaction_id`；Claude/MCP 工具结果回合通过不透明的 tool call ID 找回对应 interaction。缓存未命中或服务重启后，会安全回退为发送完整对话。
+- 实现当前基于 step 的普通响应与流式协议，包括思考摘要与签名、模型输出、自定义函数调用/结果、流式函数参数、图片和文档，并完整转换为 Anthropic Messages/SSE。
+- 新增高思考默认值、废弃采样参数抑制，以及通过 `gemini_builtin_tools` 可选启用 Google 服务端 `google_search`、`url_context`、`code_execution` 工具。
+- 更新 Gemini Provider 示例和文档，并明确说明启用该 transport 后，Google 会保存请求与响应状态。
+
+### Interactions 验证
+- 87 项 Rust 测试全部通过，覆盖续接隔离、工具结果关联、请求转换、响应转换与流式转换。
+- Windows 服务实测确认普通对话与工具调用续接、Claude Code 自定义工具闭环、三种 Google 服务端工具、服务健康状态以及部署二进制一致性。
 
 ### Gemini 图片生成
 - 新增仅监听本机的 Streamable HTTP MCP 入口，向 Claude Code 提供 `generate_image` 工具；默认使用高质量 `gemini-3.1-flash-image`、高思考，并支持 1K/2K/4K 输出。

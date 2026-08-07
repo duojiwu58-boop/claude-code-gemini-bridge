@@ -1,6 +1,17 @@
 {
   "name": "Google Gemini",
-  "model": "gemini-2.5-pro",
-  "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
-  "api_key": "<GEMINI_API_KEY>"
+  "model": "gemini-3.6-flash",
+  "base_url": "https://generativelanguage.googleapis.com/v1beta",
+  "api_key": "<GEMINI_API_KEY>",
+  "protocol": "gemini-interactions",
+  "capabilities": {
+    "default_reasoning_effort": "high",
+    "include_thoughts": true,
+    "sampling_parameters": false,
+    "gemini_builtin_tools": [
+      "google_search",
+      "url_context",
+      "code_execution"
+    ]
+  }
 }

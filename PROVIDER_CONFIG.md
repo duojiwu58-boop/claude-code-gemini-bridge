@@ -47,6 +47,37 @@
 `/chat/completions`。如果供应商给出的不是 SDK 基地址，或网关路径比较特殊，
 请用 `endpoint` 填写完整的 Chat Completions 请求地址。
 
+## Gemini 原生 Interactions（推荐）
+
+Gemini 3.6 Flash 建议使用 Google 原生 Interactions API，而不是 OpenAI 兼容层：
+
+```json
+{
+  "name": "Google Gemini 3.6 Flash",
+  "model": "gemini-3.6-flash",
+  "base_url": "https://generativelanguage.googleapis.com/v1beta",
+  "api_key": "<GEMINI_API_KEY>",
+  "protocol": "gemini-interactions",
+  "proxy": "http://127.0.0.1:8080",
+  "capabilities": {
+    "default_reasoning_effort": "high",
+    "include_thoughts": true,
+    "sampling_parameters": false,
+    "gemini_builtin_tools": ["google_search", "url_context", "code_execution"]
+  }
+}
+```
+
+此 transport 固定发送 `store: true`。首轮成功后，普通多轮按完整消息前缀指纹、
+工具轮次按 Google 的 opaque `call_id` 查找并发送 `previous_interaction_id`；只有
+精确命中才发送本轮增量。历史被编辑、缓存淘汰或服务重启后，桥接器会自动回退为
+完整 `steps`，不会把会话接到错误分支。Google 会保存交互状态；请仅在接受对应的
+数据保留与隐私政策时使用此协议。
+
+`gemini_builtin_tools` 可选值为 `google_search`、`url_context` 和
+`code_execution`。这些工具由 Google 服务端执行；Claude Code/MCP 的本地工具仍
+作为自定义函数并存。若不希望服务端自行搜索或执行代码，将此数组设为空即可。
+
 ## 完整字段
 
 ```json
@@ -68,11 +99,15 @@
     "stream_options": true,
     "parallel_tool_calls": true,
     "reasoning_effort": true,
+    "default_reasoning_effort": "high",
     "reasoning_fields": ["reasoning_content", "thinking"],
     "thinking_tags": true,
+    "include_thoughts": false,
+    "sampling_parameters": true,
     "tool_result_media": "separate_user",
     "tool_schema": "sanitize",
-    "max_tokens_field": "max_tokens"
+    "max_tokens_field": "max_tokens",
+    "gemini_builtin_tools": []
   }
 }
 ```
@@ -85,7 +120,8 @@
 - `api_key_env`：从服务进程环境变量读取密钥，例如 `DEEPSEEK_API_KEY`。
 - `name`：可选，默认使用 `model`。
 - `protocol`：可选，默认 `openai`；原生 Anthropic Messages 服务可填
-  `anthropic`。安装器生成的本地 Gemini 深度转换路由使用保留值 `gemini`。
+  `anthropic`；Google 原生有状态接口使用 `gemini-interactions`。安装器生成的
+  本地 Gemini 深度转换路由使用保留值 `gemini`。
 - `endpoint`：可选，完整请求地址；设置后不会根据 `base_url`推导。
 - `identity`：可选，告诉下游模型它在此路由中的真实身份；默认使用模型 ID。
 - `identity_override`：可选，默认 `true`。设为 `false` 可关闭身份提示适配。
@@ -161,11 +197,15 @@ profile 时检查引用是否存在。
 | `stream_options` | `true` | 流式请求发送 `stream_options.include_usage`；不支持该参数的端点设为 `false` |
 | `parallel_tool_calls` | `true` | 允许发送 `parallel_tool_calls` 控制；端点不认识该字段时设为 `false` |
 | `reasoning_effort` | `true` | 将 Claude Thinking 预算映射为 `reasoning_effort`；端点拒绝该参数时设为 `false` |
+| `default_reasoning_effort` | 未设置 | Claude 请求没有 Thinking 配置时使用的默认推理等级；可选 `minimal`、`low`、`medium` 或 `high` |
 | `reasoning_fields` | `["reasoning_content", "thinking"]` | 响应中按顺序识别的推理文本字段；可以填写一个字符串或字符串数组，空数组表示不提取推理文本 |
 | `thinking_tags` | `true` | 将正文开头的 `<think>...</think>` 提取为 Thinking 块，并支持标签跨流式 Chunk；若模型需要原样输出该标签则设为 `false` |
+| `include_thoughts` | `false` | 为 Google OpenAI 兼容端点请求思考摘要；启用时桥接器会把推理等级写入同一个 `thinking_config`，避免与 `reasoning_effort` 同时发送导致 HTTP 400 |
+| `sampling_parameters` | `true` | 转发 Claude 的 `temperature` 和 `top_p`；Gemini 3.6 Flash 已废弃这些参数，应设为 `false` |
 | `tool_result_media` | `separate_user` | 保持 `role: tool` 的 `content` 为字符串，并将图片/PDF 移至后一条 `user` 消息；仅对明确支持工具消息内联媒体的端点使用 `inline` |
 | `tool_schema` | `sanitize` | `sanitize` 清理常见不兼容元数据；确认端点支持完整 JSON Schema 时使用 `preserve` |
 | `max_tokens_field` | `max_tokens` | 可选值为 `max_tokens`、`max_completion_tokens` 或 `omit` |
+| `gemini_builtin_tools` | `[]` | 仅 `gemini-interactions` 使用；可启用 `google_search`、`url_context`、`code_execution` 服务端工具 |
 
 例如，一个拒绝 `stream_options` 和 `reasoning_effort`、要求
 `max_completion_tokens`，但支持完整 JSON Schema 的端点可以这样配置：
@@ -210,7 +250,7 @@ profile 时检查引用是否存在。
 - `qwen.example.json`：阿里云百炼 / DashScope
 - `deepseek.example.json`：DeepSeek
 - `kimi.example.json`：Kimi / Moonshot
-- `gemini.example.json`：Google Gemini 的 OpenAI 兼容接口
+- `gemini.example.json`：Google Gemini 的原生有状态 Interactions 接口
 - `custom-openai.example.json`：其他 OpenAI 兼容网关
 - `capability-overrides.example.json`：仅供需要覆盖可选参数或字段的兼容端点使用
 
@@ -223,7 +263,8 @@ profile 时检查引用是否存在。
 - [阿里云百炼 OpenAI 兼容说明](https://help.aliyun.com/en/model-studio/more-tools)
 - [DeepSeek Chat Completions](https://api-docs.deepseek.com/api/create-chat-completion)
 - [Kimi API 文档](https://platform.kimi.com/docs/api/overview)
-- [Gemini OpenAI compatibility](https://ai.google.dev/gemini-api/docs/openai)
+- [Gemini Interactions API](https://ai.google.dev/api/interactions-api-v1)
+- [Gemini streaming interactions](https://ai.google.dev/gemini-api/docs/streaming)
 
 ## 密钥安全
 
