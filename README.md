@@ -41,6 +41,43 @@ The enhancement layer is **field-driven, not model-name-driven**. For example, `
 
 > **一句话理解：OpenAI 兼容决定“能不能接入”，能力感知适配决定“接入后能发挥到什么程度”。**
 
+## Not a proxy: a semantic compatibility runtime / 不只是代理，而是语义兼容运行时
+
+Most API bridges are symmetrical field converters: rename a request, forward it, then rename the response. That can make a chat demo work, but Claude Code is not merely a chat client. Its agent loop depends on ordered content blocks, streamed state transitions, tool-call lifecycles, multimodal results, stop reasons, usage accounting, retry classes, context-limit signals, and sometimes provider-specific state that must survive into the next turn.
+
+多数 API 桥接器采用对称的字段替换：请求改几个键名，转发出去，响应再改回来。这足以跑通聊天，却不足以承载 Claude Code。Claude Code 的 Agent 循环依赖有序内容块、流式状态转换、工具调用生命周期、多模态结果、停止原因、Usage、错误重试类别、上下文超限信号，以及必须带到下一轮的供应商专有状态。
+
+> **这套实现最特别的地方：先把 Claude Code 请求解码成“模型真正需要完成的语义”，再编码成通用 OpenAI 请求；下游模型真实回答后，桥接器根据实际响应字段，把结果重新组装成 Claude Code 能继续运行的 Anthropic 生命周期。**
+
+```text
+Claude Code request
+  → decode Anthropic intent (messages / tools / thinking / media)
+  → encode provider-neutral OpenAI Chat Completions request
+  → selected downstream model generates the real answer
+  → observe fields and declared capabilities, never guess by model name
+  → rehydrate Anthropic blocks / SSE events / tool state / error contracts
+  → Claude Code UI and agent loop continue normally
+
+Side state: Gemini thought signatures survive the tool round trip
+```
+
+这是一种**非对称翻译**：请求侧寻找不同协议的公共语义，响应侧则尽可能恢复 Claude Code 需要的丰富行为。供应商扩展不是硬编码成某个模型名称分支，而是由 `reasoning_content`、`extra_content.google.thought_signature`、`promptFeedback.blockReason` 等真实字段，以及 Provider 的 `capabilities` 配置触发。
+
+It is an **asymmetric translation**: the request side targets the common semantic surface, while the response side reconstructs the richer behavior Claude Code expects. Provider extensions are activated by observed fields and explicit capabilities—not by pretending every model is Claude, Gemini, or any other named model.
+
+| Design question / 设计问题 | Ordinary field bridge / 普通字段桥 | This project / 本项目 |
+| --- | --- | --- |
+| What is translated? / 转换什么 | JSON keys and text / JSON 键名与文本 | Intent, events, state, and client behavior / 意图、事件、状态与客户端行为 |
+| Who answers? / 谁来回答 | The proxy may inject or rewrite an answer / 代理可能注入或改写答案 | The selected downstream model; the bridge never keyword-answers for it / 真实下游模型；桥接器不按关键词代答 |
+| How are extensions selected? / 如何启用增强 | Model-name branches / 模型名称分支 | Response fields + Provider capabilities / 响应字段 + Provider 能力配置 |
+| What happens to tools? / 工具如何处理 | Rename `tool_calls` and hope / 改名后直接透传 | Accumulate streams, validate/repair JSON, preserve ordering and round-trip state / 聚合流、校验修复 JSON、保持顺序与跨轮状态 |
+| What happens on errors? / 错误如何处理 | Collapse everything into a generic failure / 全部变成通用错误 | Restore retry, overload, context-limit, refusal, and abnormal-EOF semantics / 恢复重试、过载、上下文超限、拒绝与异常断流语义 |
+| How is provider depth preserved? / 如何保留供应商深度 | Reduce every provider to the lowest common denominator / 全部降到最小公分母 | Keep the common OpenAI core, then progressively restore supported extensions / 先走通用核心，再渐进恢复已支持扩展 |
+
+Here, **near-lossless does not mean byte-for-byte passthrough**. It means preserving every representable intent and behavior across two different protocols, refusing to invent unsafe semantics, and making any unavoidable downgrade explicit. If an upstream model lacks tools, vision, reasoning fields, or enough context, the bridge cannot manufacture those capabilities—but it should not silently discard capabilities the provider actually has.
+
+这里的**“近乎无损”不是字节原样转发**，而是跨越两套不同协议时，尽量保存所有能够表达的意图与行为；不凭空猜测危险语义，也不把不可避免的降级藏起来。如果上游模型本身没有工具、视觉、推理字段或足够上下文，桥接器无法创造这些能力；但只要供应商真实提供了某项能力，桥接器就不应静默丢弃。
+
 ---
 
 ## Claude Code × 原生 OpenAI 接口：这次升级为什么重要
