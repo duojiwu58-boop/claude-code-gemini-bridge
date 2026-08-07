@@ -7,8 +7,6 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 
 ## English
 
-## [Unreleased]
-
 ## [v0.5.0] - 2026-08-08
 
 ### Native Stateful Gemini Interactions
@@ -193,8 +191,6 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 ---
 
 ## 中文
-
-## [未发布]
 
 ## [v0.5.0] - 2026-08-08
 
