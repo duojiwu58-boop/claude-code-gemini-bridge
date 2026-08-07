@@ -3481,7 +3481,11 @@ fn interaction_tool_result_value(content: &Value) -> Value {
     }
 }
 
-fn interaction_user_steps(content: &Value, tool_names: &HashMap<String, String>) -> Vec<Value> {
+fn interaction_user_steps(
+    content: &Value,
+    tool_names: &HashMap<String, String>,
+    text_tool_history: bool,
+) -> Vec<Value> {
     if let Some(text) = content.as_str() {
         return if text.is_empty() {
             Vec::new()
@@ -3496,12 +3500,6 @@ fn interaction_user_steps(content: &Value, tool_names: &HashMap<String, String>)
     let mut user_content = Vec::new();
     for part in parts {
         if part.get("type").and_then(Value::as_str) == Some("tool_result") {
-            if !user_content.is_empty() {
-                steps.push(json!({
-                    "type": "user_input",
-                    "content": std::mem::take(&mut user_content)
-                }));
-            }
             let call_id = part
                 .get("tool_use_id")
                 .and_then(Value::as_str)
@@ -3510,6 +3508,31 @@ fn interaction_user_steps(content: &Value, tool_names: &HashMap<String, String>)
                 .get(call_id)
                 .cloned()
                 .unwrap_or_else(|| "unknown_function".to_string());
+            if text_tool_history {
+                let status = if part.get("is_error").and_then(Value::as_bool) == Some(true) {
+                    "error"
+                } else {
+                    "result"
+                };
+                user_content.push(json!({
+                    "type": "text",
+                    "text": format!("[Tool {status}: {name} (call ID: {call_id})]")
+                }));
+                match interaction_tool_result_value(part.get("content").unwrap_or(&Value::Null)) {
+                    Value::Array(result_content) => user_content.extend(result_content),
+                    Value::String(text) if !text.is_empty() => {
+                        user_content.push(json!({"type": "text", "text": text}));
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            if !user_content.is_empty() {
+                steps.push(json!({
+                    "type": "user_input",
+                    "content": std::mem::take(&mut user_content)
+                }));
+            }
             steps.push(json!({
                 "type": "function_result",
                 "call_id": call_id,
@@ -3530,6 +3553,7 @@ fn interaction_user_steps(content: &Value, tool_names: &HashMap<String, String>)
 fn interaction_assistant_steps(
     content: &Value,
     tool_names: &mut HashMap<String, String>,
+    text_tool_history: bool,
 ) -> Vec<Value> {
     if let Some(text) = content.as_str() {
         return if text.is_empty() {
@@ -3561,6 +3585,9 @@ fn interaction_assistant_steps(
                 }
             }
             Some("thinking") => {
+                if text_tool_history {
+                    continue;
+                }
                 flush_text(&mut steps, &mut text_content);
                 let thinking = part
                     .get("thinking")
@@ -3580,6 +3607,9 @@ fn interaction_assistant_steps(
                 steps.push(thought);
             }
             Some("redacted_thinking") => {
+                if text_tool_history {
+                    continue;
+                }
                 flush_text(&mut steps, &mut text_content);
                 steps.push(json!({
                     "type": "thought",
@@ -3588,7 +3618,6 @@ fn interaction_assistant_steps(
                 }));
             }
             Some("tool_use") => {
-                flush_text(&mut steps, &mut text_content);
                 let call_id = part
                     .get("id")
                     .and_then(Value::as_str)
@@ -3598,6 +3627,17 @@ fn interaction_assistant_steps(
                     .and_then(Value::as_str)
                     .unwrap_or("unknown_function");
                 tool_names.insert(call_id.to_string(), name.to_string());
+                if text_tool_history {
+                    let arguments = part.get("input").cloned().unwrap_or_else(|| json!({}));
+                    text_content.push(json!({
+                        "type": "text",
+                        "text": format!(
+                            "[Tool call: {name} (call ID: {call_id})]\nArguments: {arguments}"
+                        )
+                    }));
+                    continue;
+                }
+                flush_text(&mut steps, &mut text_content);
                 steps.push(json!({
                     "type": "function_call",
                     "id": call_id,
@@ -3612,16 +3652,62 @@ fn interaction_assistant_steps(
     steps
 }
 
-fn interaction_steps_from_messages(messages: &[Value]) -> Vec<Value> {
+fn interaction_messages_have_tool_history(messages: &[Value]) -> bool {
+    messages.iter().any(|message| {
+        message
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|parts| {
+                parts.iter().any(|part| {
+                    matches!(
+                        part.get("type").and_then(Value::as_str),
+                        Some("tool_use" | "tool_result")
+                    )
+                })
+            })
+    })
+}
+
+fn interaction_tool_names_from_messages(messages: &[Value]) -> HashMap<String, String> {
+    let mut names = HashMap::new();
+    for message in messages {
+        let Some(parts) = message.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for part in parts {
+            if part.get("type").and_then(Value::as_str) != Some("tool_use") {
+                continue;
+            }
+            let Some(call_id) = part.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(name) = part.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            names.insert(call_id.to_string(), name.to_string());
+        }
+    }
+    names
+}
+
+fn interaction_steps_from_messages(messages: &[Value], text_tool_history: bool) -> Vec<Value> {
     let mut steps = Vec::new();
     let mut tool_names = HashMap::new();
     for message in messages {
         let content = message.get("content").unwrap_or(&Value::Null);
         match message.get("role").and_then(Value::as_str) {
             Some("assistant") => {
-                steps.extend(interaction_assistant_steps(content, &mut tool_names));
+                steps.extend(interaction_assistant_steps(
+                    content,
+                    &mut tool_names,
+                    text_tool_history,
+                ));
             }
-            Some("user") => steps.extend(interaction_user_steps(content, &tool_names)),
+            Some("user") => steps.extend(interaction_user_steps(
+                content,
+                &tool_names,
+                text_tool_history,
+            )),
             _ => {}
         }
     }
@@ -3727,34 +3813,43 @@ fn interaction_continuation_for_request(
     if !result_ids.is_empty() {
         let mut interaction_id = None;
         let mut names = HashMap::new();
-        for call_id in result_ids {
-            let continuation = cache
+        let mut complete = true;
+        for call_id in &result_ids {
+            let Some(continuation) = cache
                 .calls
-                .get(&interaction_call_cache_key(profile_file, &call_id))?;
+                .get(&interaction_call_cache_key(profile_file, call_id))
+            else {
+                complete = false;
+                break;
+            };
             if interaction_id
                 .as_ref()
                 .is_some_and(|existing| existing != &continuation.interaction_id)
             {
-                return None;
+                complete = false;
+                break;
             }
             interaction_id = Some(continuation.interaction_id.clone());
-            names.insert(call_id, continuation.name.clone());
+            names.insert(call_id.clone(), continuation.name.clone());
         }
-        return interaction_id.map(|id| (id, names, "tool_call_id"));
+        if complete {
+            if let Some(id) = interaction_id {
+                return Some((id, names, "tool_call_id"));
+            }
+        }
     }
     if messages.len() <= 1 {
         return None;
     }
-    let key = interaction_transcript_cache_key(
-        profile_file,
-        request.get("system"),
-        &messages[..messages.len() - 1],
-    );
+    let previous_messages = &messages[..messages.len() - 1];
+    let key =
+        interaction_transcript_cache_key(profile_file, request.get("system"), previous_messages);
+    let names = interaction_tool_names_from_messages(previous_messages);
     cache
         .transcripts
         .get(&key)
         .cloned()
-        .map(|id| (id, HashMap::new(), "transcript"))
+        .map(|id| (id, names, "transcript"))
 }
 
 fn translate_gemini_interactions_request(
@@ -3778,9 +3873,10 @@ fn translate_gemini_interactions_request(
                 .and_then(|message| message.get("content"))
                 .unwrap_or(&Value::Null),
             tool_names,
+            false,
         )
     } else {
-        interaction_steps_from_messages(messages)
+        interaction_steps_from_messages(messages, interaction_messages_have_tool_history(messages))
     };
     if input.is_empty() {
         return Err("Gemini Interactions request produced no supported input steps".to_string());
@@ -10522,6 +10618,89 @@ mod tests {
         assert_eq!(translated["input"][0]["call_id"], "call-opaque-1");
         assert_eq!(translated["input"][0]["name"], "read_file");
         assert_eq!(translated["input"][0]["result"], "package data");
+    }
+
+    #[test]
+    fn continues_interactions_tool_result_from_matching_transcript() {
+        let profile = interactions_test_profile("gemini-interactions.json");
+        let continuations = RwLock::new(InteractionContinuationCache::default());
+        let first = json!({
+            "messages": [{"role": "user", "content": "Read Cargo.toml"}]
+        });
+        let assistant_content = vec![json!({
+            "type": "tool_use",
+            "id": "call-transcript-1",
+            "name": "read_file",
+            "input": {"path": "Cargo.toml"}
+        })];
+        remember_interaction_continuation(
+            &continuations,
+            &profile.file_name,
+            &first,
+            "interaction-transcript-1",
+            &assistant_content,
+            &[],
+        );
+        let result_request = json!({
+            "messages": [
+                {"role": "user", "content": "Read Cargo.toml"},
+                {"role": "assistant", "content": assistant_content},
+                {"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call-transcript-1",
+                    "content": "package data"
+                }]}
+            ]
+        });
+        let translated =
+            translate_gemini_interactions_request(&result_request, &profile, &continuations)
+                .unwrap();
+        assert_eq!(
+            translated["previous_interaction_id"],
+            "interaction-transcript-1"
+        );
+        assert_eq!(translated["input"][0]["type"], "function_result");
+        assert_eq!(translated["input"][0]["name"], "read_file");
+    }
+
+    #[test]
+    fn textifies_interactions_tool_history_when_continuation_is_unavailable() {
+        let profile = interactions_test_profile("gemini-interactions.json");
+        let continuations = RwLock::new(InteractionContinuationCache::default());
+        let request = json!({
+            "messages": [
+                {"role": "user", "content": "Read Cargo.toml"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "private summary", "signature": "sig"},
+                    {
+                        "type": "tool_use",
+                        "id": "call-missing-1",
+                        "name": "read_file",
+                        "input": {"path": "Cargo.toml"}
+                    }
+                ]},
+                {"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call-missing-1",
+                    "content": "package data"
+                }]}
+            ]
+        });
+        let translated =
+            translate_gemini_interactions_request(&request, &profile, &continuations).unwrap();
+        assert!(translated.get("previous_interaction_id").is_none());
+        let input = translated["input"].as_array().unwrap();
+        assert!(input.iter().all(|step| {
+            !matches!(
+                step.get("type").and_then(Value::as_str),
+                Some("function_call" | "function_result" | "thought")
+            )
+        }));
+        let replay = serde_json::to_string(input).unwrap();
+        assert!(replay.contains("[Tool call: read_file (call ID: call-missing-1)]"));
+        assert!(replay.contains("[Tool result: read_file (call ID: call-missing-1)]"));
+        assert!(replay.contains("package data"));
+        assert!(!replay.contains("private summary"));
     }
 
     #[test]
