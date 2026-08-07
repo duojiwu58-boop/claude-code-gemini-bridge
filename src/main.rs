@@ -76,6 +76,94 @@ impl ProviderTransport {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolSchemaMode {
+    Sanitize,
+    Preserve,
+}
+
+impl ToolSchemaMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Sanitize => "sanitize",
+            Self::Preserve => "preserve",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolResultMediaMode {
+    SeparateUser,
+    Inline,
+}
+
+impl ToolResultMediaMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SeparateUser => "separate_user",
+            Self::Inline => "inline",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MaxTokensField {
+    MaxTokens,
+    MaxCompletionTokens,
+    Omit,
+}
+
+impl MaxTokensField {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MaxTokens => "max_tokens",
+            Self::MaxCompletionTokens => "max_completion_tokens",
+            Self::Omit => "omit",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OpenAiCapabilities {
+    stream_options: bool,
+    parallel_tool_calls: bool,
+    reasoning_effort: bool,
+    reasoning_fields: Vec<String>,
+    thinking_tags: bool,
+    tool_result_media: ToolResultMediaMode,
+    tool_schema: ToolSchemaMode,
+    max_tokens_field: MaxTokensField,
+}
+
+impl Default for OpenAiCapabilities {
+    fn default() -> Self {
+        Self {
+            stream_options: true,
+            parallel_tool_calls: true,
+            reasoning_effort: true,
+            reasoning_fields: vec!["reasoning_content".to_string(), "thinking".to_string()],
+            thinking_tags: true,
+            // OpenAI-compatible tool messages are most portable when their
+            // content remains a string. Media is moved to a following user
+            // message unless a provider explicitly accepts inline media.
+            tool_result_media: ToolResultMediaMode::SeparateUser,
+            // Retain the existing broadly compatible behavior. Providers that
+            // accept the complete Anthropic schema can opt into preservation.
+            tool_schema: ToolSchemaMode::Sanitize,
+            max_tokens_field: MaxTokensField::MaxTokens,
+        }
+    }
+}
+
+impl OpenAiCapabilities {
+    fn local_gemini() -> Self {
+        Self {
+            tool_result_media: ToolResultMediaMode::Inline,
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ProviderProfile {
     file_name: String,
@@ -90,6 +178,7 @@ struct ProviderProfile {
     proxy_url: Option<String>,
     local_gemini: bool,
     transport: ProviderTransport,
+    openai_capabilities: OpenAiCapabilities,
     upstream_url: String,
     client: Client,
 }
@@ -469,6 +558,190 @@ fn profile_string(object: &Map<String, Value>, names: &[&str]) -> Option<String>
     })
 }
 
+fn capability_bool(
+    object: &Map<String, Value>,
+    names: &[&str],
+    default: bool,
+    file_name: &str,
+) -> Result<bool, String> {
+    for name in names {
+        if let Some(value) = object.get(*name) {
+            return value.as_bool().ok_or_else(|| {
+                format!("Provider profile '{file_name}' capability '{name}' must be a boolean")
+            });
+        }
+    }
+    Ok(default)
+}
+
+fn capability_string(
+    object: &Map<String, Value>,
+    names: &[&str],
+    file_name: &str,
+) -> Result<Option<String>, String> {
+    for name in names {
+        if let Some(value) = object.get(*name) {
+            return value
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .map(Some)
+                .ok_or_else(|| {
+                    format!(
+                        "Provider profile '{file_name}' capability '{name}' must be a non-empty string"
+                    )
+                });
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+fn parse_openai_capabilities(
+    profile: &Map<String, Value>,
+    file_name: &str,
+) -> Result<OpenAiCapabilities, String> {
+    parse_openai_capabilities_with_defaults(profile, file_name, OpenAiCapabilities::default())
+}
+
+fn parse_openai_capabilities_with_defaults(
+    profile: &Map<String, Value>,
+    file_name: &str,
+    defaults: OpenAiCapabilities,
+) -> Result<OpenAiCapabilities, String> {
+    let Some(value) = profile.get("capabilities") else {
+        return Ok(defaults);
+    };
+    let object = value.as_object().ok_or_else(|| {
+        format!("Provider profile '{file_name}' field 'capabilities' must be a JSON object")
+    })?;
+
+    let reasoning_fields = match object
+        .get("reasoning_fields")
+        .or_else(|| object.get("reasoningFields"))
+    {
+        None => defaults.reasoning_fields,
+        Some(Value::String(field)) if !field.trim().is_empty() => {
+            vec![field.trim().to_string()]
+        }
+        Some(Value::Array(fields)) => fields
+            .iter()
+            .map(|field| {
+                field
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|field| !field.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        format!(
+                            "Provider profile '{file_name}' capability 'reasoning_fields' must contain only non-empty strings"
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => {
+            return Err(format!(
+                "Provider profile '{file_name}' capability 'reasoning_fields' must be a string or an array of strings"
+            ))
+        }
+    };
+
+    let tool_schema = match capability_string(
+        object,
+        &["tool_schema", "toolSchema"],
+        file_name,
+    )?
+        .as_deref()
+        .unwrap_or(defaults.tool_schema.as_str())
+    {
+        "sanitize" => ToolSchemaMode::Sanitize,
+        "preserve" => ToolSchemaMode::Preserve,
+        other => {
+            return Err(format!(
+                "Provider profile '{file_name}' capability 'tool_schema' has unsupported value '{other}' (expected sanitize or preserve)"
+            ))
+        }
+    };
+    let max_tokens_field = match capability_string(
+        object,
+        &["max_tokens_field", "maxTokensField"],
+        file_name,
+    )?
+    .as_deref()
+    .unwrap_or(defaults.max_tokens_field.as_str())
+    {
+        "max_tokens" => MaxTokensField::MaxTokens,
+        "max_completion_tokens" => MaxTokensField::MaxCompletionTokens,
+        "omit" => MaxTokensField::Omit,
+        other => {
+            return Err(format!(
+                "Provider profile '{file_name}' capability 'max_tokens_field' has unsupported value '{other}' (expected max_tokens, max_completion_tokens, or omit)"
+            ))
+        }
+    };
+    let tool_result_media = match capability_string(
+        object,
+        &["tool_result_media", "toolResultMedia"],
+        file_name,
+    )?
+    .as_deref()
+    .unwrap_or(defaults.tool_result_media.as_str())
+    {
+        "separate_user" => ToolResultMediaMode::SeparateUser,
+        "inline" => ToolResultMediaMode::Inline,
+        other => {
+            return Err(format!(
+                "Provider profile '{file_name}' capability 'tool_result_media' has unsupported value '{other}' (expected separate_user or inline)"
+            ))
+        }
+    };
+
+    Ok(OpenAiCapabilities {
+        stream_options: capability_bool(
+            object,
+            &["stream_options", "streamOptions"],
+            defaults.stream_options,
+            file_name,
+        )?,
+        parallel_tool_calls: capability_bool(
+            object,
+            &["parallel_tool_calls", "parallelToolCalls"],
+            defaults.parallel_tool_calls,
+            file_name,
+        )?,
+        reasoning_effort: capability_bool(
+            object,
+            &["reasoning_effort", "reasoningEffort"],
+            defaults.reasoning_effort,
+            file_name,
+        )?,
+        reasoning_fields,
+        thinking_tags: capability_bool(
+            object,
+            &["thinking_tags", "thinkingTags"],
+            defaults.thinking_tags,
+            file_name,
+        )?,
+        tool_result_media,
+        tool_schema,
+        max_tokens_field,
+    })
+}
+
+fn openai_capabilities_json(capabilities: &OpenAiCapabilities) -> Value {
+    json!({
+        "stream_options": capabilities.stream_options,
+        "parallel_tool_calls": capabilities.parallel_tool_calls,
+        "reasoning_effort": capabilities.reasoning_effort,
+        "reasoning_fields": capabilities.reasoning_fields,
+        "thinking_tags": capabilities.thinking_tags,
+        "tool_result_media": capabilities.tool_result_media.as_str(),
+        "tool_schema": capabilities.tool_schema.as_str(),
+        "max_tokens_field": capabilities.max_tokens_field.as_str()
+    })
+}
+
 fn build_provider_client(file_name: &str, proxy_url: Option<&str>) -> Result<Client, String> {
     let mut client_builder = Client::builder();
     if let Some(proxy_url) = proxy_url {
@@ -525,6 +798,13 @@ fn load_native_provider_profiles(
                 ))
             }
         };
+        let capability_defaults = if transport == ProviderTransport::LocalGemini {
+            OpenAiCapabilities::local_gemini()
+        } else {
+            OpenAiCapabilities::default()
+        };
+        let openai_capabilities =
+            parse_openai_capabilities_with_defaults(object, &file_name, capability_defaults)?;
         if transport == ProviderTransport::LocalGemini
             && normalize_base_url(&base_url) != normalize_base_url(local_bridge_base_url)
         {
@@ -584,6 +864,7 @@ fn load_native_provider_profiles(
             proxy_url,
             local_gemini: transport == ProviderTransport::LocalGemini,
             transport,
+            openai_capabilities,
             upstream_url,
             client,
         });
@@ -658,6 +939,11 @@ fn load_legacy_provider_profiles(
             proxy_url,
             local_gemini,
             transport,
+            openai_capabilities: if local_gemini {
+                OpenAiCapabilities::local_gemini()
+            } else {
+                OpenAiCapabilities::default()
+            },
             upstream_url,
             client,
         });
@@ -952,6 +1238,7 @@ fn provider_profile_json(profile: &ProviderProfile, active_file: &str) -> Value 
         "proxy": profile.proxy_url,
         "local_gemini": profile.local_gemini,
         "transport": profile.transport.as_str(),
+        "capabilities": openai_capabilities_json(&profile.openai_capabilities),
         "upstream_url": profile.upstream_url,
         "active": profile.file_name == active_file
     })
@@ -1475,6 +1762,7 @@ async fn anthropic_messages(
             return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message);
         }
     }
+    let local_capabilities = active_profile.openai_capabilities.clone();
     match active_profile.transport {
         ProviderTransport::Anthropic => {
             return forward_anthropic_profile(active_profile, &headers, request).await;
@@ -1490,13 +1778,17 @@ async fn anthropic_messages(
         ProviderTransport::LocalGemini => {}
     }
 
-    let chat_request =
-        match translate_anthropic_request(&request, &state.model, &state.thought_signatures) {
-            Ok(value) => value,
-            Err(message) => {
-                return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message);
-            }
-        };
+    let chat_request = match translate_anthropic_request_with_capabilities(
+        &request,
+        &state.model,
+        &state.thought_signatures,
+        &local_capabilities,
+    ) {
+        Ok(value) => value,
+        Err(message) => {
+            return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message);
+        }
+    };
     let transport = match current_gemini_transport(&state) {
         Ok(transport) => transport,
         Err(message) => {
@@ -1553,6 +1845,7 @@ async fn anthropic_messages(
             state.model.clone(),
             state.thought_signatures.clone(),
             estimated_input_tokens,
+            OpenAiCapabilities::default(),
         );
     }
 
@@ -1641,13 +1934,17 @@ async fn forward_openai_profile(
     thought_signatures: Arc<ThoughtSignatureCache>,
 ) -> Response {
     let upstream_model = display_model_name(&profile.model);
-    let chat_request =
-        match translate_anthropic_request(&request, &upstream_model, &thought_signatures) {
-            Ok(value) => value,
-            Err(message) => {
-                return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message);
-            }
-        };
+    let chat_request = match translate_anthropic_request_with_capabilities(
+        &request,
+        &upstream_model,
+        &thought_signatures,
+        &profile.openai_capabilities,
+    ) {
+        Ok(value) => value,
+        Err(message) => {
+            return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message);
+        }
+    };
     let stream_requested = request
         .get("stream")
         .and_then(Value::as_bool)
@@ -1694,11 +1991,10 @@ async fn forward_openai_profile(
             "Provider '{}' returned HTTP {status}: {message}",
             profile.file_name
         );
-        return anthropic_error(
-            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-            "api_error",
-            &message,
-        );
+        let response_status =
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let (response_status, error_type) = openai_error_contract(response_status, &message);
+        return anthropic_error(response_status, error_type, &message);
     }
 
     if stream_requested {
@@ -1707,6 +2003,7 @@ async fn forward_openai_profile(
             upstream_model,
             thought_signatures,
             estimated_input_tokens,
+            profile.openai_capabilities,
         );
     }
 
@@ -1724,17 +2021,21 @@ async fn forward_openai_profile(
             );
         }
     };
-    let message =
-        match translate_anthropic_response(&upstream_body, &upstream_model, &thought_signatures) {
-            Ok(value) => value,
-            Err(message) => {
-                error!(
-                    "Cannot translate provider '{}' response: {message}",
-                    profile.file_name
-                );
-                return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", &message);
-            }
-        };
+    let message = match translate_anthropic_response_with_capabilities(
+        &upstream_body,
+        &upstream_model,
+        &thought_signatures,
+        &profile.openai_capabilities,
+    ) {
+        Ok(value) => value,
+        Err(message) => {
+            error!(
+                "Cannot translate provider '{}' response: {message}",
+                profile.file_name
+            );
+            return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", &message);
+        }
+    };
     Json(message).into_response()
 }
 
@@ -1851,53 +2152,226 @@ fn anthropic_stop_reason(finish_reason: Option<&str>, has_tool_calls: bool) -> &
     }
 }
 
+fn stream_eof_is_complete(saw_done: bool, finish_reason: Option<&str>) -> bool {
+    saw_done || finish_reason.is_some()
+}
+
 fn parse_tool_arguments(arguments: &str) -> Result<Value, String> {
+    parse_tool_arguments_with_json(arguments).map(|(input, _)| input)
+}
+
+fn parse_tool_arguments_with_json(arguments: &str) -> Result<(Value, String), String> {
     let arguments = if arguments.is_empty() {
         "{}"
     } else {
         arguments
     };
-    let input: Value = serde_json::from_str(arguments)
-        .map_err(|err| format!("Upstream returned invalid tool arguments JSON: {err}"))?;
+    let (input, normalized): (Value, String) = match serde_json::from_str(arguments) {
+        Ok(input) => (input, arguments.to_string()),
+        Err(original_error) => {
+            let repaired = repair_tool_arguments_json(arguments).ok_or_else(|| {
+                format!("Upstream returned invalid tool arguments JSON: {original_error}")
+            })?;
+            let input: Value = serde_json::from_str(&repaired).map_err(|_| {
+                format!("Upstream returned invalid tool arguments JSON: {original_error}")
+            })?;
+            let normalized = input.to_string();
+            (input, normalized)
+        }
+    };
     if !input.is_object() {
         return Err("Upstream tool arguments must be a JSON object".to_string());
     }
-    Ok(input)
+    Ok((input, normalized))
+}
+
+fn repair_tool_arguments_json(arguments: &str) -> Option<String> {
+    let mut repaired = String::with_capacity(arguments.len() + 8);
+    let mut expected_closers = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for character in arguments.chars() {
+        if in_string {
+            if escaped {
+                repaired.push(character);
+                escaped = false;
+                continue;
+            }
+            match character {
+                '\\' => {
+                    repaired.push(character);
+                    escaped = true;
+                }
+                '"' => {
+                    repaired.push(character);
+                    in_string = false;
+                }
+                '\n' => repaired.push_str("\\n"),
+                '\r' => repaired.push_str("\\r"),
+                '\t' => repaired.push_str("\\t"),
+                character if character.is_control() => {
+                    use std::fmt::Write as _;
+                    write!(&mut repaired, "\\u{:04x}", character as u32).ok()?;
+                }
+                _ => repaired.push(character),
+            }
+            continue;
+        }
+
+        match character {
+            '"' => {
+                repaired.push(character);
+                in_string = true;
+            }
+            '{' => {
+                repaired.push(character);
+                expected_closers.push('}');
+            }
+            '[' => {
+                repaired.push(character);
+                expected_closers.push(']');
+            }
+            '}' | ']' => {
+                if expected_closers.pop() != Some(character) {
+                    return None;
+                }
+                while repaired.ends_with(char::is_whitespace) {
+                    repaired.pop();
+                }
+                if repaired.ends_with(',') {
+                    repaired.pop();
+                }
+                repaired.push(character);
+            }
+            _ => repaired.push(character),
+        }
+    }
+
+    // Never invent the end of a string: that can materially change a tool
+    // argument. Closing structurally balanced containers is deterministic.
+    if in_string || escaped {
+        return None;
+    }
+    while let Some(closer) = expected_closers.pop() {
+        while repaired.ends_with(char::is_whitespace) {
+            repaired.pop();
+        }
+        if repaired.ends_with(',') {
+            repaired.pop();
+        }
+        repaired.push(closer);
+    }
+    (repaired != arguments).then_some(repaired)
+}
+
+fn text_from_fields(value: &Value, fields: &[String]) -> Option<String> {
+    fields.iter().find_map(|field| {
+        let value = value.get(field)?;
+        if !value.is_string() && !value.is_array() {
+            return None;
+        }
+        let text = value_to_text(value);
+        (!text.is_empty()).then_some(text)
+    })
+}
+
+fn split_tagged_thinking(text: &str) -> Option<(&str, &str)> {
+    const OPEN_TAG: &str = "<think>";
+    const CLOSE_TAG: &str = "</think>";
+    let trimmed = text.trim_start();
+    let prefix = trimmed.get(..OPEN_TAG.len())?;
+    if !prefix.eq_ignore_ascii_case(OPEN_TAG) {
+        return None;
+    }
+    let body = &trimmed[OPEN_TAG.len()..];
+    let lowered = body.to_ascii_lowercase();
+    let end = lowered.find(CLOSE_TAG)?;
+    Some((&body[..end], &body[end + CLOSE_TAG.len()..]))
+}
+
+fn tool_arguments_text(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(arguments)) if !arguments.is_empty() => arguments.clone(),
+        Some(Value::Null) | None | Some(Value::String(_)) => "{}".to_string(),
+        Some(arguments) => arguments.to_string(),
+    }
+}
+
+fn usage_token(usage: &Value, fields: &[&str]) -> Option<u64> {
+    fields
+        .iter()
+        .find_map(|field| usage.get(*field).and_then(Value::as_u64))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TaggedContentState {
+    Detecting,
+    Thinking,
+    Text,
 }
 
 struct AnthropicStreamTranslator {
     message_id: String,
     model: String,
     thought_signatures: Arc<ThoughtSignatureCache>,
+    capabilities: OpenAiCapabilities,
     next_content_index: usize,
     thinking_block_index: Option<usize>,
     text_block_index: Option<usize>,
+    tagged_content_state: TaggedContentState,
+    tagged_content_buffer: String,
     tool_calls: IndexMap<String, StreamingToolCall>,
     next_anonymous_tool: usize,
     finish_reason: Option<String>,
     input_tokens: u64,
     output_tokens: u64,
+    refusal_seen: bool,
     finished: bool,
 }
 
 impl AnthropicStreamTranslator {
+    #[cfg(test)]
     fn new(
         model: String,
         thought_signatures: Arc<ThoughtSignatureCache>,
         estimated_input_tokens: u64,
     ) -> Self {
+        Self::with_capabilities(
+            model,
+            thought_signatures,
+            estimated_input_tokens,
+            OpenAiCapabilities::default(),
+        )
+    }
+
+    fn with_capabilities(
+        model: String,
+        thought_signatures: Arc<ThoughtSignatureCache>,
+        estimated_input_tokens: u64,
+        capabilities: OpenAiCapabilities,
+    ) -> Self {
+        let tagged_content_state = if capabilities.thinking_tags {
+            TaggedContentState::Detecting
+        } else {
+            TaggedContentState::Text
+        };
         Self {
             message_id: format!("msg_{}", Uuid::new_v4().simple()),
             model,
             thought_signatures,
+            capabilities,
             next_content_index: 0,
             thinking_block_index: None,
             text_block_index: None,
+            tagged_content_state,
+            tagged_content_buffer: String::new(),
             tool_calls: IndexMap::new(),
             next_anonymous_tool: 0,
             finish_reason: None,
             input_tokens: estimated_input_tokens,
             output_tokens: 0,
+            refusal_seen: false,
             finished: false,
         }
     }
@@ -1935,13 +2409,9 @@ impl AnthropicStreamTranslator {
         }
 
         if let Some(usage) = chunk.get("usage") {
-            self.input_tokens = usage
-                .get("prompt_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(self.input_tokens);
-            self.output_tokens = usage
-                .get("completion_tokens")
-                .and_then(Value::as_u64)
+            self.input_tokens =
+                usage_token(usage, &["prompt_tokens", "input_tokens"]).unwrap_or(self.input_tokens);
+            self.output_tokens = usage_token(usage, &["completion_tokens", "output_tokens"])
                 .unwrap_or(self.output_tokens);
         }
 
@@ -1956,74 +2426,21 @@ impl AnthropicStreamTranslator {
         };
 
         let mut events = Vec::new();
-        let reasoning_text = delta
-            .get("reasoning_content")
-            .and_then(Value::as_str)
-            .filter(|text| !text.is_empty())
-            .or_else(|| {
-                delta
-                    .get("thinking")
-                    .and_then(Value::as_str)
-                    .filter(|text| !text.is_empty())
-            });
+        let reasoning_text = text_from_fields(delta, &self.capabilities.reasoning_fields);
         if let Some(reasoning_text) = reasoning_text {
-            let index = if let Some(index) = self.thinking_block_index {
-                index
-            } else {
-                let index = self.next_content_index;
-                self.next_content_index += 1;
-                self.thinking_block_index = Some(index);
-                push_anthropic_event(
-                    &mut events,
-                    "content_block_start",
-                    json!({
-                        "type": "content_block_start",
-                        "index": index,
-                        "content_block": {"type": "thinking", "thinking": ""}
-                    }),
-                )?;
-                index
-            };
-            push_anthropic_event(
-                &mut events,
-                "content_block_delta",
-                json!({
-                    "type": "content_block_delta",
-                    "index": index,
-                    "delta": {"type": "thinking_delta", "thinking": reasoning_text}
-                }),
-            )?;
+            self.emit_thinking_delta(&mut events, &reasoning_text)?;
         }
 
-        if let Some(text) = delta.get("content").and_then(Value::as_str) {
-            if !text.is_empty() {
-                self.stop_thinking_block(&mut events)?;
-                let index = if let Some(index) = self.text_block_index {
-                    index
-                } else {
-                    let index = self.next_content_index;
-                    self.next_content_index += 1;
-                    self.text_block_index = Some(index);
-                    push_anthropic_event(
-                        &mut events,
-                        "content_block_start",
-                        json!({
-                            "type": "content_block_start",
-                            "index": index,
-                            "content_block": {"type": "text", "text": ""}
-                        }),
-                    )?;
-                    index
-                };
-                push_anthropic_event(
-                    &mut events,
-                    "content_block_delta",
-                    json!({
-                        "type": "content_block_delta",
-                        "index": index,
-                        "delta": {"type": "text_delta", "text": text}
-                    }),
-                )?;
+        for field in ["content", "refusal"] {
+            let text = value_to_text(delta.get(field).unwrap_or(&Value::Null));
+            if text.is_empty() {
+                continue;
+            }
+            if field == "refusal" {
+                self.refusal_seen = true;
+                self.emit_text_delta(&mut events, &text)?;
+            } else {
+                self.process_content_delta(&mut events, &text)?;
             }
         }
 
@@ -2035,7 +2452,125 @@ impl AnthropicStreamTranslator {
                 self.accumulate_tool_call(tool_call);
             }
         }
+        if let Some(function_call) = delta.get("function_call") {
+            self.stop_thinking_block(&mut events)?;
+            self.accumulate_tool_call(&json!({
+                "index": 0,
+                "function": function_call
+            }));
+        }
         Ok(events)
+    }
+
+    fn emit_thinking_delta(
+        &mut self,
+        events: &mut Vec<Event>,
+        thinking: &str,
+    ) -> Result<(), String> {
+        if thinking.is_empty() {
+            return Ok(());
+        }
+        let index = if let Some(index) = self.thinking_block_index {
+            index
+        } else {
+            let index = self.next_content_index;
+            self.next_content_index += 1;
+            self.thinking_block_index = Some(index);
+            push_anthropic_event(
+                events,
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {"type": "thinking", "thinking": ""}
+                }),
+            )?;
+            index
+        };
+        push_anthropic_event(
+            events,
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {"type": "thinking_delta", "thinking": thinking}
+            }),
+        )
+    }
+
+    fn process_content_delta(&mut self, events: &mut Vec<Event>, text: &str) -> Result<(), String> {
+        const OPEN_TAG: &str = "<think>";
+        match self.tagged_content_state {
+            TaggedContentState::Text => self.emit_text_delta(events, text),
+            TaggedContentState::Thinking => self.process_tagged_thinking(events, text),
+            TaggedContentState::Detecting => {
+                self.tagged_content_buffer.push_str(text);
+                let trimmed = self.tagged_content_buffer.trim_start();
+                let lowered = trimmed.to_ascii_lowercase();
+                if OPEN_TAG.starts_with(&lowered) && self.tagged_content_buffer.len() <= 64 {
+                    return Ok(());
+                }
+                if lowered.starts_with(OPEN_TAG) {
+                    let leading_bytes = self.tagged_content_buffer.len() - trimmed.len();
+                    let rest =
+                        self.tagged_content_buffer[leading_bytes + OPEN_TAG.len()..].to_string();
+                    self.tagged_content_buffer.clear();
+                    self.tagged_content_state = TaggedContentState::Thinking;
+                    return self.process_tagged_thinking(events, &rest);
+                }
+
+                self.tagged_content_state = TaggedContentState::Text;
+                let buffered = std::mem::take(&mut self.tagged_content_buffer);
+                self.emit_text_delta(events, &buffered)
+            }
+        }
+    }
+
+    fn process_tagged_thinking(
+        &mut self,
+        events: &mut Vec<Event>,
+        text: &str,
+    ) -> Result<(), String> {
+        const CLOSE_TAG: &str = "</think>";
+        self.tagged_content_buffer.push_str(text);
+        let lowered = self.tagged_content_buffer.to_ascii_lowercase();
+        if let Some(end) = lowered.find(CLOSE_TAG) {
+            let thinking = self.tagged_content_buffer[..end].to_string();
+            let remaining = self.tagged_content_buffer[end + CLOSE_TAG.len()..].to_string();
+            self.tagged_content_buffer.clear();
+            self.emit_thinking_delta(events, &thinking)?;
+            self.tagged_content_state = TaggedContentState::Text;
+            if !remaining.is_empty() {
+                self.emit_text_delta(events, &remaining)?;
+            }
+            return Ok(());
+        }
+
+        let retained = (1..CLOSE_TAG.len())
+            .rev()
+            .find(|length| lowered.ends_with(&CLOSE_TAG[..*length]))
+            .unwrap_or(0);
+        let emit_length = self.tagged_content_buffer.len() - retained;
+        if emit_length > 0 {
+            let thinking = self.tagged_content_buffer[..emit_length].to_string();
+            self.tagged_content_buffer.drain(..emit_length);
+            self.emit_thinking_delta(events, &thinking)?;
+        }
+        Ok(())
+    }
+
+    fn flush_tagged_content(&mut self, events: &mut Vec<Event>) -> Result<(), String> {
+        if self.tagged_content_buffer.is_empty() {
+            return Ok(());
+        }
+        let buffered = std::mem::take(&mut self.tagged_content_buffer);
+        match self.tagged_content_state {
+            TaggedContentState::Thinking => self.emit_thinking_delta(events, &buffered),
+            TaggedContentState::Detecting | TaggedContentState::Text => {
+                self.tagged_content_state = TaggedContentState::Text;
+                self.emit_text_delta(events, &buffered)
+            }
+        }
     }
 
     fn stop_thinking_block(&mut self, events: &mut Vec<Event>) -> Result<(), String> {
@@ -2047,6 +2582,36 @@ impl AnthropicStreamTranslator {
             )?;
         }
         Ok(())
+    }
+
+    fn emit_text_delta(&mut self, events: &mut Vec<Event>, text: &str) -> Result<(), String> {
+        self.stop_thinking_block(events)?;
+        let index = if let Some(index) = self.text_block_index {
+            index
+        } else {
+            let index = self.next_content_index;
+            self.next_content_index += 1;
+            self.text_block_index = Some(index);
+            push_anthropic_event(
+                events,
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {"type": "text", "text": ""}
+                }),
+            )?;
+            index
+        };
+        push_anthropic_event(
+            events,
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {"type": "text_delta", "text": text}
+            }),
+        )
     }
 
     fn accumulate_tool_call(&mut self, tool_call: &Value) {
@@ -2084,11 +2649,15 @@ impl AnthropicStreamTranslator {
                 entry.name.push_str(name);
             }
         }
-        if let Some(arguments) = tool_call
-            .pointer("/function/arguments")
-            .and_then(Value::as_str)
-        {
-            entry.arguments.push_str(arguments);
+        if let Some(arguments) = tool_call.pointer("/function/arguments") {
+            match arguments {
+                Value::String(arguments) => entry.arguments.push_str(arguments),
+                Value::Null => {}
+                arguments if entry.arguments.is_empty() => {
+                    entry.arguments = arguments.to_string();
+                }
+                _ => {}
+            }
         }
         if let Some(signature) = tool_call
             .pointer("/extra_content/google/thought_signature")
@@ -2111,6 +2680,7 @@ impl AnthropicStreamTranslator {
         self.finished = true;
         let mut events = Vec::new();
 
+        self.flush_tagged_content(&mut events)?;
         self.stop_thinking_block(&mut events)?;
         if let Some(index) = self.text_block_index.take() {
             push_anthropic_event(
@@ -2120,26 +2690,29 @@ impl AnthropicStreamTranslator {
             )?;
         }
 
-        let stop_reason =
-            anthropic_stop_reason(self.finish_reason.as_deref(), !self.tool_calls.is_empty());
+        let stop_reason = if self.refusal_seen {
+            "refusal"
+        } else {
+            anthropic_stop_reason(self.finish_reason.as_deref(), !self.tool_calls.is_empty())
+        };
         let emit_tool_calls = stop_reason == "tool_use";
         if emit_tool_calls {
-            for tool_call in self.tool_calls.values() {
-                parse_tool_arguments(&tool_call.arguments)?;
-            }
+            let normalized_arguments = self
+                .tool_calls
+                .values()
+                .map(|tool_call| {
+                    parse_tool_arguments_with_json(&tool_call.arguments)
+                        .map(|(_, normalized)| normalized)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
 
-            for tool_call in self.tool_calls.values() {
+            for (tool_call, arguments) in self.tool_calls.values().zip(&normalized_arguments) {
                 let index = self.next_content_index;
                 self.next_content_index += 1;
                 let name = if tool_call.name.is_empty() {
                     "unknown_function"
                 } else {
                     &tool_call.name
-                };
-                let arguments = if tool_call.arguments.is_empty() {
-                    "{}"
-                } else {
-                    &tool_call.arguments
                 };
                 if let Some(signature) = &tool_call.thought_signature {
                     remember_thought_signature(&self.thought_signatures, &tool_call.id, signature);
@@ -2202,10 +2775,15 @@ fn anthropic_upstream_stream_response(
     model: String,
     thought_signatures: Arc<ThoughtSignatureCache>,
     estimated_input_tokens: u64,
+    capabilities: OpenAiCapabilities,
 ) -> Response {
     let byte_stream = Box::pin(upstream.bytes_stream());
-    let translator =
-        AnthropicStreamTranslator::new(model, thought_signatures, estimated_input_tokens);
+    let translator = AnthropicStreamTranslator::with_capabilities(
+        model,
+        thought_signatures,
+        estimated_input_tokens,
+        capabilities,
+    );
     let initial_events = match translator.start_events() {
         Ok(events) => VecDeque::from(events),
         Err(message) => VecDeque::from([anthropic_stream_error_event(&message)]),
@@ -2261,26 +2839,44 @@ fn anthropic_upstream_stream_response(
                         ended = true;
                     }
                     None => {
+                        let mut saw_done = false;
+                        let mut processing_failed = false;
                         match decoder.finish() {
                             Ok(payloads) => {
                                 for payload in payloads {
-                                    if payload.trim() != "[DONE]" {
-                                        match translator.process_payload(&payload) {
-                                            Ok(events) => pending.extend(events),
-                                            Err(message) => pending
-                                                .push_back(anthropic_stream_error_event(&message)),
+                                    if payload.trim() == "[DONE]" {
+                                        saw_done = true;
+                                        continue;
+                                    }
+                                    match translator.process_payload(&payload) {
+                                        Ok(events) => pending.extend(events),
+                                        Err(message) => {
+                                            pending
+                                                .push_back(anthropic_stream_error_event(&message));
+                                            processing_failed = true;
+                                            break;
                                         }
                                     }
                                 }
                             }
                             Err(message) => {
-                                pending.push_back(anthropic_stream_error_event(&message))
+                                pending.push_back(anthropic_stream_error_event(&message));
+                                processing_failed = true;
                             }
                         }
-                        match translator.finish() {
-                            Ok(events) => pending.extend(events),
-                            Err(message) => {
-                                pending.push_back(anthropic_stream_error_event(&message))
+                        if !processing_failed {
+                            if stream_eof_is_complete(saw_done, translator.finish_reason.as_deref())
+                            {
+                                match translator.finish() {
+                                    Ok(events) => pending.extend(events),
+                                    Err(message) => {
+                                        pending.push_back(anthropic_stream_error_event(&message))
+                                    }
+                                }
+                            } else {
+                                pending.push_back(anthropic_stream_error_event(
+                                    "OpenAI-compatible stream ended before [DONE] or finish_reason",
+                                ));
                             }
                         }
                         ended = true;
@@ -2403,6 +2999,50 @@ fn anthropic_error(status: StatusCode, error_type: &str, message: &str) -> Respo
         })),
     )
         .into_response()
+}
+
+fn openai_error_contract(status: StatusCode, message: &str) -> (StatusCode, &'static str) {
+    let status_error = match status.as_u16() {
+        401 => Some("authentication_error"),
+        403 => Some("permission_error"),
+        404 => Some("not_found_error"),
+        429 => Some("rate_limit_error"),
+        529 => Some("overloaded_error"),
+        _ => None,
+    };
+    if let Some(error_type) = status_error {
+        return (status, error_type);
+    }
+
+    let lower = message.to_ascii_lowercase();
+    let context_limit = [
+        "context length",
+        "context_length",
+        "context window",
+        "maximum context",
+        "max context",
+        "prompt is too long",
+        "prompt too long",
+        "too many tokens",
+        "token limit",
+        "input is too long",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    if context_limit {
+        let status = if status.is_client_error() {
+            status
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        return (status, "invalid_request_error");
+    }
+
+    let error_type = match status.as_u16() {
+        400..=499 => "invalid_request_error",
+        _ => "api_error",
+    };
+    (status, error_type)
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
@@ -2702,10 +3342,25 @@ fn append_bridge_identity(request: &mut Value, identity: &str) -> Result<bool, S
     Ok(true)
 }
 
+#[cfg(test)]
 fn translate_anthropic_request(
     request: &Value,
     default_model: &str,
     thought_signatures: &ThoughtSignatureCache,
+) -> Result<Value, String> {
+    translate_anthropic_request_with_capabilities(
+        request,
+        default_model,
+        thought_signatures,
+        &OpenAiCapabilities::local_gemini(),
+    )
+}
+
+fn translate_anthropic_request_with_capabilities(
+    request: &Value,
+    default_model: &str,
+    thought_signatures: &ThoughtSignatureCache,
+    capabilities: &OpenAiCapabilities,
 ) -> Result<Value, String> {
     let mut messages = Vec::new();
     let mut runtime_identity_reminder = None;
@@ -2736,7 +3391,7 @@ fn translate_anthropic_request(
             "assistant" => {
                 translate_anthropic_assistant_message(content, &mut messages, thought_signatures);
             }
-            "user" => translate_anthropic_user_message(content, &mut messages),
+            "user" => translate_anthropic_user_message(content, &mut messages, capabilities),
             "system" | "developer" => {
                 let text = value_to_text(content);
                 if !text.is_empty() {
@@ -2761,12 +3416,20 @@ fn translate_anthropic_request(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     body.insert("stream".to_string(), Value::Bool(stream_requested));
-    if stream_requested {
+    if stream_requested && capabilities.stream_options {
         body.insert("stream_options".to_string(), json!({"include_usage": true}));
     }
 
     if let Some(max_tokens) = request.get("max_tokens").and_then(Value::as_u64) {
-        body.insert("max_tokens".to_string(), json!(max_tokens));
+        match capabilities.max_tokens_field {
+            MaxTokensField::MaxTokens => {
+                body.insert("max_tokens".to_string(), json!(max_tokens));
+            }
+            MaxTokensField::MaxCompletionTokens => {
+                body.insert("max_completion_tokens".to_string(), json!(max_tokens));
+            }
+            MaxTokensField::Omit => {}
+        }
     }
     if let Some(temperature) = request.get("temperature").and_then(Value::as_f64) {
         body.insert("temperature".to_string(), json!(temperature));
@@ -2781,8 +3444,10 @@ fn translate_anthropic_request(
     }
 
     if let Some(tools) = request.get("tools").and_then(Value::as_array) {
-        let translated_tools: Vec<Value> =
-            tools.iter().filter_map(translate_anthropic_tool).collect();
+        let translated_tools: Vec<Value> = tools
+            .iter()
+            .filter_map(|tool| translate_anthropic_tool_with_capabilities(tool, capabilities))
+            .collect();
         if !translated_tools.is_empty() {
             body.insert("tools".to_string(), Value::Array(translated_tools));
         }
@@ -2792,33 +3457,37 @@ fn translate_anthropic_request(
         if let Some(translated) = translate_anthropic_tool_choice(choice) {
             body.insert("tool_choice".to_string(), translated);
         }
-        if choice
-            .get("disable_parallel_tool_use")
-            .and_then(Value::as_bool)
-            == Some(true)
+        if capabilities.parallel_tool_calls
+            && choice
+                .get("disable_parallel_tool_use")
+                .and_then(Value::as_bool)
+                == Some(true)
         {
             body.insert("parallel_tool_calls".to_string(), Value::Bool(false));
         }
     }
 
-    if let Some(thinking) = request.get("thinking") {
-        let effort = thinking
-            .get("budget_tokens")
-            .and_then(Value::as_u64)
-            .map(|budget| {
-                if budget >= 8_192 {
-                    "high"
-                } else if budget >= 2_048 {
-                    "medium"
-                } else {
-                    "low"
-                }
-            })
-            .or_else(|| {
-                (thinking.get("type").and_then(Value::as_str) == Some("adaptive")).then_some("high")
-            });
-        if let Some(effort) = effort {
-            body.insert("reasoning_effort".to_string(), json!(effort));
+    if capabilities.reasoning_effort {
+        if let Some(thinking) = request.get("thinking") {
+            let effort = thinking
+                .get("budget_tokens")
+                .and_then(Value::as_u64)
+                .map(|budget| {
+                    if budget >= 8_192 {
+                        "high"
+                    } else if budget >= 2_048 {
+                        "medium"
+                    } else {
+                        "low"
+                    }
+                })
+                .or_else(|| {
+                    (thinking.get("type").and_then(Value::as_str) == Some("adaptive"))
+                        .then_some("high")
+                });
+            if let Some(effort) = effort {
+                body.insert("reasoning_effort".to_string(), json!(effort));
+            }
         }
     }
 
@@ -2905,7 +3574,11 @@ fn translate_anthropic_assistant_message(
     }
 }
 
-fn translate_anthropic_user_message(content: &Value, messages: &mut Vec<Value>) {
+fn translate_anthropic_user_message(
+    content: &Value,
+    messages: &mut Vec<Value>,
+    capabilities: &OpenAiCapabilities,
+) {
     if let Some(text) = content.as_str() {
         if !text.is_empty() {
             messages.push(json!({"role": "user", "content": text}));
@@ -2926,15 +3599,17 @@ fn translate_anthropic_user_message(content: &Value, messages: &mut Vec<Value>) 
                     .get("tool_use_id")
                     .and_then(Value::as_str)
                     .unwrap_or("toolu_unknown");
-                let result_content = translate_anthropic_tool_result_content(
+                let (result_content, media_parts) = translate_anthropic_tool_result_content(
                     part.get("content").unwrap_or(&Value::Null),
                     part.get("is_error").and_then(Value::as_bool) == Some(true),
+                    capabilities.tool_result_media,
                 );
                 tool_results.push(json!({
                     "role": "tool",
                     "tool_call_id": tool_use_id,
                     "content": result_content
                 }));
+                user_parts.extend(media_parts);
             }
             Some("text") => {
                 if let Some(text) = part.get("text").and_then(Value::as_str) {
@@ -2963,9 +3638,15 @@ fn translate_anthropic_user_message(content: &Value, messages: &mut Vec<Value>) 
     flush_anthropic_user_parts(messages, &mut user_parts);
 }
 
-fn translate_anthropic_tool_result_content(content: &Value, is_error: bool) -> Value {
+fn translate_anthropic_tool_result_content(
+    content: &Value,
+    is_error: bool,
+    media_mode: ToolResultMediaMode,
+) -> (Value, Vec<Value>) {
     if let Some(parts) = content.as_array() {
         let mut translated_parts = Vec::new();
+        let mut result_text = Vec::new();
+        let mut media_parts = Vec::new();
         let mut has_media = false;
 
         for part in parts {
@@ -2974,20 +3655,30 @@ fn translate_anthropic_tool_result_content(content: &Value, is_error: bool) -> V
                     if let Some(text) = part.get("text").and_then(Value::as_str) {
                         if !text.is_empty() {
                             translated_parts.push(json!({"type": "text", "text": text}));
+                            result_text.push(text.to_string());
                         }
                     }
                 }
-                Some("image") | Some("document") => {
+                Some(block_type @ ("image" | "document")) => {
                     if let Some(media_part) = translate_anthropic_base64_media(part) {
                         has_media = true;
-                        translated_parts.push(media_part);
+                        translated_parts.push(media_part.clone());
+                        result_text.push(
+                            if block_type == "image" {
+                                "[Image result attached]"
+                            } else {
+                                "[Document result attached]"
+                            }
+                            .to_string(),
+                        );
+                        media_parts.push(media_part);
                     }
                 }
                 _ => {}
             }
         }
 
-        if has_media {
+        if has_media && media_mode == ToolResultMediaMode::Inline {
             if is_error {
                 if let Some(text_part) = translated_parts
                     .iter_mut()
@@ -3002,7 +3693,14 @@ fn translate_anthropic_tool_result_content(content: &Value, is_error: bool) -> V
                     translated_parts.insert(0, json!({"type": "text", "text": "Tool error:"}));
                 }
             }
-            return Value::Array(translated_parts);
+            return (Value::Array(translated_parts), Vec::new());
+        }
+        if has_media {
+            let mut text = result_text.join("\n");
+            if is_error {
+                text = format!("Tool error: {text}");
+            }
+            return (Value::String(text), media_parts);
         }
     }
 
@@ -3010,7 +3708,7 @@ fn translate_anthropic_tool_result_content(content: &Value, is_error: bool) -> V
     if is_error {
         result_text = format!("Tool error: {result_text}");
     }
-    Value::String(result_text)
+    (Value::String(result_text), Vec::new())
 }
 
 fn translate_anthropic_base64_media(part: &Value) -> Option<Value> {
@@ -3050,7 +3748,15 @@ fn flush_anthropic_user_parts(messages: &mut Vec<Value>, parts: &mut Vec<Value>)
     }));
 }
 
+#[cfg(test)]
 fn translate_anthropic_tool(tool: &Value) -> Option<Value> {
+    translate_anthropic_tool_with_capabilities(tool, &OpenAiCapabilities::default())
+}
+
+fn translate_anthropic_tool_with_capabilities(
+    tool: &Value,
+    capabilities: &OpenAiCapabilities,
+) -> Option<Value> {
     let name = tool.get("name")?.as_str()?;
     let mut function = Map::new();
     function.insert("name".to_string(), json!(name));
@@ -3061,7 +3767,9 @@ fn translate_anthropic_tool(tool: &Value) -> Option<Value> {
         .get("input_schema")
         .cloned()
         .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
-    sanitize_json_schema(&mut schema);
+    if capabilities.tool_schema == ToolSchemaMode::Sanitize {
+        sanitize_json_schema(&mut schema);
+    }
     function.insert("parameters".to_string(), schema);
     Some(json!({"type": "function", "function": function}))
 }
@@ -3095,6 +3803,11 @@ fn sanitize_json_schema(schema: &mut Value) {
             item => sanitize_json_schema(item),
         }
     }
+    if let Some(additional_properties) = object.get_mut("additionalProperties") {
+        if additional_properties.is_object() {
+            sanitize_json_schema(additional_properties);
+        }
+    }
     for key in ["oneOf", "anyOf", "allOf"] {
         if let Some(children) = object.get_mut(key).and_then(Value::as_array_mut) {
             for child in children {
@@ -3122,6 +3835,20 @@ fn translate_anthropic_response(
     model: &str,
     thought_signatures: &ThoughtSignatureCache,
 ) -> Result<Value, String> {
+    translate_anthropic_response_with_capabilities(
+        upstream,
+        model,
+        thought_signatures,
+        &OpenAiCapabilities::default(),
+    )
+}
+
+fn translate_anthropic_response_with_capabilities(
+    upstream: &Value,
+    model: &str,
+    thought_signatures: &ThoughtSignatureCache,
+    capabilities: &OpenAiCapabilities,
+) -> Result<Value, String> {
     if let Some(block_reason) = upstream
         .pointer("/promptFeedback/blockReason")
         .and_then(Value::as_str)
@@ -3133,14 +3860,9 @@ fn translate_anthropic_response(
             .unwrap_or(true);
         if choices_are_empty {
             let usage = upstream.get("usage").cloned().unwrap_or_else(|| json!({}));
-            let input_tokens = usage
-                .get("prompt_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let output_tokens = usage
-                .get("completion_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
+            let input_tokens = usage_token(&usage, &["prompt_tokens", "input_tokens"]).unwrap_or(0);
+            let output_tokens =
+                usage_token(&usage, &["completion_tokens", "output_tokens"]).unwrap_or(0);
             return Ok(json!({
                 "id": format!("msg_{}", Uuid::new_v4().simple()),
                 "type": "message",
@@ -3173,31 +3895,42 @@ fn translate_anthropic_response(
         .and_then(Value::as_str);
     let allow_tool_calls = anthropic_stop_reason(finish_reason, true) == "tool_use";
     let mut content = Vec::new();
-    let reasoning_text = upstream_message
-        .get("reasoning_content")
-        .and_then(Value::as_str)
-        .filter(|text| !text.is_empty())
-        .or_else(|| {
-            upstream_message
-                .get("thinking")
-                .and_then(Value::as_str)
-                .filter(|text| !text.is_empty())
-        });
+    let reasoning_text = text_from_fields(upstream_message, &capabilities.reasoning_fields);
     if let Some(reasoning_text) = reasoning_text {
         content.push(json!({"type": "thinking", "thinking": reasoning_text}));
     }
     let text = value_to_text(upstream_message.get("content").unwrap_or(&Value::Null));
-    if !text.is_empty() {
+    if capabilities.thinking_tags {
+        if let Some((thinking, answer)) = split_tagged_thinking(&text) {
+            if !thinking.is_empty() {
+                content.push(json!({"type": "thinking", "thinking": thinking}));
+            }
+            if !answer.is_empty() {
+                content.push(json!({"type": "text", "text": answer}));
+            }
+        } else if !text.is_empty() {
+            content.push(json!({"type": "text", "text": text}));
+        }
+    } else if !text.is_empty() {
         content.push(json!({"type": "text", "text": text}));
+    }
+    let refusal = value_to_text(upstream_message.get("refusal").unwrap_or(&Value::Null));
+    if !refusal.is_empty() {
+        content.push(json!({"type": "text", "text": refusal}));
     }
 
     if allow_tool_calls {
-        let tool_calls = upstream_message
+        let mut tool_calls = upstream_message
             .get("tool_calls")
             .and_then(Value::as_array)
-            .map(Vec::as_slice)
+            .cloned()
             .unwrap_or_default();
-        for tool_call in tool_calls {
+        if tool_calls.is_empty() {
+            if let Some(function_call) = upstream_message.get("function_call") {
+                tool_calls.push(json!({"type": "function", "function": function_call}));
+            }
+        }
+        for tool_call in &tool_calls {
             let call_id = tool_call
                 .get("id")
                 .and_then(Value::as_str)
@@ -3207,11 +3940,8 @@ fn translate_anthropic_response(
                 .pointer("/function/name")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown_function");
-            let arguments = tool_call
-                .pointer("/function/arguments")
-                .and_then(Value::as_str)
-                .unwrap_or("{}");
-            let input = parse_tool_arguments(arguments)?;
+            let arguments = tool_arguments_text(tool_call.pointer("/function/arguments"));
+            let input = parse_tool_arguments(&arguments)?;
 
             if let Some(signature) = tool_call
                 .pointer("/extra_content/google/thought_signature")
@@ -3232,16 +3962,14 @@ fn translate_anthropic_response(
     let has_tools = content
         .iter()
         .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"));
-    let stop_reason = anthropic_stop_reason(finish_reason, has_tools);
+    let stop_reason = if refusal.is_empty() {
+        anthropic_stop_reason(finish_reason, has_tools)
+    } else {
+        "refusal"
+    };
     let usage = upstream.get("usage").cloned().unwrap_or_else(|| json!({}));
-    let input_tokens = usage
-        .get("prompt_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let output_tokens = usage
-        .get("completion_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    let input_tokens = usage_token(&usage, &["prompt_tokens", "input_tokens"]).unwrap_or(0);
+    let output_tokens = usage_token(&usage, &["completion_tokens", "output_tokens"]).unwrap_or(0);
 
     Ok(json!({
         "id": format!("msg_{}", Uuid::new_v4().simple()),
@@ -3763,6 +4491,24 @@ fn safe_error_message(value: &Value) -> String {
         .map(str::to_owned)
         .or_else(|| {
             value
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            value
+                .pointer("/detail/message")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            value
+                .get("detail")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            value
                 .pointer("/promptFeedback/blockReason")
                 .and_then(Value::as_str)
                 .map(|reason| {
@@ -3920,6 +4666,94 @@ mod tests {
     }
 
     #[test]
+    fn provider_capabilities_control_optional_openai_fields() {
+        let root = env::temp_dir().join(format!("claude-bridge-capabilities-{}", Uuid::new_v4()));
+        let providers_dir = root.join("bridge-providers");
+        let settings_dir = root.join(".claude");
+        fs::create_dir_all(&providers_dir).unwrap();
+        fs::create_dir_all(&settings_dir).unwrap();
+        fs::write(
+            providers_dir.join("strict.json"),
+            serde_json::to_vec_pretty(&json!({
+                "model": "strict-model",
+                "base_url": "https://strict.example/v1",
+                "api_key": "secret",
+                "capabilities": {
+                    "stream_options": false,
+                    "parallel_tool_calls": false,
+                    "reasoning_effort": false,
+                    "reasoning_fields": ["analysis"],
+                    "thinking_tags": false,
+                    "tool_result_media": "inline",
+                    "tool_schema": "preserve",
+                    "max_tokens_field": "max_completion_tokens"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let loaded =
+            load_provider_profiles(&providers_dir, &settings_dir, "http://127.0.0.1:18787")
+                .unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        let profile = &loaded.profiles[0];
+        assert_eq!(profile.openai_capabilities.reasoning_fields, ["analysis"]);
+        assert!(!profile.openai_capabilities.thinking_tags);
+        assert_eq!(
+            profile.openai_capabilities.tool_result_media,
+            ToolResultMediaMode::Inline
+        );
+        assert_eq!(
+            provider_profile_json(profile, &profile.file_name)["capabilities"]["tool_schema"],
+            "preserve"
+        );
+
+        let request = json!({
+            "stream": true,
+            "max_tokens": 123,
+            "thinking": {"type": "adaptive"},
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{
+                "name": "inspect",
+                "input_schema": {
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "properties": {}
+                }
+            }],
+            "tool_choice": {"type": "auto", "disable_parallel_tool_use": true}
+        });
+        let signatures = RwLock::new(IndexMap::new());
+        let translated = translate_anthropic_request_with_capabilities(
+            &request,
+            "strict-model",
+            &signatures,
+            &profile.openai_capabilities,
+        )
+        .unwrap();
+
+        assert!(translated.get("stream_options").is_none());
+        assert!(translated.get("parallel_tool_calls").is_none());
+        assert!(translated.get("reasoning_effort").is_none());
+        assert!(translated.get("max_tokens").is_none());
+        assert_eq!(translated["max_completion_tokens"], 123);
+        assert_eq!(
+            translated["tools"][0]["function"]["parameters"]["$schema"],
+            "https://json-schema.org/draft/2020-12/schema"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_provider_capability_types() {
+        let profile = json!({"capabilities": {"tool_schema": 7}});
+        let error =
+            parse_openai_capabilities(profile.as_object().unwrap(), "invalid.json").unwrap_err();
+        assert!(error.contains("tool_schema"));
+        assert!(error.contains("non-empty string"));
+    }
+
+    #[test]
     fn native_local_gemini_profile_uses_bridge_managed_credential() {
         let root = env::temp_dir().join(format!("claude-bridge-native-gemini-{}", Uuid::new_v4()));
         let providers_dir = root.join("bridge-providers");
@@ -3945,6 +4779,10 @@ mod tests {
 
         assert_eq!(loaded.profiles.len(), 1);
         assert_eq!(loaded.profiles[0].transport, ProviderTransport::LocalGemini);
+        assert_eq!(
+            loaded.profiles[0].openai_capabilities.tool_result_media,
+            ToolResultMediaMode::Inline
+        );
         assert!(loaded.profiles[0].auth_token.is_none());
         assert!(loaded.profiles[0].api_key.is_none());
     }
@@ -4160,6 +4998,10 @@ mod tests {
                 },
                 "$defs": {
                     "metadata": {"type": "string", "$comment": "definition"}
+                },
+                "additionalProperties": {
+                    "$schema": "nested",
+                    "properties": {"value": {"type": "string"}}
                 }
             }
         });
@@ -4183,6 +5025,8 @@ mod tests {
             .get("$comment")
             .is_none());
         assert!(schema["$defs"]["metadata"].get("$comment").is_none());
+        assert!(schema["additionalProperties"].get("$schema").is_none());
+        assert_eq!(schema["additionalProperties"]["type"], "object");
     }
 
     #[test]
@@ -4499,6 +5343,276 @@ mod tests {
     }
 
     #[test]
+    fn extracts_tagged_thinking_across_stream_chunks() {
+        let signatures = Arc::new(RwLock::new(IndexMap::new()));
+        let mut translator =
+            AnthropicStreamTranslator::new("reasoning-model".to_string(), signatures, 0);
+
+        let opening = translator
+            .process_payload(r#"{"choices":[{"delta":{"content":"<thi"},"finish_reason":null}]}"#)
+            .unwrap();
+        assert!(opening.is_empty());
+
+        let thinking = translator
+            .process_payload(
+                r#"{"choices":[{"delta":{"content":"nk>inspect files</thi"},"finish_reason":null}]}"#,
+            )
+            .unwrap();
+        let thinking_debug = format!("{thinking:?}");
+        assert!(thinking_debug.contains("thinking_delta"));
+        assert!(thinking_debug.contains("inspect files"));
+
+        let answer = translator
+            .process_payload(
+                r#"{"choices":[{"delta":{"content":"nk>Done"},"finish_reason":"stop"}]}"#,
+            )
+            .unwrap();
+        let answer_debug = format!("{answer:?}");
+        assert!(answer_debug.contains("content_block_stop"));
+        assert!(answer_debug.contains("text_delta"));
+        assert!(answer_debug.contains("Done"));
+    }
+
+    #[test]
+    fn extracts_tagged_thinking_non_streaming_and_allows_opt_out() {
+        let upstream = json!({
+            "choices": [{
+                "message": {"content": "<think>Inspect repository</think>Answer"},
+                "finish_reason": "stop"
+            }]
+        });
+        let signatures = RwLock::new(IndexMap::new());
+        let translated = translate_anthropic_response_with_capabilities(
+            &upstream,
+            "reasoning-model",
+            &signatures,
+            &OpenAiCapabilities::default(),
+        )
+        .unwrap();
+        assert_eq!(translated["content"][0]["type"], "thinking");
+        assert_eq!(translated["content"][0]["thinking"], "Inspect repository");
+        assert_eq!(translated["content"][1]["text"], "Answer");
+
+        let capabilities = OpenAiCapabilities {
+            thinking_tags: false,
+            ..OpenAiCapabilities::default()
+        };
+        let preserved = translate_anthropic_response_with_capabilities(
+            &upstream,
+            "literal-tag-model",
+            &signatures,
+            &capabilities,
+        )
+        .unwrap();
+        assert_eq!(
+            preserved["content"][0]["text"],
+            "<think>Inspect repository</think>Answer"
+        );
+    }
+
+    #[test]
+    fn standard_tool_results_keep_tool_content_text_only_and_move_media_to_user() {
+        let request = json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_media",
+                    "content": [
+                        {"type": "text", "text": "Screenshot captured"},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "aW1hZ2U="
+                            }
+                        }
+                    ]
+                }]
+            }]
+        });
+        let signatures = RwLock::new(IndexMap::new());
+        let translated = translate_anthropic_request_with_capabilities(
+            &request,
+            "strict-openai-model",
+            &signatures,
+            &OpenAiCapabilities::default(),
+        )
+        .unwrap();
+
+        assert!(translated["messages"][0]["content"].is_string());
+        assert!(translated["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("[Image result attached]"));
+        assert_eq!(translated["messages"][1]["role"], "user");
+        assert_eq!(translated["messages"][1]["content"][0]["type"], "image_url");
+
+        let gemini = translate_anthropic_request(&request, "gemini", &signatures).unwrap();
+        assert!(gemini["messages"][0]["content"].is_array());
+    }
+
+    #[test]
+    fn conservatively_repairs_common_tool_argument_json_defects() {
+        assert_eq!(parse_tool_arguments(r#"{"a":1,}"#).unwrap()["a"], 1);
+        assert_eq!(
+            parse_tool_arguments("{\"text\":\"line 1\nline 2\"}").unwrap()["text"],
+            "line 1\nline 2"
+        );
+        assert_eq!(
+            parse_tool_arguments(r#"{"path":"src""#).unwrap()["path"],
+            "src"
+        );
+        assert!(parse_tool_arguments(r#"{"path":"unterminated"#).is_err());
+    }
+
+    #[test]
+    fn streams_repaired_tool_arguments_instead_of_the_malformed_source() {
+        let signatures = Arc::new(RwLock::new(IndexMap::new()));
+        let mut translator =
+            AnthropicStreamTranslator::new("small-tool-model".to_string(), signatures, 0);
+        translator
+            .process_payload(
+                r#"{"choices":[{"delta":{"tool_calls":[{"id":"call_repair","function":{"name":"inspect","arguments":"{\"path\":\"src\""}}]},"finish_reason":"tool_calls"}]}"#,
+            )
+            .unwrap();
+
+        let events = translator.finish().unwrap();
+        let debug = format!("{events:?}");
+        assert!(debug.contains(r#"partial_json\":\"{\\\"path\\\":\\\"src\\\"}\""#));
+    }
+
+    #[test]
+    fn maps_openai_http_failures_to_anthropic_retry_contracts() {
+        assert_eq!(
+            openai_error_contract(StatusCode::TOO_MANY_REQUESTS, "quota"),
+            (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error")
+        );
+        assert_eq!(
+            openai_error_contract(StatusCode::PAYLOAD_TOO_LARGE, "request too large"),
+            (StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error")
+        );
+        let overloaded = StatusCode::from_u16(529).unwrap();
+        assert_eq!(
+            openai_error_contract(overloaded, "overloaded"),
+            (overloaded, "overloaded_error")
+        );
+        assert_eq!(
+            openai_error_contract(StatusCode::INTERNAL_SERVER_ERROR, "context length exceeded"),
+            (StatusCode::BAD_REQUEST, "invalid_request_error")
+        );
+        assert_eq!(
+            openai_error_contract(StatusCode::BAD_GATEWAY, "upstream unavailable").1,
+            "api_error"
+        );
+    }
+
+    #[test]
+    fn clean_stream_eof_requires_done_or_finish_reason() {
+        assert!(!stream_eof_is_complete(false, None));
+        assert!(stream_eof_is_complete(true, None));
+        assert!(stream_eof_is_complete(false, Some("stop")));
+    }
+
+    #[test]
+    fn field_driven_response_matrix_handles_openai_variants() {
+        let signatures = RwLock::new(IndexMap::new());
+        let cases = [
+            (
+                "object tool arguments",
+                json!({
+                    "choices": [{
+                        "message": {
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call_object",
+                                "function": {"name": "inspect", "arguments": {"path": "src"}}
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }],
+                    "usage": {"input_tokens": 7, "output_tokens": 3}
+                }),
+                "tool_use",
+            ),
+            (
+                "legacy function_call",
+                json!({
+                    "choices": [{
+                        "message": {
+                            "content": null,
+                            "function_call": {"name": "inspect", "arguments": "{\"path\":\"src\"}"}
+                        },
+                        "finish_reason": "function_call"
+                    }]
+                }),
+                "tool_use",
+            ),
+            (
+                "standard refusal",
+                json!({
+                    "choices": [{
+                        "message": {"content": null, "refusal": "Request refused."},
+                        "finish_reason": "stop"
+                    }]
+                }),
+                "text",
+            ),
+        ];
+
+        for (case, upstream, expected_block_type) in cases {
+            let message = translate_anthropic_response(&upstream, case, &signatures).unwrap();
+            assert_eq!(
+                message["content"][0]["type"], expected_block_type,
+                "failed compatibility case: {case}"
+            );
+            if case == "object tool arguments" {
+                assert_eq!(message["content"][0]["input"]["path"], "src");
+                assert_eq!(message["usage"]["input_tokens"], 7);
+                assert_eq!(message["usage"]["output_tokens"], 3);
+            }
+            if case == "standard refusal" {
+                assert_eq!(message["stop_reason"], "refusal");
+            }
+        }
+    }
+
+    #[test]
+    fn configured_reasoning_field_and_usage_aliases_work_in_streams() {
+        let signatures = Arc::new(RwLock::new(IndexMap::new()));
+        let capabilities = OpenAiCapabilities {
+            reasoning_fields: vec!["analysis".to_string()],
+            ..OpenAiCapabilities::default()
+        };
+        let mut translator = AnthropicStreamTranslator::with_capabilities(
+            "custom-model".to_string(),
+            signatures,
+            0,
+            capabilities,
+        );
+
+        let events = translator
+            .process_payload(
+                r#"{"choices":[{"delta":{"analysis":"Checking","content":null},"finish_reason":null}],"usage":{"input_tokens":11,"output_tokens":4}}"#,
+            )
+            .unwrap();
+        let debug = format!("{events:?}");
+        assert!(debug.contains("thinking_delta"));
+        assert!(debug.contains("Checking"));
+        assert_eq!(translator.input_tokens, 11);
+        assert_eq!(translator.output_tokens, 4);
+
+        let refusal_events = translator
+            .process_payload(
+                r#"{"choices":[{"delta":{"refusal":"Not allowed."},"finish_reason":"content_filter"}]}"#,
+            )
+            .unwrap();
+        assert!(format!("{refusal_events:?}").contains("Not allowed."));
+        assert!(format!("{:?}", translator.finish().unwrap()).contains("refusal"));
+    }
+
+    #[test]
     fn turns_prompt_feedback_into_anthropic_refusal() {
         let upstream = json!({
             "promptFeedback": {"blockReason": "SAFETY"},
@@ -4520,7 +5634,8 @@ mod tests {
     #[test]
     fn streams_thinking_regardless_of_model_name() {
         let signatures = Arc::new(RwLock::new(IndexMap::new()));
-        let mut translator = AnthropicStreamTranslator::new("deepseek-chat".to_string(), signatures, 0);
+        let mut translator =
+            AnthropicStreamTranslator::new("deepseek-chat".to_string(), signatures, 0);
 
         let thinking_events = translator
             .process_payload(
@@ -4561,11 +5676,7 @@ mod tests {
         assert_eq!(message["content"][1]["type"], "text");
         assert_eq!(message["content"][2]["type"], "tool_use");
         assert_eq!(
-            signatures
-                .read()
-                .unwrap()
-                .get("call_g")
-                .map(String::as_str),
+            signatures.read().unwrap().get("call_g").map(String::as_str),
             Some("sig-from-field")
         );
     }
@@ -4697,6 +5808,10 @@ mod tests {
         );
         assert_eq!(anthropic_stop_reason(Some("SAFETY"), true), "refusal");
         assert_eq!(anthropic_stop_reason(Some("length"), true), "max_tokens");
+        assert_eq!(
+            safe_error_message(&json!({"detail": {"message": "provider detail"}})),
+            "provider detail"
+        );
     }
 
     #[test]
@@ -4715,6 +5830,7 @@ mod tests {
             proxy_url: None,
             local_gemini: false,
             transport: ProviderTransport::Anthropic,
+            openai_capabilities: OpenAiCapabilities::default(),
             upstream_url: "https://example.invalid/v1/messages".to_string(),
             client: client.clone(),
         };
@@ -5000,6 +6116,7 @@ mod tests {
             proxy_url: None,
             local_gemini: false,
             transport: ProviderTransport::OpenAiChat,
+            openai_capabilities: OpenAiCapabilities::default(),
             upstream_url: "https://example.invalid/v1/chat/completions".to_string(),
             client,
         };
@@ -5072,6 +6189,7 @@ mod tests {
             proxy_url: None,
             local_gemini: false,
             transport: ProviderTransport::OpenAiChat,
+            openai_capabilities: OpenAiCapabilities::default(),
             upstream_url: "https://example.invalid/v1/chat/completions".to_string(),
             client,
         };

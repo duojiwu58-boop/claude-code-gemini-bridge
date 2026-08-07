@@ -1,0 +1,19 @@
+{
+  "name": "OpenAI-Compatible (Capability Overrides)",
+  "model": "<MODEL_ID>",
+  "base_url": "https://provider.example/v1",
+  "api_key": "<API_KEY>",
+  "capabilities": {
+    "stream_options": false,
+    "parallel_tool_calls": true,
+    "reasoning_effort": false,
+    "reasoning_fields": [
+      "reasoning_content",
+      "thinking"
+    ],
+    "thinking_tags": true,
+    "tool_result_media": "separate_user",
+    "tool_schema": "preserve",
+    "max_tokens_field": "max_completion_tokens"
+  }
+}

@@ -7,6 +7,36 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 
 ## English
 
+## [v0.3.0] - 2026-08-07
+
+### Near-Lossless OpenAI Semantic Core
+- Rebuilt the Claude Messages → OpenAI Chat Completions path around a provider-neutral semantic core. Provider behavior is now selected by response fields and explicit capabilities rather than model-name checks.
+- Added optional per-Provider capability overrides for `stream_options`, parallel-tool controls, `reasoning_effort`, reasoning response fields, `<think>` extraction, multimodal tool-result placement, tool-schema policy, and output-token field selection. Ordinary Providers still need only `model`, `base_url`, and `api_key`.
+- Exposed the effective capability policy through the local management API so the GUI and diagnostics can show the behavior actually in force.
+
+### Reasoning, Responses, and Streaming
+- Preserved reasoning from configurable `reasoning_content`-style fields in both streaming and non-streaming responses without model-name gating.
+- Added optional `<think>...</think>` extraction into Anthropic Thinking blocks, including opening and closing tags split across arbitrary SSE chunks. Extraction is limited to the start of answer content and can be disabled when literal tags must be preserved.
+- Added field-driven support for array-shaped text, standard `refusal`, legacy `function_call`, object-valued tool arguments, and both `prompt_tokens/completion_tokens` and `input_tokens/output_tokens` usage conventions.
+- Treats a stream ending without either `[DONE]` or `finish_reason` as an abnormal termination instead of falsely emitting `end_turn`.
+
+### Tools, Multimodal Results, and Schemas
+- Added conservative repair for common tool-argument JSON defects: raw control characters, trailing commas, and missing `}`/`]`. Unterminated strings are never guessed or executed.
+- Fixed streaming tool calls to emit the repaired, valid JSON in Anthropic `input_json_delta` events instead of validating the repair and then forwarding the malformed source fragment.
+- Standard OpenAI-compatible Providers now keep `role: tool.content` as a string and move attached images/PDFs into a following `role: user` message. The Gemini-specific route retains inline multimodal tool results.
+- Kept recursive JSON Schema sanitization enabled by default, including definitions, combinators, array items, and object-valued `additionalProperties`; full schemas can still be preserved explicitly.
+
+### Claude Code Reliability Contract
+- Maps HTTP `429` to `rate_limit_error`, `400/413` to `invalid_request_error`, `529` to `overloaded_error`, and authentication/permission/not-found statuses to their Anthropic equivalents.
+- Detects context-limit messages incorrectly wrapped by an upstream proxy as 5xx and normalizes them to `400 invalid_request_error`, restoring Claude Code retry and Auto-compact behavior.
+- Preserves existing Gemini thought-signature round trips and safety/refusal handling while applying the generic OpenAI core to Qwen/DashScope, DeepSeek, Kimi/Moonshot, Ollama, vLLM, LM Studio, SiliconFlow, and other compatible endpoints.
+- The native Codex Responses/GPT route remains deliberately unchanged; v0.3.0 improves Claude Code → OpenAI Chat Completions bridging only.
+
+### Documentation, Packaging, and Verification
+- Expanded the README and Provider guide with the two-layer architecture, capability matrix, proxy guidance, strict-endpoint fallbacks, compatibility boundaries, and a ready-to-copy capability override example.
+- 56 Rust unit tests passed, including cross-chunk thinking tags, strict multimodal tool results, repaired streamed arguments, abnormal EOF, error contracts, provider variants, and Gemini regression coverage.
+- Rust tests, strict Clippy checks, static-CRT release build, Delphi 11 GUI build, portable ZIP, Inno Setup installer, and SHA-256 manifests completed successfully.
+
 ## [v0.2.0] - 2026-08-07
 
 ### Native OpenAI Provider Configuration
@@ -62,6 +92,36 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 ---
 
 ## 中文
+
+## [v0.3.0] - 2026-08-07
+
+### 近乎无损的 OpenAI 语义核心
+- 将 Claude Messages → OpenAI Chat Completions 路径重构为供应商中立的语义核心；供应商行为由响应字段和显式能力配置决定，不再依赖模型名称判断。
+- 新增逐 Provider 可选能力覆盖，可控制 `stream_options`、并行工具参数、`reasoning_effort`、推理响应字段、`<think>` 提取、多模态工具结果位置、工具 Schema 策略和输出 Token 字段。普通 Provider 仍只需 `model`、`base_url`、`api_key`。
+- 本地管理 API 会返回实际生效的能力策略，GUI 和诊断工具因此能够展示真实运行行为。
+
+### 深度思考、响应与流式转换
+- 流式和非流式响应均可从配置的 `reasoning_content` 类字段保留推理内容，全程不依赖模型名称。
+- 支持将 `<think>...</think>` 提取为 Anthropic Thinking 块，开闭标签即使横跨任意 SSE Chunk 也能正确识别；仅在答案正文开头启用识别，也可以关闭以保留字面标签。
+- 字段驱动兼容数组型文本、标准 `refusal`、旧式 `function_call`、对象型工具参数，以及两套 OpenAI Usage Token 命名。
+- 流在既没有 `[DONE]`、也没有 `finish_reason` 时会被识别为异常中断，不再伪装成正常 `end_turn`。
+
+### 工具、多模态结果与 Schema
+- 对工具参数 JSON 增加保守修复：可处理原始控制字符、尾逗号和缺失的 `}`/`]`，但绝不猜测补全未闭合字符串或冒险执行工具。
+- 修复流式工具调用已通过 JSON 修复校验、却仍把原始畸形参数写入 Anthropic `input_json_delta` 的问题。
+- 普通 OpenAI 兼容 Provider 的 `role: tool.content` 始终保持字符串，图片/PDF 会移到随后的 `role: user` 消息；Gemini 专有线路继续保留工具结果内联多模态。
+- JSON Schema 默认继续递归清洗定义、组合器、数组项和对象型 `additionalProperties`；确认上游完整支持时仍可显式选择保留原 Schema。
+
+### Claude Code 稳定性契约
+- 将 HTTP `429` 映射为 `rate_limit_error`，`400/413` 映射为 `invalid_request_error`，`529` 映射为 `overloaded_error`，并保留认证、权限和资源不存在等 Anthropic 错误语义。
+- 能识别被上游代理错误包装成 5xx 的上下文超限信息，并规范化为 `400 invalid_request_error`，恢复 Claude Code 的退避重试与 Auto-compact 行为。
+- 在通用 OpenAI 核心覆盖 Qwen/百炼、DeepSeek、Kimi/Moonshot、Ollama、vLLM、LM Studio、SiliconFlow 等兼容端点的同时，继续保留 Gemini thought signature 往返与安全拒绝深度适配。
+- Codex 原生 Responses/GPT 路径保持不变；v0.3.0 只增强 Claude Code → OpenAI Chat Completions 桥接。
+
+### 文档、打包与验证
+- README 和 Provider 指南新增双层架构、能力矩阵、代理说明、严格端点降级策略、兼容边界及可直接复制的能力覆盖示例。
+- 56 项 Rust 单元测试全部通过，覆盖跨 Chunk Thinking 标签、严格多模态工具结果、修复后的流式参数、异常 EOF、错误契约、供应商变体和 Gemini 回归。
+- Rust 测试、严格 Clippy、静态 CRT Release、Delphi 11 GUI、便携 ZIP、Inno Setup 安装程序及 SHA-256 清单均构建验证成功。
 
 ## [v0.2.0] - 2026-08-07
 

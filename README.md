@@ -1,8 +1,8 @@
-# Claude Code ↔ Gemini Deep-Compatibility Bridge
+# Claude Code ↔ Multi-Model Bridge — OpenAI-Compatible, Gemini Deep-Compatible
 
-**A protocol-aware Rust bridge built specifically to make Gemini behave like a first-class Claude Code backend—not merely an OpenAI-shaped chat endpoint—with live model switching that does not require restarting VS Code or Claude Code.**
+**A protocol-aware Rust bridge that opens Claude Code to native OpenAI-compatible providers without reducing Gemini to a lowest-common-denominator chat endpoint. OpenAI compatibility provides breadth; capability-aware Gemini adaptation preserves depth.**
 
-**一个专门为 Claude Code 打造的协议级 Rust 本地桥接器与多模型路由器。它针对 Gemini 的思维链流式输出、工具调用状态机、思考签名（Thought Signature）、多模态工具结果、JSON Schema 严格校验与安全拦截等进行了深度适配；配合配套 GUI，无需重启 VS Code 或 Claude Code 即可随时免打扰热切换 Gemini、DeepSeek、Kimi、Claude 等模型。**
+**一个专门为 Claude Code 打造的协议级 Rust 本地桥接器与多模型路由器。它以原生 OpenAI Chat Completions 接口扩大模型接入范围，同时保留对 Gemini 思维链、工具调用状态机、思考签名（Thought Signature）、多模态工具结果、严格 Schema 与安全拦截的深度适配。OpenAI 兼容提供广度，能力感知适配保留深度。**
 
 ---
 
@@ -10,6 +10,36 @@
 
 *The bundled model center keeps Claude Code on one stable local endpoint while Gemini, DeepSeek, Kimi, Claude, Qwen, proxy settings, and other compatible profiles can be switched live. The next request uses the selected route—no VS Code reload or Claude Code restart required.*  
 *配套的模型中心 GUI 让 Claude Code 始终连接到固定的本地端点，双击即可在 Gemini、DeepSeek、Kimi、Claude、Qwen 以及代理设置之间即时热切换。下一个请求立即生效——无需重新加载 VS Code 或重启 Claude Code。*
+
+---
+
+## Two layers, one bridge / 双层兼容，一套桥接器
+
+This project does not make every model pretend to be Gemini, nor does it flatten Gemini into a generic OpenAI chat model. It separates **protocol compatibility** from **provider capability adaptation**.
+
+这个版本并不是让所有模型假装成 Gemini，也不是把 Gemini 降级成普通的 OpenAI 聊天模型。桥接器把**协议兼容**与**供应商能力适配**拆成两个协同工作的层次：
+
+| Layer / 层次 | Responsibility / 职责 | Result / 结果 |
+| --- | --- | --- |
+| **OpenAI-compatible core / OpenAI 兼容核心** | Translates Claude Code's Anthropic Messages workflow into valid OpenAI Chat Completions messages, streaming events, tools, schemas, images, and errors. / 将 Claude Code 的 Anthropic Messages 工作流转换为合法的 OpenAI 消息、流事件、工具、Schema、图片与错误语义。 | Any sufficiently complete OpenAI-compatible provider can become a real downstream model. / 任何接口较完整的 OpenAI 兼容模型都可以成为真实下游。 |
+| **Capability-aware extensions / 能力感知增强** | Recognizes extension fields and protocol behaviors actually returned by a provider. / 根据上游实际返回的扩展字段与协议行为启用增强。 | Gemini keeps thinking blocks, thought signatures, safety feedback, multimodal tool results, and stateful tool round trips. / Gemini 继续获得思考块、思考签名、安全反馈、多模态工具结果和有状态工具回合等深度适配。 |
+
+```text
+Claude Code (Anthropic Messages, Agent, MCP, tools)
+                         ↓
+        OpenAI-compatible protocol core
+                         ↓
+     Capability-aware progressive enhancement
+          ↙              ↓               ↘
+      Gemini          DeepSeek         Qwen / Kimi / others
+   + signatures      + reasoning       + available extensions
+```
+
+The enhancement layer is **field-driven, not model-name-driven**. For example, `reasoning_content` is translated whenever it is present; `extra_content.google.thought_signature` activates Gemini's signature round trip; and `promptFeedback.blockReason` activates Gemini-aware safety handling. A Gemini profile can therefore use its official OpenAI-compatible endpoint without losing the Gemini-specific behavior the bridge was originally built to preserve.
+
+增强层是**字段驱动，而不是模型名称关键词驱动**：响应中存在 `reasoning_content` 就转换为 Claude Code 的 Thinking 生命周期；存在 `extra_content.google.thought_signature` 就启用 Gemini 思考签名的跨轮次回传；存在 `promptFeedback.blockReason` 就启用 Gemini 安全拦截转换。因此，Gemini 可以直接使用官方 OpenAI 兼容端点，同时不会丢失本项目最初积累的深度适配能力。
+
+> **一句话理解：OpenAI 兼容决定“能不能接入”，能力感知适配决定“接入后能发挥到什么程度”。**
 
 ---
 
@@ -37,6 +67,8 @@ Gemini / DeepSeek / Kimi / Qwen / OpenRouter / 其他兼容模型
 - **切换无需重启：** 新增或修改 Provider 文件后，在模型中心点击刷新并切换，下一个请求立即走新模型。
 
 这里有一个重要边界：支持 OpenAI Chat Completions 并不代表所有普通聊天模型都能完整胜任 Claude Code。要获得可靠的 Coding Agent 体验，下游模型仍应正确支持流式输出、工具调用、结构化参数，并具备足够的上下文长度和代码能力。
+
+桥接器默认使用兼容面较广的能力策略。若某个端点不接受 `stream_options`、`reasoning_effort` 或 `max_tokens`，需要关闭 `<think>` 提取、允许工具结果内联媒体，或者支持无需清洗的完整 JSON Schema，可以在该 Provider 中增加可选的 `capabilities` 覆盖；普通配置仍然只需三个字段。桥接器还会保守修复常见工具参数 JSON，并将限流、上下文超限和过载状态还原为 Claude Code 可识别的重试/压缩契约。可覆盖项、默认值和故障诊断见 [Provider 配置指南](PROVIDER_CONFIG.md#近乎无损兼容与能力覆盖)。
 
 ### 三分钟添加一个 OpenAI Provider
 
@@ -117,7 +149,17 @@ Claude Code can now keep its agent, MCP, tool-use, and orchestration workflow wh
 > `"proxy": "http://127.0.0.1:8080"`, reload profiles, and confirm the GUI's
 > Proxy column before testing the route.
 
+> **Compatibility overrides:** the three-field configuration remains the
+> default. Providers with non-standard parameter support can optionally use a
+> `capabilities` object to disable unsupported `stream_options` or
+> `reasoning_effort`, select `max_completion_tokens`, preserve full tool
+> schemas, declare additional reasoning fields, disable `<think>` extraction,
+> or opt into inline media inside tool results. See the
+> [Provider guide](PROVIDER_CONFIG.md#近乎无损兼容与能力覆盖).
+
 ### Why this is different from a generic bridge
+
+A generic OpenAI route and deep Gemini compatibility are not competing designs in this project. The generic route is the stable protocol foundation; provider extensions are progressive enhancements applied only when their fields are present. This keeps ordinary OpenAI-compatible providers easy to configure while allowing Gemini—and any other provider exposing richer fields—to retain capabilities beyond the common denominator.
 
 A generic bridge often stops after mapping `messages`, `content`, and `tool_calls`. That is enough for a chat demo, but coding agents exercise a much larger protocol surface: interleaved thinking and text, streamed partial JSON, parallel tools, multimodal tool results, strict schemas, truncated generations, and provider-specific state that must survive a tool round trip.
 
@@ -125,12 +167,13 @@ This bridge handles those behaviors explicitly:
 
 | Compatibility surface | Common generic-bridge behavior | This project |
 | --- | --- | --- |
-| Streaming | Buffers the upstream response or assumes each network chunk is one SSE event | Calls Gemini with `stream: true`, incrementally decodes SSE across UTF-8 and network boundaries, and forwards Anthropic events as they become valid |
-| Extended thinking | Drops Gemini `reasoning_content` / `thinking` | Emits Anthropic `thinking` blocks and `thinking_delta` events, closes them before text or tools, and preserves thinking in non-streaming responses |
-| Tool arguments | Forwards incomplete JSON fragments directly | Accumulates streamed fragments, preserves parallel-call order, validates the completed JSON object, then emits a valid Anthropic `tool_use` block |
+| Streaming | Buffers the upstream response or assumes each network chunk is one SSE event | Calls the selected OpenAI-compatible Provider with `stream: true`, incrementally decodes SSE across UTF-8 and network boundaries, and forwards Anthropic events as they become valid |
+| Extended thinking | Drops provider reasoning fields or leaks `<think>` into answer text | Emits Anthropic `thinking` blocks from configured fields or leading `<think>` tags, including tags split across stream chunks; tag extraction can be disabled per Provider |
+| Tool arguments | Forwards incomplete or slightly malformed JSON fragments directly | Accumulates streamed fragments, preserves parallel-call order, validates the completed object, and conservatively repairs control characters, trailing commas, and missing container closers without guessing unfinished strings |
 | Gemini thought signatures | Loses `extra_content.google.thought_signature` after the first tool call | Caches signatures by tool-call ID and restores them on the next assistant/tool round trip, with bounded eviction |
 | Tool-result ordering | Preserves Claude block order even when Gemini requires tool results immediately after assistant tool calls | Emits `role: tool` results before remaining user text/images while preserving tool-call identity |
-| Multimodal tool results | Stringifies or drops image/document blocks | Converts base64 images and PDFs to Gemini-compatible `image_url` data URIs, including structured `tool_result` content |
+| Multimodal tool results | Sends an array as `role: tool` content and is rejected by strict OpenAI endpoints | Keeps standard tool content as a string and moves media to a following user message; Gemini can retain inline media |
+| Error contract | Collapses every upstream failure into a generic API error | Preserves rate-limit, invalid-request/context-limit, overload, authentication, and permission semantics so Claude Code can retry or compact correctly |
 | Tool schemas | Passes Anthropic JSON Schema through unchanged and receives Gemini HTTP 400 errors | Recursively removes unsupported `$schema`, `$id`, and `$comment`, traverses definitions/combinators/items, and infers `type: object` when `properties` is present |
 | Safety filtering | Crashes on an empty `choices` array | Converts Gemini `promptFeedback.blockReason` into a valid Anthropic `refusal` message with a readable reason |
 | Truncated tool calls | Executes malformed/empty arguments or reports the wrong stop reason | Maps cutoff responses to `max_tokens` and suppresses incomplete tool calls and uncached signatures |
@@ -203,8 +246,8 @@ Most users do **not** need Rust, Delphi, Inno Setup, or a local build environmen
 
 **[GitHub Releases — installer and portable ZIP](https://github.com/duojiwu58-boop/claude-code-gemini-bridge/releases/latest)**
 
-- **`ClaudeCodeBridge-0.2.0-Setup.exe` (recommended):** installs the native Windows service, model-switcher GUI, Start Menu shortcuts, automatic startup, recovery policy, configuration tools, and uninstaller.
-- **`ClaudeCodeBridge-0.2.0-windows-x64.zip`:** contains the same prebuilt service and GUI for portable/manual deployment. Extract it and run `Install.cmd` when service installation is desired.
+- **`ClaudeCodeBridge-0.3.0-Setup.exe` (recommended):** installs the native Windows service, model-switcher GUI, Start Menu shortcuts, automatic startup, recovery policy, configuration tools, and uninstaller.
+- **`ClaudeCodeBridge-0.3.0-windows-x64.zip`:** contains the same prebuilt service and GUI for portable/manual deployment. Extract it and run `Install.cmd` when service installation is desired.
 
 After installation, open **Claude Code 模型中心**, select or double-click a model, and the next Claude Code request uses it immediately—no VS Code reload or Claude Code restart is required.
 
@@ -241,6 +284,8 @@ cargo run --release
 ## 中文说明 (Chinese Version)
 
 ### 为什么它不同于普通 API 转发网关？
+
+本项目中的 OpenAI 通用路由与 Gemini 深度兼容并不冲突：通用路由是稳定的协议底座，供应商专有字段则作为渐进增强按实际能力启用。普通 OpenAI 兼容模型因此容易接入；Gemini 以及未来返回更丰富扩展字段的模型，也不会被压缩到“最低公分母”能力。
 
 市面上普通的转发网关通常仅做 `messages`、`content` 和 `tool_calls` 的基础字段改名。用于普通 Chat 演示这足够了，但像 Claude Code 这样的编程 Agent（Coding Agent）会频繁触发更复杂的协议边界：思维链与文本交错、流式 JSON 增量拼接、并行工具调用、多模态工具结果、严格的 Schema 校验、截断生成以及跨轮次工具调用的状态维护。
 
@@ -295,8 +340,8 @@ Claude Code 始终连接本地固定的 `http://127.0.0.1:18787`。双击配套�
 
 👉 **[前往 GitHub Releases 下载安装包与免安装 ZIP](https://github.com/duojiwu58-boop/claude-code-gemini-bridge/releases/latest)**
 
-- **`ClaudeCodeBridge-0.2.0-Setup.exe`（推荐）**：一键安装程序，注册 Windows 系统服务、配置开机自启、创建开始菜单快捷方式并附带 GUI 切换器。
-- **`ClaudeCodeBridge-0.2.0-windows-x64.zip`**：绿色免安装包，解压即用。
+- **`ClaudeCodeBridge-0.3.0-Setup.exe`（推荐）**：一键安装程序，注册 Windows 系统服务、配置开机自启、创建开始菜单快捷方式并附带 GUI 切换器。
+- **`ClaudeCodeBridge-0.3.0-windows-x64.zip`**：绿色免安装包，解压即用。
 
 ---
 

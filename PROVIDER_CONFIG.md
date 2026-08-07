@@ -60,7 +60,17 @@
   "identity": "模型对外说明的真实身份",
   "identity_override": true,
   "proxy": "http://127.0.0.1:8080",
-  "enabled": true
+  "enabled": true,
+  "capabilities": {
+    "stream_options": true,
+    "parallel_tool_calls": true,
+    "reasoning_effort": true,
+    "reasoning_fields": ["reasoning_content", "thinking"],
+    "thinking_tags": true,
+    "tool_result_media": "separate_user",
+    "tool_schema": "sanitize",
+    "max_tokens_field": "max_tokens"
+  }
 }
 ```
 
@@ -78,8 +88,69 @@
 - `identity_override`：可选，默认 `true`。设为 `false` 可关闭身份提示适配。
 - `proxy`：可选，仅用于这个 Provider；省略表示直连。
 - `enabled`：可选，默认 `true`。设为 `false` 后保留文件但不显示该配置。
+- `capabilities`：可选。仅在供应商的 OpenAI 兼容实现与默认行为不同时填写；
+  省略时使用下文列出的兼容默认值。
 
 同时兼容 JavaScript 风格的 `baseURL`、`apiKey` 和 `apiKeyEnv` 字段名。
+
+## 近乎无损兼容与能力覆盖
+
+桥接器的默认原则是：标准字段走通用 OpenAI 语义核心；扩展字段根据响应内容
+自动识别，而不是根据模型名称写死判断。例如，只要上游实际返回
+`reasoning_content` 或 `thinking`，桥接器就会生成 Claude Code 的 Thinking
+生命周期；`extra_content.google.thought_signature` 和
+`promptFeedback.blockReason` 也分别触发 Gemini 的签名回传与安全拦截转换。
+
+对于接口较完整的 Provider，仍然只需要最小的三个配置字段。只有供应商拒绝某个
+可选参数、使用不同字段名，或者支持更完整的 Schema 时，才增加
+`capabilities`：
+
+| 能力字段 | 默认值 | 用途 |
+| --- | --- | --- |
+| `stream_options` | `true` | 流式请求发送 `stream_options.include_usage`；不支持该参数的端点设为 `false` |
+| `parallel_tool_calls` | `true` | 允许发送 `parallel_tool_calls` 控制；端点不认识该字段时设为 `false` |
+| `reasoning_effort` | `true` | 将 Claude Thinking 预算映射为 `reasoning_effort`；端点拒绝该参数时设为 `false` |
+| `reasoning_fields` | `["reasoning_content", "thinking"]` | 响应中按顺序识别的推理文本字段；可以填写一个字符串或字符串数组，空数组表示不提取推理文本 |
+| `thinking_tags` | `true` | 将正文开头的 `<think>...</think>` 提取为 Thinking 块，并支持标签跨流式 Chunk；若模型需要原样输出该标签则设为 `false` |
+| `tool_result_media` | `separate_user` | 保持 `role: tool` 的 `content` 为字符串，并将图片/PDF 移至后一条 `user` 消息；仅对明确支持工具消息内联媒体的端点使用 `inline` |
+| `tool_schema` | `sanitize` | `sanitize` 清理常见不兼容元数据；确认端点支持完整 JSON Schema 时使用 `preserve` |
+| `max_tokens_field` | `max_tokens` | 可选值为 `max_tokens`、`max_completion_tokens` 或 `omit` |
+
+例如，一个拒绝 `stream_options` 和 `reasoning_effort`、要求
+`max_completion_tokens`，但支持完整 JSON Schema 的端点可以这样配置：
+
+```json
+{
+  "model": "provider-model-id",
+  "base_url": "https://provider.example/v1",
+  "api_key": "sk-...",
+  "capabilities": {
+    "stream_options": false,
+    "reasoning_effort": false,
+    "thinking_tags": true,
+    "tool_result_media": "separate_user",
+    "tool_schema": "preserve",
+    "max_tokens_field": "max_completion_tokens"
+  }
+}
+```
+
+能力覆盖会随 Provider 热刷新，并通过本地管理 API 返回给 GUI。字段类型或枚举值
+错误时，刷新会明确报错，不会静默回退。桥接器还兼容对象型工具参数、旧式
+`function_call`、标准 `refusal`、数组型文本内容，以及
+`prompt_tokens/completion_tokens` 和 `input_tokens/output_tokens` 两套 Usage
+命名。工具调用参数在标准 JSON 解析失败后只进行保守修复：未转义控制字符、闭合
+容器前的尾逗号和缺失的 `}`/`]` 可以修复，未闭合字符串不会被猜测补全。
+
+上游错误会映射回 Claude Code 所依赖的 Anthropic 契约：`429` 为
+`rate_limit_error`，`400/413` 为 `invalid_request_error`，`529` 为
+`overloaded_error`；上下文超限若被代理错误包装成 5xx，也会规范化为
+`400 invalid_request_error`。没有 `[DONE]` 且没有 `finish_reason` 的流式 EOF
+会作为异常流结束，不会伪装为正常 `end_turn`。
+
+“近乎无损”指桥接器不会静默丢弃已支持的语义；它不能补出上游接口本身没有的
+能力。如果一个标称 OpenAI 兼容的模型不支持工具调用、流式参数或多模态输入，
+应通过能力覆盖关闭不兼容请求字段，或者选择能力更完整的模型。
 
 ## 常见供应商示例
 
@@ -90,6 +161,7 @@
 - `kimi.example.json`：Kimi / Moonshot
 - `gemini.example.json`：Google Gemini 的 OpenAI 兼容接口
 - `custom-openai.example.json`：其他 OpenAI 兼容网关
+- `capability-overrides.example.json`：仅供需要覆盖可选参数或字段的兼容端点使用
 
 使用方法：复制所需模板到 `%USERPROFILE%\.claude\bridge-providers\`，去掉
 文件名中的 `.example`，然后填写真实 Key 和官网当前模型 ID。
