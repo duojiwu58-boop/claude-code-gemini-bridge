@@ -1,8 +1,8 @@
-# Claude Code ↔ Multi-Model Bridge — OpenAI-Compatible, Gemini Deep-Compatible
+# Claude Code ↔ Multi-Model Bridge — Native Gemini Interactions + OpenAI Compatibility
 
-**A protocol-aware Rust bridge that opens Claude Code to native OpenAI-compatible providers without reducing Gemini to a lowest-common-denominator chat endpoint. OpenAI compatibility provides breadth; capability-aware Gemini adaptation preserves depth.**
+**A protocol-aware Rust bridge with two first-class downstream paths: Google's native stateful Gemini Interactions API for maximum Gemini capability, and OpenAI-compatible Chat Completions for broad multi-model access.**
 
-**一个专门为 Claude Code 打造的协议级 Rust 本地桥接器与多模型路由器。它以原生 OpenAI Chat Completions 接口扩大模型接入范围，同时保留对 Gemini 思维链、工具调用状态机、思考签名（Thought Signature）、多模态工具结果、严格 Schema 与安全拦截的深度适配。OpenAI 兼容提供广度，能力感知适配保留深度。**
+**一个专门为 Claude Code 打造的协议级 Rust 本地桥接器与多模型路由器。它同时提供两条一级下游路径：Google 原生有状态 Gemini Interactions API 发挥 Gemini 的完整能力，OpenAI-compatible Chat Completions 则提供广泛的多模型接入。**
 
 ---
 
@@ -13,50 +13,20 @@
 
 ---
 
-## Two layers, one bridge / 双层兼容，一套桥接器
-
-This project does not make every model pretend to be Gemini, nor does it flatten Gemini into a generic OpenAI chat model. It separates **protocol compatibility** from **provider capability adaptation**.
-
-这个版本并不是让所有模型假装成 Gemini，也不是把 Gemini 降级成普通的 OpenAI 聊天模型。桥接器把**协议兼容**与**供应商能力适配**拆成两个协同工作的层次：
-
-| Layer / 层次 | Responsibility / 职责 | Result / 结果 |
-| --- | --- | --- |
-| **OpenAI-compatible core / OpenAI 兼容核心** | Translates Claude Code's Anthropic Messages workflow into valid OpenAI Chat Completions messages, streaming events, tools, schemas, images, and errors. / 将 Claude Code 的 Anthropic Messages 工作流转换为合法的 OpenAI 消息、流事件、工具、Schema、图片与错误语义。 | Any sufficiently complete OpenAI-compatible provider can become a real downstream model. / 任何接口较完整的 OpenAI 兼容模型都可以成为真实下游。 |
-| **Capability-aware extensions / 能力感知增强** | Recognizes extension fields and protocol behaviors actually returned by a provider. / 根据上游实际返回的扩展字段与协议行为启用增强。 | Gemini keeps thinking blocks, thought signatures, safety feedback, multimodal tool results, and stateful tool round trips. / Gemini 继续获得思考块、思考签名、安全反馈、多模态工具结果和有状态工具回合等深度适配。 |
-
-```text
-Claude Code (Anthropic Messages, Agent, MCP, tools)
-                         ↓
-        OpenAI-compatible protocol core
-                         ↓
-     Capability-aware progressive enhancement
-          ↙              ↓               ↘
-      Gemini          DeepSeek         Qwen / Kimi / others
-   + signatures      + reasoning       + available extensions
-```
-
-The enhancement layer is **field-driven, not model-name-driven**. For example, `reasoning_content` is translated whenever it is present; `extra_content.google.thought_signature` activates Gemini's signature round trip; and `promptFeedback.blockReason` activates Gemini-aware safety handling. A Gemini profile can therefore use its official OpenAI-compatible endpoint without losing the Gemini-specific behavior the bridge was originally built to preserve.
-
-增强层是**字段驱动，而不是模型名称关键词驱动**：响应中存在 `reasoning_content` 就转换为 Claude Code 的 Thinking 生命周期；存在 `extra_content.google.thought_signature` 就启用 Gemini 思考签名的跨轮次回传；存在 `promptFeedback.blockReason` 就启用 Gemini 安全拦截转换。因此，Gemini 可以直接使用官方 OpenAI 兼容端点，同时不会丢失本项目最初积累的深度适配能力。
-
-> **一句话理解：OpenAI 兼容决定“能不能接入”，能力感知适配决定“接入后能发挥到什么程度”。**
-
-### Gemini maximum-capability path: native stateful Interactions
+## v0.5.0 major upgrade: native stateful Gemini Interactions / v0.5.0 重大升级：Gemini 原生有状态 Interactions
 
 For Gemini 3.6 Flash, the recommended route is now `protocol: "gemini-interactions"`.
-It calls Google's native `/v1beta/interactions` endpoint with `store: true`, streams
-the current `step.*` event protocol, and continues exact branches through
-`previous_interaction_id`. Google therefore owns the preceding thought/signature
-state instead of requiring the bridge to reconstruct it through an OpenAI-compatible
-chat history.
+This is an independent native transport—not an OpenAI Chat compatibility wrapper. It calls
+Google's `/v1beta/interactions` endpoint with `store: true`, consumes the current `step.*`
+event protocol, and continues exact conversation branches through `previous_interaction_id`.
+Google owns the preceding thought/signature state instead of requiring the bridge to reconstruct
+it through an OpenAI-compatible chat history.
 
-The bridge indexes tool continuations by Google's opaque call ID and ordinary turns
-by a SHA-256 fingerprint of the provider, system prompt, and complete message prefix.
-Only an exact match uses delta-only continuation; edited history, cache eviction, or a
-service restart falls back to full `steps`. The profile can also combine Claude Code's
-client-side tools with Google's server-side `google_search`, `url_context`, and
-`code_execution` tools. This mode deliberately stores request/response state at Google;
-use the OpenAI profile instead if server-side retention is unacceptable.
+The bridge indexes tool continuations by Google's opaque call ID and ordinary turns by a SHA-256
+fingerprint of the provider, system prompt, and complete message prefix. Only an exact match uses
+delta-only continuation; edited history, cache eviction, or a service restart safely falls back to
+full `steps`. Claude Code's client-side tools can coexist with Google's server-side `google_search`,
+`url_context`, and `code_execution` tools.
 
 ```json
 {
@@ -73,11 +43,52 @@ use the OpenAI profile instead if server-side retention is unacceptable.
 }
 ```
 
-对 Gemini 3.6 Flash，当前推荐使用 `gemini-interactions` 原生有状态通道。桥接器
-固定发送 `store: true`，按精确会话分支续传 `previous_interaction_id`，并将新的
-`thought`、`model_output`、`function_call` 与 `step.delta` 流转换为 Claude Code
-需要的 Anthropic 内容块。Google 负责保存历史思考与签名；这比在 OpenAI Chat
-历史中重放签名更可靠，但也意味着请求/响应状态会保存在 Google 服务端。
+对 Gemini 3.6 Flash，当前推荐使用独立的 `gemini-interactions` 原生有状态通道，而不是
+OpenAI Chat 兼容包装。桥接器固定发送 `store: true`，按精确会话分支续传
+`previous_interaction_id`，并将 `thought`、`model_output`、`function_call` 与
+`step.delta` 流转换为 Claude Code 所需的 Anthropic 生命周期。Google 负责保存历史思考
+与签名；这比在 OpenAI Chat 历史中重放签名更可靠，但也意味着请求/响应状态会保存在
+Google 服务端。如果不能接受服务端状态保留，请继续使用 OpenAI-compatible Gemini profile。
+
+## Two first-class transport paths, one semantic bridge / 两条一级传输路径，一套语义桥接器
+
+This project does not make every model pretend to be Gemini, nor does it flatten Gemini into a
+generic OpenAI chat model. The bridge gives native Gemini Interactions and OpenAI-compatible Chat
+equal architectural status, then applies the semantic adaptation required by each provider.
+
+项目既不让所有模型假装成 Gemini，也不把 Gemini 降级成普通 OpenAI 聊天模型。桥接器将
+Gemini 原生 Interactions 与 OpenAI-compatible Chat 作为两条同级传输路径，再分别完成供应商
+所需的语义适配。
+
+| Transport path / 传输路径 | Responsibility / 职责 | Result / 结果 |
+| --- | --- | --- |
+| **Native Gemini Interactions / Gemini 原生 Interactions** | Calls `/v1beta/interactions`, translates `step.*` streams, and preserves Google-owned conversation state and exact-branch continuation. / 调用 `/v1beta/interactions`、转换 `step.*` 流，并保留 Google 管理的会话状态与精确分支续接。 | Gemini keeps native thoughts, signatures, stateful tools, multimodal steps, and optional Google server-side tools. / Gemini 保留原生思考、签名、有状态工具、多模态步骤及可选 Google 服务端工具。 |
+| **OpenAI-compatible Chat / OpenAI 兼容 Chat** | Translates Claude Code's Anthropic Messages workflow into valid Chat Completions messages, streams, tools, schemas, images, and errors. / 将 Claude Code 的 Anthropic Messages 工作流转换为合法的 Chat Completions 消息、流、工具、Schema、图片与错误语义。 | DeepSeek, Qwen, Kimi, Gemini fallback profiles, and other sufficiently complete compatible providers become real downstream models. / DeepSeek、Qwen、Kimi、Gemini 回退 profile 及其他接口较完整的兼容供应商都可成为真实下游。 |
+
+```text
+Claude Code (Anthropic Messages, Agent, MCP, tools)
+                              ↓
+                Semantic compatibility runtime
+                    ↙                       ↘
+   Native Gemini Interactions          OpenAI-compatible Chat
+      /v1beta/interactions                /chat/completions
+     stateful step protocol            portable chat protocol
+                ↓                               ↓
+          Gemini 3.6 Flash        DeepSeek / Qwen / Kimi / Gemini fallback / others
+```
+
+Across both paths, provider enhancements are **field-driven, not model-name-driven**. On the
+OpenAI-compatible path, `reasoning_content`, `extra_content.google.thought_signature`, and
+`promptFeedback.blockReason` activate their corresponding Claude Code semantics whenever present.
+On the native path, the Interactions `step.*` protocol and stored interaction state provide those
+lifecycles directly.
+
+两条路径上的供应商增强都遵循**字段驱动，而不是模型名称关键词驱动**。OpenAI-compatible
+路径会按实际存在的 `reasoning_content`、`extra_content.google.thought_signature` 和
+`promptFeedback.blockReason` 启用相应语义；原生路径则直接通过 Interactions 的 `step.*`
+协议与已保存 interaction 状态承载这些生命周期。
+
+> **一句话理解：Gemini Interactions 提供原生深度，OpenAI compatibility 提供模型广度，语义桥接器保证 Claude Code 在两条路径上都能继续完成 Agent 与工具生命周期。**
 
 ## Not a proxy: a semantic compatibility runtime / 不只是代理，而是语义兼容运行时
 
@@ -90,18 +101,26 @@ Most API bridges are symmetrical field converters: rename a request, forward it,
 ```text
 Claude Code request
   → decode Anthropic intent (messages / tools / thinking / media)
-  → encode provider-neutral OpenAI Chat Completions request
+  → select a first-class downstream transport
+      ├─ native Gemini Interactions (`/v1beta/interactions`)
+      └─ OpenAI-compatible Chat (`/chat/completions`)
   → selected downstream model generates the real answer
-  → observe fields and declared capabilities, never guess by model name
+  → translate native steps or observe compatible fields and declared capabilities
   → rehydrate Anthropic blocks / SSE events / tool state / error contracts
   → Claude Code UI and agent loop continue normally
 
-Side state: Gemini thought signatures survive the tool round trip
+Side state: Google retains native interaction state; compatible transports preserve
+provider signatures locally when a round trip requires them
 ```
 
-这是一种**非对称翻译**：请求侧寻找不同协议的公共语义，响应侧则尽可能恢复 Claude Code 需要的丰富行为。供应商扩展不是硬编码成某个模型名称分支，而是由 `reasoning_content`、`extra_content.google.thought_signature`、`promptFeedback.blockReason` 等真实字段，以及 Provider 的 `capabilities` 配置触发。
+这是一种**非对称翻译**：请求侧先提取不同协议的公共语义，再选择原生 Gemini Interactions
+或 OpenAI-compatible Chat；响应侧则尽可能恢复 Claude Code 需要的丰富行为。原生路径按
+`step.*` 生命周期转换，兼容路径的增强则由真实响应字段与 Provider 的 `capabilities` 配置触发。
 
-It is an **asymmetric translation**: the request side targets the common semantic surface, while the response side reconstructs the richer behavior Claude Code expects. Provider extensions are activated by observed fields and explicit capabilities—not by pretending every model is Claude, Gemini, or any other named model.
+It is an **asymmetric translation**: the request side extracts a common semantic intent and then
+selects native Gemini Interactions or OpenAI-compatible Chat, while the response side reconstructs
+the richer behavior Claude Code expects. Native steps, observed compatible fields, and explicit
+capabilities—not model-name guesses—activate provider-specific behavior.
 
 | Design question / 设计问题 | Ordinary field bridge / 普通字段桥 | This project / 本项目 |
 | --- | --- | --- |
@@ -110,7 +129,7 @@ It is an **asymmetric translation**: the request side targets the common semanti
 | How are extensions selected? / 如何启用增强 | Model-name branches / 模型名称分支 | Response fields + Provider capabilities / 响应字段 + Provider 能力配置 |
 | What happens to tools? / 工具如何处理 | Rename `tool_calls` and hope / 改名后直接透传 | Accumulate streams, validate/repair JSON, preserve ordering and round-trip state / 聚合流、校验修复 JSON、保持顺序与跨轮状态 |
 | What happens on errors? / 错误如何处理 | Collapse everything into a generic failure / 全部变成通用错误 | Restore retry, overload, context-limit, refusal, and abnormal-EOF semantics / 恢复重试、过载、上下文超限、拒绝与异常断流语义 |
-| How is provider depth preserved? / 如何保留供应商深度 | Reduce every provider to the lowest common denominator / 全部降到最小公分母 | Keep the common OpenAI core, then progressively restore supported extensions / 先走通用核心，再渐进恢复已支持扩展 |
+| How is provider depth preserved? / 如何保留供应商深度 | Reduce every provider to the lowest common denominator / 全部降到最小公分母 | Use a first-class native transport when available; otherwise restore extensions from observed fields and capabilities / 有原生 transport 时直接使用；否则根据真实字段与能力配置恢复扩展 |
 
 Here, **near-lossless does not mean byte-for-byte passthrough**. It means preserving every representable intent and behavior across two different protocols, refusing to invent unsafe semantics, and making any unavoidable downgrade explicit. If an upstream model lacks tools, vision, reasoning fields, or enough context, the bridge cannot manufacture those capabilities—but it should not silently discard capabilities the provider actually has.
 
