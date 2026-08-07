@@ -7,7 +7,7 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 
 ## English
 
-## [Unreleased]
+## [v0.5.0] - 2026-08-08
 
 ### Gemini Interactions Compatibility and Native Tools
 - Replaced local estimation on `/v1/messages/count_tokens` with Google's native `models.countTokens` for `gemini-interactions` profiles. The request includes the translated prompt, system instruction, custom function declarations, structured-output schema, and supported media; bounded upstream failures fall back to the local estimate and expose the count source through `x-claude-bridge-token-count`.
@@ -17,8 +17,6 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 - Added one-shot compatibility fallbacks for two upstream gaps: mixed Google server tools plus Claude Code function tools retry with function tools only after the known 400 rejection, and unsupported `previous_interaction_id` requests retry with safe full-history recovery after HTTP 501.
 - Added native `google_maps` configuration and File Search through `gemini_file_search_store_names`. Documented the current reachable modality and safety boundaries for audio/video, Computer Use, and remote MCP Server tools.
 - Expanded regression coverage to 98 Rust tests, including native token-count endpoint verification, request-semantic mappings, explicit diagnostics, both compatibility fallback paths, and server-tool metadata/usage translation.
-
-## [v0.5.0] - 2026-08-08
 
 ### Native Stateful Gemini Interactions
 - Added the independent `gemini-interactions` transport for Google's native `/v1beta/interactions` API, using `x-goog-api-key` authentication and `store: true`. The existing OpenAI Chat-compatible Gemini route remains available as a fallback.
@@ -43,7 +41,7 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 - Live Windows-service verification generated valid 1K and 2K JPEG images, returned MCP previews, and confirmed writes by `NT SERVICE\ClaudeCodeBridge` to the current user's Pictures directory.
 
 ### Release Verification
-- Final `v0.5.0` verification reran all 89 Rust tests, `rustfmt`, and strict Clippy successfully.
+- Final refreshed `v0.5.0` verification passed all 98 Rust tests, `rustfmt`, strict Clippy, the static-CRT release build, portable ZIP, Inno Setup installer, and SHA-256 manifest verification.
 - Delphi 11 Release GUI compiled as `0.5.0.0` with 0 warnings and 0 errors.
 - The static-CRT bridge, portable ZIP, Inno Setup installer, and SHA-256 manifest were rebuilt and verified successfully.
 
@@ -203,7 +201,7 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 
 ## 中文
 
-## [未发布]
+## [v0.5.0] - 2026-08-08
 
 ### Gemini Interactions 兼容性与原生工具
 - `gemini-interactions` profile 的 `/v1/messages/count_tokens` 已由本地估算改为调用 Google 原生 `models.countTokens`，请求包含转换后的提示、系统指令、自定义函数声明、结构化输出 schema 和受支持媒体；受限的上游失败会回退到本地估算，并通过 `x-claude-bridge-token-count` 标明计数来源。
@@ -213,8 +211,6 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 - 针对两个上游缺口增加单次兼容降级：混合 Google 服务端工具与 Claude Code 函数工具遇到已知 400 时仅用函数工具重试；`previous_interaction_id` 遇到 HTTP 501 时使用安全完整历史恢复重试。
 - 新增原生 `google_maps` 配置，以及通过 `gemini_file_search_store_names` 配置 File Search；同时明确音频/视频、Computer Use 与远程 MCP Server 工具当前可达性和安全边界。
 - Rust 回归测试扩充至 98 项，包括 Google 原生 token count 端点验证、请求语义映射、明确诊断、两条兼容降级路径及服务端工具元数据/usage 转换。
-
-## [v0.5.0] - 2026-08-08
 
 ### Gemini 原生有状态 Interactions
 - 新增独立的 `gemini-interactions` transport，直接调用 Google 原生 `/v1beta/interactions` API，使用 `x-goog-api-key` 鉴权并固定启用 `store: true`；原有 OpenAI Chat 兼容路径继续作为回退方案保留。
@@ -239,7 +235,7 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 - Windows 服务真实生成 1K、2K JPEG 图片并正确返回 MCP 预览，确认 `NT SERVICE\ClaudeCodeBridge` 可以写入当前用户的“图片”目录。
 
 ### 发布验证
-- `v0.5.0` 最终验证重新运行全部 89 项 Rust 测试、`rustfmt` 与严格 Clippy，均成功通过。
+- 刷新后的 `v0.5.0` 最终验证通过全部 98 项 Rust 测试、`rustfmt`、严格 Clippy、静态 CRT Release 构建、便携 ZIP、Inno Setup 安装程序及 SHA-256 清单校验。
 - Delphi 11 Release GUI 以 `0.5.0.0` 编译通过，0 警告、0 错误。
 - 静态 CRT bridge、便携 ZIP、Inno Setup 安装程序及 SHA-256 清单均已重新构建并验证成功。
 
