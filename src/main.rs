@@ -4518,6 +4518,72 @@ mod tests {
     }
 
     #[test]
+    fn streams_thinking_regardless_of_model_name() {
+        let signatures = Arc::new(RwLock::new(IndexMap::new()));
+        let mut translator = AnthropicStreamTranslator::new("deepseek-chat".to_string(), signatures, 0);
+
+        let thinking_events = translator
+            .process_payload(
+                r#"{"choices":[{"delta":{"reasoning_content":"Reasoning step"},"finish_reason":null}]}"#,
+            )
+            .unwrap();
+        let debug = format!("{thinking_events:?}");
+        assert!(debug.contains("thinking_delta"));
+        assert!(debug.contains("Reasoning step"));
+        assert_eq!(translator.thinking_block_index, Some(0));
+    }
+
+    #[test]
+    fn translates_gemini_response_fields_without_model_name_gating() {
+        let upstream = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "reasoning_content": "Deep reasoning",
+                    "content": "Result",
+                    "tool_calls": [{
+                        "id": "call_g",
+                        "type": "function",
+                        "function": {"name": "shell", "arguments": "{\"cmd\":\"dir\"}"},
+                        "extra_content": {
+                            "google": {"thought_signature": "sig-from-field"}
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let signatures = RwLock::new(IndexMap::new());
+        // A Claude-named model must not change field-driven translation.
+        let message =
+            translate_anthropic_response(&upstream, "claude-sonnet-4-5", &signatures).unwrap();
+        assert_eq!(message["content"][0]["type"], "thinking");
+        assert_eq!(message["content"][1]["type"], "text");
+        assert_eq!(message["content"][2]["type"], "tool_use");
+        assert_eq!(
+            signatures
+                .read()
+                .unwrap()
+                .get("call_g")
+                .map(String::as_str),
+            Some("sig-from-field")
+        );
+    }
+
+    #[test]
+    fn turns_prompt_feedback_into_refusal_without_model_name_gating() {
+        let upstream = json!({
+            "promptFeedback": {"blockReason": "SAFETY"},
+            "choices": []
+        });
+        let signatures = RwLock::new(IndexMap::new());
+        // The blockReason field identifies Gemini; the model name is irrelevant.
+        let message = translate_anthropic_response(&upstream, "gpt-5.2", &signatures).unwrap();
+        assert_eq!(message["stop_reason"], "refusal");
+        assert_eq!(message["content"][0]["type"], "text");
+    }
+
+    #[test]
     fn aggregates_streamed_tool_call_and_preserves_signature() {
         let signatures = Arc::new(RwLock::new(IndexMap::new()));
         let mut translator =
