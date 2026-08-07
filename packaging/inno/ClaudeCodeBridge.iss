@@ -61,7 +61,7 @@ Name: "{commondesktop}\Claude Code 模型切换器"; Filename: "{app}\ClaudeBrid
 Filename: "{app}\ClaudeBridgeManager.exe"; Description: "启动模型切换器"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [UninstallRun]
-Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\uninstall.ps1"" -KeepProgramFiles"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveClaudeCodeBridgeService"
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\uninstall.ps1"" -KeepProgramFiles"; Flags: runhidden waituntilterminated
 
 [Code]
 var

@@ -30,7 +30,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use futures_util::{stream, StreamExt};
+use futures_util::{stream, Stream, StreamExt};
 use indexmap::IndexMap;
 use reqwest::{Client, Proxy};
 use serde_json::{json, Map, Value};
@@ -47,6 +47,7 @@ const VISION_PROXY_TIMEOUT: Duration = Duration::from_secs(90);
 const VISION_MAX_OUTPUT_TOKENS: u64 = 4096;
 const MAX_VISION_CONTEXT_CHARS: usize = 12_000;
 const MAX_VISION_OBSERVATION_CHARS: usize = 16_000;
+const MAX_UPSTREAM_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_UPSTREAM_SSE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const UPSTREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -1261,6 +1262,39 @@ fn build_gemini_client(
         .map_err(|err| format!("Cannot create Gemini HTTP client: {err}"))
 }
 
+async fn read_response_bytes_limited(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(format!("Upstream response body exceeds {limit} bytes"));
+    }
+
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|err| format!("Cannot read upstream response body: {err}"))?;
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err(format!("Upstream response body exceeds {limit} bytes"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+async fn read_response_text_limited(response: reqwest::Response) -> Result<String, String> {
+    let body = read_response_bytes_limited(response, MAX_UPSTREAM_RESPONSE_BYTES).await?;
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+async fn read_response_json_limited(response: reqwest::Response) -> Result<Value, String> {
+    let body = read_response_bytes_limited(response, MAX_UPSTREAM_RESPONSE_BYTES).await?;
+    serde_json::from_slice(&body).map_err(|err| format!("Invalid JSON in upstream response: {err}"))
+}
+
 fn provider_config_stamp(providers_dir: &Path, legacy_settings_dir: &Path) -> String {
     let mut paths = Vec::new();
     if let Ok(entries) = fs::read_dir(providers_dir) {
@@ -1701,20 +1735,41 @@ fn parse_vision_observation(transport: ProviderTransport, body: &Value) -> Strin
 async fn send_vision_request(
     request: reqwest::RequestBuilder,
     source: &ProviderProfile,
-) -> Result<reqwest::Response, VisionProxyError> {
-    match tokio::time::timeout(VISION_PROXY_TIMEOUT, request.send()).await {
-        Ok(Ok(response)) => Ok(response),
-        Ok(Err(err)) => Err(VisionProxyError::gateway(format!(
-            "Vision provider '{}' request failed: {err}",
-            source.file_name
-        ))),
+) -> Result<(reqwest::StatusCode, String), VisionProxyError> {
+    send_vision_request_with_timeout(request, source, VISION_PROXY_TIMEOUT).await
+}
+
+async fn send_vision_request_with_timeout(
+    request: reqwest::RequestBuilder,
+    source: &ProviderProfile,
+    timeout: Duration,
+) -> Result<(reqwest::StatusCode, String), VisionProxyError> {
+    let operation = async {
+        let response = request.send().await.map_err(|err| {
+            VisionProxyError::gateway(format!(
+                "Vision provider '{}' request failed: {err}",
+                source.file_name
+            ))
+        })?;
+        let status = response.status();
+        let body = read_response_text_limited(response).await.map_err(|err| {
+            VisionProxyError::gateway(format!(
+                "Cannot read vision provider '{}' response: {err}",
+                source.file_name
+            ))
+        })?;
+        Ok((status, body))
+    };
+
+    match tokio::time::timeout(timeout, operation).await {
+        Ok(result) => result,
         Err(_) => Err(VisionProxyError {
             status: StatusCode::GATEWAY_TIMEOUT,
             error_type: "api_error",
             message: format!(
                 "Vision provider '{}' timed out after {} seconds",
                 source.file_name,
-                VISION_PROXY_TIMEOUT.as_secs()
+                timeout.as_secs_f64()
             ),
         }),
     }
@@ -1733,7 +1788,7 @@ async fn analyze_vision_job(
         }
     }
 
-    let response = match source.transport {
+    let (status, response_body) = match source.transport {
         ProviderTransport::LocalGemini => {
             let api_key = state.fallback_api_key.as_deref().ok_or_else(|| {
                 VisionProxyError::gateway(
@@ -1785,13 +1840,6 @@ async fn analyze_vision_job(
         }
     };
 
-    let status = response.status();
-    let response_body = response.text().await.map_err(|err| {
-        VisionProxyError::gateway(format!(
-            "Cannot read vision provider '{}' response: {err}",
-            source.file_name
-        ))
-    })?;
     if !status.is_success() {
         let upstream_status = status.as_u16();
         let message = serde_json::from_str::<Value>(&response_body)
@@ -2269,7 +2317,9 @@ async fn admin_test_gemini_proxy(
         }
     };
     let status = upstream.status();
-    let body = upstream.json::<Value>().await.unwrap_or_else(|_| json!({}));
+    let body = read_response_json_limited(upstream)
+        .await
+        .unwrap_or_else(|_| json!({}));
     if !status.is_success() {
         return (
             StatusCode::BAD_GATEWAY,
@@ -2386,13 +2436,13 @@ async fn responses(
     };
 
     let status = upstream.status();
-    let upstream_body = match upstream.json::<Value>().await {
+    let upstream_body = match read_response_json_limited(upstream).await {
         Ok(value) => value,
         Err(err) => {
-            error!("Gemini returned a non-JSON response: {err}");
+            error!("Gemini returned an invalid or oversized JSON response: {err}");
             return (
                 StatusCode::BAD_GATEWAY,
-                Json(json!({"error": {"code": "server_error", "message": "Gemini returned a non-JSON response"}})),
+                Json(json!({"error": {"code": "server_error", "message": "Gemini returned an invalid or oversized JSON response"}})),
             )
                 .into_response();
         }
@@ -2525,14 +2575,14 @@ async fn anthropic_messages(
 
     let status = upstream.status();
     if !status.is_success() {
-        let upstream_body = match upstream.json::<Value>().await {
+        let upstream_body = match read_response_json_limited(upstream).await {
             Ok(value) => value,
             Err(err) => {
-                error!("Gemini returned a non-JSON error response: {err}");
+                error!("Gemini returned an invalid or oversized JSON error response: {err}");
                 return anthropic_error(
                     StatusCode::BAD_GATEWAY,
                     "api_error",
-                    "Gemini returned a non-JSON error response",
+                    "Gemini returned an invalid or oversized JSON error response",
                 );
             }
         };
@@ -2561,14 +2611,14 @@ async fn anthropic_messages(
         );
     }
 
-    let upstream_body = match upstream.json::<Value>().await {
+    let upstream_body = match read_response_json_limited(upstream).await {
         Ok(value) => value,
         Err(err) => {
-            error!("Gemini returned a non-JSON response: {err}");
+            error!("Gemini returned an invalid or oversized JSON response: {err}");
             return anthropic_error(
                 StatusCode::BAD_GATEWAY,
                 "api_error",
-                "Gemini returned a non-JSON response",
+                "Gemini returned an invalid or oversized JSON response",
             );
         }
     };
@@ -2705,7 +2755,7 @@ async fn forward_openai_profile(
 
     let status = upstream.status();
     if !status.is_success() {
-        let response_text = match upstream.text().await {
+        let response_text = match read_response_text_limited(upstream).await {
             Ok(text) => text,
             Err(err) => format!("Cannot read provider error response: {err}"),
         };
@@ -2733,17 +2783,17 @@ async fn forward_openai_profile(
         );
     }
 
-    let upstream_body = match upstream.json::<Value>().await {
+    let upstream_body = match read_response_json_limited(upstream).await {
         Ok(value) => value,
         Err(err) => {
             error!(
-                "Provider '{}' returned a non-JSON response: {err}",
+                "Provider '{}' returned an invalid or oversized JSON response: {err}",
                 profile.file_name
             );
             return anthropic_error(
                 StatusCode::BAD_GATEWAY,
                 "api_error",
-                "OpenAI-compatible provider returned a non-JSON response",
+                "OpenAI-compatible provider returned an invalid or oversized JSON response",
             );
         }
     };
@@ -2905,8 +2955,12 @@ fn anthropic_stop_reason(finish_reason: Option<&str>, has_tool_calls: bool) -> &
     }
 }
 
-fn stream_eof_is_complete(saw_done: bool, finish_reason: Option<&str>) -> bool {
-    saw_done || finish_reason.is_some()
+fn stream_eof_is_complete(
+    saw_done: bool,
+    finish_reason: Option<&str>,
+    usage_only_tail_seen: bool,
+) -> bool {
+    saw_done || finish_reason.is_some() || usage_only_tail_seen
 }
 
 fn parse_tool_arguments(arguments: &str) -> Result<Value, String> {
@@ -3085,6 +3139,7 @@ struct AnthropicStreamTranslator {
     finish_reason: Option<String>,
     input_tokens: u64,
     output_tokens: u64,
+    usage_only_tail_seen: bool,
     refusal_seen: bool,
     safety_block_seen: bool,
     finished: bool,
@@ -3131,6 +3186,7 @@ impl AnthropicStreamTranslator {
             finish_reason: None,
             input_tokens: estimated_input_tokens,
             output_tokens: 0,
+            usage_only_tail_seen: false,
             refusal_seen: false,
             safety_block_seen: false,
             finished: false,
@@ -3163,6 +3219,9 @@ impl AnthropicStreamTranslator {
     }
 
     fn process_payload(&mut self, payload: &str) -> Result<Vec<Event>, String> {
+        if payload.trim().is_empty() {
+            return Ok(Vec::new());
+        }
         let chunk: Value = serde_json::from_str(payload)
             .map_err(|err| format!("Invalid JSON in OpenAI-compatible SSE stream: {err}"))?;
         if chunk.get("error").is_some() {
@@ -3183,6 +3242,7 @@ impl AnthropicStreamTranslator {
             return Ok(events);
         }
 
+        let usage_seen = chunk.get("usage").is_some();
         if let Some(usage) = chunk.get("usage") {
             self.input_tokens =
                 usage_token(usage, &["prompt_tokens", "input_tokens"]).unwrap_or(self.input_tokens);
@@ -3191,8 +3251,10 @@ impl AnthropicStreamTranslator {
         }
 
         let Some(choice) = chunk.pointer("/choices/0") else {
+            self.usage_only_tail_seen = usage_seen;
             return Ok(Vec::new());
         };
+        self.usage_only_tail_seen = false;
         if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
             self.finish_reason = Some(reason.to_string());
         }
@@ -3245,6 +3307,7 @@ impl AnthropicStreamTranslator {
         if thinking.is_empty() {
             return Ok(());
         }
+        self.stop_text_block(events)?;
         let index = if let Some(index) = self.thinking_block_index {
             index
         } else {
@@ -3359,6 +3422,17 @@ impl AnthropicStreamTranslator {
         Ok(())
     }
 
+    fn stop_text_block(&mut self, events: &mut Vec<Event>) -> Result<(), String> {
+        if let Some(index) = self.text_block_index.take() {
+            push_anthropic_event(
+                events,
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": index}),
+            )?;
+        }
+        Ok(())
+    }
+
     fn emit_text_delta(&mut self, events: &mut Vec<Event>, text: &str) -> Result<(), String> {
         self.stop_thinking_block(events)?;
         let index = if let Some(index) = self.text_block_index {
@@ -3403,7 +3477,7 @@ impl AnthropicStreamTranslator {
             format!("index:{index}")
         } else if let Some(id) = incoming_id {
             format!("id:{id}")
-        } else if incoming_name.is_some() {
+        } else if let Some(incoming_name) = incoming_name {
             let unnamed_existing = self.tool_calls.len() == 1
                 && self
                     .tool_calls
@@ -3414,6 +3488,12 @@ impl AnthropicStreamTranslator {
                     .get_index(0)
                     .map(|(key, _)| key.clone())
                     .unwrap_or_else(|| self.next_tool_key())
+            } else if let Some((key, _)) = self.tool_calls.last().filter(|(_, call)| {
+                call.name == incoming_name
+                    && serde_json::from_str::<Value>(&call.arguments)
+                        .map_or(true, |value| !value.is_object())
+            }) {
+                key.clone()
             } else {
                 self.next_tool_key()
             }
@@ -3478,13 +3558,7 @@ impl AnthropicStreamTranslator {
 
         self.flush_tagged_content(&mut events)?;
         self.stop_thinking_block(&mut events)?;
-        if let Some(index) = self.text_block_index.take() {
-            push_anthropic_event(
-                &mut events,
-                "content_block_stop",
-                json!({"type": "content_block_stop", "index": index}),
-            )?;
-        }
+        self.stop_text_block(&mut events)?;
 
         let tool_calls_allowed = !self.refusal_seen
             && anthropic_stop_reason(self.finish_reason.as_deref(), !self.tool_calls.is_empty())
@@ -3579,14 +3653,19 @@ impl AnthropicStreamTranslator {
     }
 }
 
-fn anthropic_upstream_stream_response(
-    upstream: reqwest::Response,
+fn anthropic_upstream_event_stream<S, B, E>(
+    byte_stream: S,
     model: String,
     thought_signatures: Arc<ThoughtSignatureCache>,
     estimated_input_tokens: u64,
     capabilities: OpenAiCapabilities,
-) -> Response {
-    let byte_stream = Box::pin(upstream.bytes_stream());
+) -> impl Stream<Item = Result<Event, Infallible>>
+where
+    S: Stream<Item = Result<B, E>> + Send + 'static,
+    B: AsRef<[u8]> + Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    let byte_stream = Box::pin(byte_stream);
     let translator = AnthropicStreamTranslator::with_capabilities(
         model,
         thought_signatures,
@@ -3599,7 +3678,7 @@ fn anthropic_upstream_stream_response(
     };
     let decoder = SseDataDecoder::default();
 
-    let event_stream = stream::unfold(
+    stream::unfold(
         (byte_stream, decoder, translator, initial_events, false),
         |(mut byte_stream, mut decoder, mut translator, mut pending, mut ended)| async move {
             loop {
@@ -3614,7 +3693,7 @@ fn anthropic_upstream_stream_response(
                 }
 
                 match byte_stream.next().await {
-                    Some(Ok(bytes)) => match decoder.push_bytes(&bytes) {
+                    Some(Ok(bytes)) => match decoder.push_bytes(bytes.as_ref()) {
                         Ok(payloads) => {
                             for payload in payloads {
                                 if payload.trim() == "[DONE]" {
@@ -3674,8 +3753,11 @@ fn anthropic_upstream_stream_response(
                             }
                         }
                         if !processing_failed {
-                            if stream_eof_is_complete(saw_done, translator.finish_reason.as_deref())
-                            {
+                            if stream_eof_is_complete(
+                                saw_done,
+                                translator.finish_reason.as_deref(),
+                                translator.usage_only_tail_seen,
+                            ) {
                                 match translator.finish() {
                                     Ok(events) => pending.extend(events),
                                     Err(message) => {
@@ -3693,8 +3775,23 @@ fn anthropic_upstream_stream_response(
                 }
             }
         },
-    );
+    )
+}
 
+fn anthropic_upstream_stream_response(
+    upstream: reqwest::Response,
+    model: String,
+    thought_signatures: Arc<ThoughtSignatureCache>,
+    estimated_input_tokens: u64,
+    capabilities: OpenAiCapabilities,
+) -> Response {
+    let event_stream = anthropic_upstream_event_stream(
+        upstream.bytes_stream(),
+        model,
+        thought_signatures,
+        estimated_input_tokens,
+        capabilities,
+    );
     Sse::new(event_stream)
         .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
         .into_response()
@@ -5415,6 +5512,78 @@ fn unix_timestamp() -> u64 {
 mod tests {
     use super::*;
 
+    async fn collect_translated_sse_from_mock(mock: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        let upstream = Client::builder()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let response = anthropic_upstream_stream_response(
+            upstream,
+            "integration-model".to_string(),
+            Arc::new(RwLock::new(IndexMap::new())),
+            7,
+            OpenAiCapabilities::default(),
+        );
+        let body = axum::body::to_bytes(response.into_body(), MAX_UPSTREAM_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        server.abort();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    async fn collect_translated_sse(upstream_body: String) -> String {
+        let mock = Router::new().route(
+            "/stream",
+            get(move || {
+                let upstream_body = upstream_body.clone();
+                async move {
+                    Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(upstream_body))
+                        .unwrap()
+                }
+            }),
+        );
+        collect_translated_sse_from_mock(mock).await
+    }
+
+    fn anthropic_sse_event_values(body: &str) -> Vec<Value> {
+        let mut decoder = SseDataDecoder::default();
+        let mut payloads = decoder.push_bytes(body.as_bytes()).unwrap();
+        payloads.extend(decoder.finish().unwrap());
+        payloads
+            .into_iter()
+            .map(|payload| serde_json::from_str(&payload).unwrap())
+            .collect()
+    }
+
+    fn test_provider_profile(client: Client, upstream_url: String) -> ProviderProfile {
+        ProviderProfile {
+            file_name: "test-provider.json".to_string(),
+            display_name: "Test Provider".to_string(),
+            source: ProviderProfileSource::Native,
+            model: "test-model".to_string(),
+            upstream_identity: None,
+            identity_override: true,
+            base_url: upstream_url.clone(),
+            auth_token: Some("secret".to_string()),
+            api_key: None,
+            proxy_url: None,
+            local_gemini: false,
+            transport: ProviderTransport::OpenAiChat,
+            openai_capabilities: OpenAiCapabilities::default(),
+            vision: VisionConfig::default(),
+            upstream_url,
+            client,
+        }
+    }
+
     #[test]
     fn accepts_an_empty_provider_profile_directory() {
         let settings_dir =
@@ -5933,6 +6102,70 @@ mod tests {
             assert!(serialized.contains("one failed test"));
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn bounded_response_reader_rejects_chunked_oversized_bodies() {
+        let mock = Router::new().route(
+            "/oversized",
+            get(|| async {
+                let chunks = stream::iter([
+                    Ok::<String, Infallible>("1234".to_string()),
+                    Ok::<String, Infallible>("5678".to_string()),
+                ]);
+                Response::builder().body(Body::from_stream(chunks)).unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        let response = Client::builder()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/oversized"))
+            .send()
+            .await
+            .unwrap();
+
+        let error = read_response_bytes_limited(response, 7).await.unwrap_err();
+        assert!(error.contains("exceeds 7 bytes"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn vision_timeout_covers_response_body_reading() {
+        let mock = Router::new().route(
+            "/vision",
+            post(|| async {
+                let delayed = stream::once(async {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Ok::<String, Infallible>(
+                        json!({"choices": [{"message": {"content": "late"}}]}).to_string(),
+                    )
+                });
+                Response::builder()
+                    .header("content-type", "application/json")
+                    .body(Body::from_stream(delayed))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        let client = Client::builder().build().unwrap();
+        let url = format!("http://{address}/vision");
+        let source = test_provider_profile(client.clone(), url.clone());
+
+        let error = send_vision_request_with_timeout(
+            client.post(url).json(&json!({"stream": false})),
+            &source,
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::GATEWAY_TIMEOUT);
+        assert!(error.message.contains("timed out"));
         server.abort();
     }
 
@@ -6622,6 +6855,153 @@ mod tests {
         assert!(serde_json::from_str::<Value>(&payloads[0]).is_ok());
     }
 
+    #[tokio::test]
+    async fn upstream_byte_stream_emits_complete_anthropic_sequence_at_done() {
+        let body = collect_translated_sse(
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
+                "data: [DONE]\n\n",
+                "data: this must be ignored after done\n\n"
+            )
+            .to_string(),
+        )
+        .await;
+        let values = anthropic_sse_event_values(&body);
+        let types = values
+            .iter()
+            .filter_map(|value| value.get("type").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            types,
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop"
+            ]
+        );
+        assert!(body.contains("Hello"));
+        assert!(!body.contains("must be ignored"));
+    }
+
+    #[tokio::test]
+    async fn upstream_byte_stream_finishes_cleanly_at_eof_with_finish_reason() {
+        let body = collect_translated_sse(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Complete\"},\"finish_reason\":\"stop\"}]}\n\n"
+                .to_string(),
+        )
+        .await;
+        let values = anthropic_sse_event_values(&body);
+
+        assert!(values.iter().any(|value| value["type"] == "message_stop"));
+        assert!(!values.iter().any(|value| value["type"] == "error"));
+    }
+
+    #[tokio::test]
+    async fn empty_keepalive_and_usage_only_tail_complete_the_stream() {
+        let body = collect_translated_sse(
+            concat!(
+                "data:\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Complete\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":3}}\n\n"
+            )
+            .to_string(),
+        )
+        .await;
+        let values = anthropic_sse_event_values(&body);
+
+        assert!(values.iter().any(|value| value["type"] == "message_stop"));
+        assert!(!values.iter().any(|value| value["type"] == "error"));
+        let message_delta = values
+            .iter()
+            .find(|value| value["type"] == "message_delta")
+            .unwrap();
+        assert_eq!(message_delta["usage"]["output_tokens"], 3);
+    }
+
+    #[tokio::test]
+    async fn truncated_upstream_byte_stream_injects_error_without_message_stop() {
+        let body = collect_translated_sse(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Partial\"},\"finish_reason\":null}]}\n\n"
+                .to_string(),
+        )
+        .await;
+        let values = anthropic_sse_event_values(&body);
+
+        assert!(values.iter().any(|value| value["type"] == "error"));
+        assert!(!values.iter().any(|value| value["type"] == "message_stop"));
+    }
+
+    #[tokio::test]
+    async fn upstream_byte_stream_read_failure_is_exposed_as_an_error_event() {
+        let byte_stream = stream::iter([Err::<Vec<u8>, &'static str>("mock stream failure")]);
+        let event_stream = anthropic_upstream_event_stream(
+            byte_stream,
+            "integration-model".to_string(),
+            Arc::new(RwLock::new(IndexMap::new())),
+            0,
+            OpenAiCapabilities::default(),
+        );
+        let response = Sse::new(event_stream).into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), MAX_UPSTREAM_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        let values = anthropic_sse_event_values(&body);
+        let error = values
+            .iter()
+            .find(|value| value["type"] == "error")
+            .unwrap();
+
+        assert!(error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("mock stream failure"));
+        assert!(!values.iter().any(|value| value["type"] == "message_stop"));
+    }
+
+    #[tokio::test]
+    async fn late_thinking_closes_an_open_text_block_before_starting() {
+        let body = collect_translated_sse(
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Answer first\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Late thought\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .to_string(),
+        )
+        .await;
+        let values = anthropic_sse_event_values(&body);
+        let block_events = values
+            .iter()
+            .filter(|value| {
+                matches!(
+                    value.get("type").and_then(Value::as_str),
+                    Some("content_block_start" | "content_block_stop")
+                )
+            })
+            .map(|value| {
+                (
+                    value["type"].as_str().unwrap().to_string(),
+                    value["index"].as_u64().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            block_events,
+            [
+                ("content_block_start".to_string(), 0),
+                ("content_block_stop".to_string(), 0),
+                ("content_block_start".to_string(), 1),
+                ("content_block_stop".to_string(), 1),
+            ]
+        );
+    }
+
     #[test]
     fn emits_text_delta_before_upstream_stream_finishes() {
         let signatures = Arc::new(RwLock::new(IndexMap::new()));
@@ -6946,9 +7326,10 @@ mod tests {
 
     #[test]
     fn clean_stream_eof_requires_done_or_finish_reason() {
-        assert!(!stream_eof_is_complete(false, None));
-        assert!(stream_eof_is_complete(true, None));
-        assert!(stream_eof_is_complete(false, Some("stop")));
+        assert!(!stream_eof_is_complete(false, None, false));
+        assert!(stream_eof_is_complete(true, None, false));
+        assert!(stream_eof_is_complete(false, Some("stop"), false));
+        assert!(stream_eof_is_complete(false, None, true));
     }
 
     #[test]
@@ -7194,6 +7575,50 @@ mod tests {
         assert_eq!(translator.tool_calls.len(), 2);
         assert_eq!(translator.tool_calls[0].name, "first");
         assert_eq!(translator.tool_calls[1].name, "second");
+    }
+
+    #[test]
+    fn merges_repeated_anonymous_tool_names_while_arguments_are_incomplete() {
+        let signatures = Arc::new(RwLock::new(IndexMap::new()));
+        let mut translator =
+            AnthropicStreamTranslator::new("nonstandard-model".to_string(), signatures, 0);
+
+        translator
+            .process_payload(
+                r#"{"choices":[{"delta":{"tool_calls":[{"function":{"name":"inspect","arguments":"{\"path\":\"src\""}}]},"finish_reason":null}]}"#,
+            )
+            .unwrap();
+        translator
+            .process_payload(
+                r#"{"choices":[{"delta":{"tool_calls":[{"function":{"name":"inspect","arguments":",\"depth\":2}"}}]},"finish_reason":"tool_calls"}]}"#,
+            )
+            .unwrap();
+
+        assert_eq!(translator.tool_calls.len(), 1);
+        assert_eq!(translator.tool_calls[0].name, "inspect");
+        assert_eq!(
+            parse_tool_arguments(&translator.tool_calls[0].arguments).unwrap()["path"],
+            "src"
+        );
+        assert_eq!(
+            parse_tool_arguments(&translator.tool_calls[0].arguments).unwrap()["depth"],
+            2
+        );
+
+        let mut sequential = AnthropicStreamTranslator::new(
+            "nonstandard-model".to_string(),
+            Arc::new(RwLock::new(IndexMap::new())),
+            0,
+        );
+        for arguments in ["{}", "{\"path\":\"other\"}"] {
+            sequential
+                .process_payload(&format!(
+                    r#"{{"choices":[{{"delta":{{"tool_calls":[{{"function":{{"name":"inspect","arguments":{}}}}}]}}}}]}}"#,
+                    serde_json::to_string(arguments).unwrap()
+                ))
+                .unwrap();
+        }
+        assert_eq!(sequential.tool_calls.len(), 2);
     }
 
     #[test]

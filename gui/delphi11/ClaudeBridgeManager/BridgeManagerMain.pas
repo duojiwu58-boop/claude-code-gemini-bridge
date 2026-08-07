@@ -130,6 +130,7 @@ const
   DEFAULT_BRIDGE_URL = 'http://127.0.0.1:18787';
   STATUS_RESPONSE_TIMEOUT_MS = 4000;
   ACTION_RESPONSE_TIMEOUT_MS = 30000;
+  SCRIPT_PROCESS_TIMEOUT_MS = 5 * 60 * 1000;
   LOG_MAX_LINES = 500;
   DWMWA_WINDOW_CORNER_PREFERENCE = 33;
   DWMWCP_ROUND = 2;
@@ -1109,6 +1110,7 @@ var
   LPowerShell: string;
   LStartupInfo: TStartupInfo;
   LProcessInfo: TProcessInformation;
+  LWaitResult: DWORD;
 begin
   LPowerShell :=
     GetEnvironmentVariable('SystemRoot') +
@@ -1138,7 +1140,16 @@ begin
   ) then
     RaiseLastOSError;
   try
-    WaitForSingleObject(LProcessInfo.hProcess, 30000);
+    LWaitResult := WaitForSingleObject(
+      LProcessInfo.hProcess,
+      SCRIPT_PROCESS_TIMEOUT_MS
+    );
+    if LWaitResult = WAIT_FAILED then
+      RaiseLastOSError;
+    if LWaitResult = WAIT_TIMEOUT then
+      raise Exception.Create('服务脚本运行超过 5 分钟，仍未结束。');
+    if LWaitResult <> WAIT_OBJECT_0 then
+      raise Exception.CreateFmt('等待服务脚本失败，状态码 %d。', [LWaitResult]);
     if not GetExitCodeProcess(LProcessInfo.hProcess, Result) then
       RaiseLastOSError;
   finally
