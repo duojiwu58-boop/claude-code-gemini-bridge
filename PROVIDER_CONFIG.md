@@ -61,6 +61,9 @@
   "identity_override": true,
   "proxy": "http://127.0.0.1:8080",
   "enabled": true,
+  "vision": {
+    "mode": "native"
+  },
   "capabilities": {
     "stream_options": true,
     "parallel_tool_calls": true,
@@ -88,10 +91,58 @@
 - `identity_override`：可选，默认 `true`。设为 `false` 可关闭身份提示适配。
 - `proxy`：可选，仅用于这个 Provider；省略表示直连。
 - `enabled`：可选，默认 `true`。设为 `false` 后保留文件但不显示该配置。
+- `vision`：可选，默认 `{"mode":"native"}`，即图片仍由当前 Provider 原生处理。
+  对无视觉能力的模型可设为 `{"mode":"proxy"}`；此时默认由本地 Gemini
+  profile 提取视觉信息。也可用 `profile` 指定另一个视觉 Provider 配置文件。
 - `capabilities`：可选。仅在供应商的 OpenAI 兼容实现与默认行为不同时填写；
   省略时使用下文列出的兼容默认值。
 
 同时兼容 JavaScript 风格的 `baseURL`、`apiKey` 和 `apiKeyEnv` 字段名。
+
+## 通用 Vision Proxy
+
+对于 DeepSeek V4 Flash 等纯文本模型，可在目标 Provider 中开启视觉代理：
+
+```json
+{
+  "name": "DeepSeek V4 Flash",
+  "model": "deepseek-v4-flash",
+  "base_url": "https://api.deepseek.com",
+  "api_key": "<DEEPSEEK_API_KEY>",
+  "vision": {
+    "mode": "proxy"
+  }
+}
+```
+
+省略 `vision.profile` 时，桥接器优先选择第一个使用 `protocol: "gemini"` 的本地
+Gemini profile；若没有，则选择 `base_url` 指向 Google 官方
+`generativelanguage.googleapis.com` 的原生 Gemini profile。也可以显式指定任意一个
+原生支持视觉的 Provider 文件，例如：
+
+```json
+"vision": {
+  "mode": "proxy",
+  "profile": "gemini-openai.json"
+}
+```
+
+显式视觉 Provider 可以使用 `gemini`、`openai` 或 `anthropic` transport，但它
+自己的 `vision.mode` 必须是 `native`。桥接器拒绝自引用和多级代理链，并在刷新
+profile 时检查引用是否存在。
+
+收到图片或 PDF 后，桥接器先让视觉 Provider 生成与当前任务相关的事实性观察；
+对于文字密集图片以及翻译、总结、解释文字等请求，会要求按阅读顺序完整逐字 OCR、
+保留原语言和排版结构，禁止用省略号代替内容。随后桥接器
+移除发往目标文本模型的原始媒体块，并把观察作为标记过的“不可信视觉证据”加入
+原用户消息。普通纯文本请求不会调用视觉 Provider。流式请求也复用同一预处理器，
+所以视觉分析完成前不会产生首个 SSE 事件；分析超时为 90 秒，失败会明确返回错误，
+不会静默让文本模型猜图。相同视觉 Provider、用户上下文和 base64 媒体内容的成功
+结果会在进程内缓存，最多 128 项，服务重启即清空；远程 URL 内容可能变化，因此
+不缓存。
+
+隐私边界：启用后，原始图片会发送给配置的视觉 Provider，视觉观察会发送给当前
+目标 Provider。若这两个服务属于不同厂商，请按两边的数据政策评估后再启用。
 
 ## 近乎无损兼容与能力覆盖
 

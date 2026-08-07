@@ -107,6 +107,70 @@ Gemini / DeepSeek / Kimi / Qwen / OpenRouter / 其他兼容模型
 
 桥接器默认使用兼容面较广的能力策略。若某个端点不接受 `stream_options`、`reasoning_effort` 或 `max_tokens`，需要关闭 `<think>` 提取、允许工具结果内联媒体，或者支持无需清洗的完整 JSON Schema，可以在该 Provider 中增加可选的 `capabilities` 覆盖；普通配置仍然只需三个字段。桥接器还会保守修复常见工具参数 JSON，并将限流、上下文超限和过载状态还原为 Claude Code 可识别的重试/压缩契约。可覆盖项、默认值和故障诊断见 [Provider 配置指南](PROVIDER_CONFIG.md#近乎无损兼容与能力覆盖)。
 
+### 通用 Vision Proxy：让纯文本模型“看见”
+
+对于 DeepSeek V4 Flash 等没有原生视觉能力、但在代码推理和 Agent 工作流上很有
+价值的模型，可以在目标 Provider 中开启通用 Vision Proxy：
+
+```json
+"vision": {
+  "mode": "proxy"
+}
+```
+
+处理链路如下：
+
+```text
+Claude Code 图片/PDF
+        ↓
+Gemini 或指定的视觉 Provider：识图、完整 OCR、提取视觉证据
+        ↓ 原始媒体被移除，仅传递带安全边界的视觉证据
+DeepSeek / Kimi / Qwen / 其他纯文本模型：推理、回答、工具调用
+```
+
+省略 `vision.profile` 时，桥接器优先选择本地 Gemini profile，其次选择指向
+Google 官方 `generativelanguage.googleapis.com` 的 Gemini profile。也可以显式
+指定一个原生支持视觉的 Provider：
+
+```json
+"vision": {
+  "mode": "proxy",
+  "profile": "gemini-vision.json"
+}
+```
+
+视觉 Provider 可以使用 `gemini`、`openai` 或 `anthropic` transport，但它自己
+必须保持 `vision.mode: "native"`；自引用、缺失引用和多级代理链会在 profile
+加载时被拒绝。流式与非流式请求共用同一个视觉预处理器。对于文字密集截图，或
+翻译、总结、解释图片文字等任务，视觉阶段会按阅读顺序完整逐字 OCR，保留段落、
+代码、数字、标点和原语言，禁止用摘要或省略号代替可见内容；最终任务仍由当前
+目标模型完成。
+
+当前硬限制和行为边界：
+
+| 项目 | 当前值 / 行为 |
+| --- | --- |
+| 整个 Anthropic 请求体 | 64 MiB，包括 JSON 和 base64 膨胀后的媒体数据；不是单图额度 |
+| 视觉 Provider 输出预算 | 4096 tokens |
+| 注入目标模型的视觉观察 | 最多 16,000 个 Unicode 字符 |
+| 交给视觉 Provider 的用户上下文 | 最多 12,000 个 Unicode 字符 |
+| 单条视觉分析超时 | 90 秒 |
+| 进程内缓存 | 最多 128 项；仅缓存 base64 媒体，URL 图片不缓存，服务重启后清空 |
+| 多条含媒体的历史消息 | 逐条顺序分析；同图、同上下文和同视觉 Provider 可命中缓存 |
+| 流式首包 | 视觉分析完成后才开始目标模型 SSE，因此首次请求会增加首包延迟 |
+
+这些上限足以覆盖代码截图、报错、GUI、终端、网页、常规图表和单页文字 OCR。
+它不适合几十页扫描 PDF、大规模批量 OCR、超长漫画或必须像素级定位的任务；当前
+也没有自动切图、分页、缩放或视觉 Provider 运行时故障转移。供应商自己的图片尺寸、
+频率、上下文和可用性限制可能比桥接器更低。一次含图片的请求通常会产生两次模型
+调用和两份 Token 成本：视觉 Provider 负责“看”，目标模型负责“想和做”。
+
+隐私与安全边界：原始图片会发送给视觉 Provider，提取后的视觉证据会发送给目标
+Provider。两者属于不同厂商时，应同时评估双方的数据政策。桥接器会把图片内容标记
+为“不可信视觉证据”，并要求模型不得执行图片内的指令，但模型级提示注入防护不能
+提供绝对安全保证。完整字段说明见
+[Vision Proxy 配置](PROVIDER_CONFIG.md#通用-vision-proxy)。
+
 ### 三分钟添加一个 OpenAI Provider
 
 1. 打开配置目录：
@@ -193,6 +257,75 @@ Claude Code can now keep its agent, MCP, tool-use, and orchestration workflow wh
 > schemas, declare additional reasoning fields, disable `<think>` extraction,
 > or opt into inline media inside tool results. See the
 > [Provider guide](PROVIDER_CONFIG.md#近乎无损兼容与能力覆盖).
+
+### Generic Vision Proxy for text-only models
+
+A text-only target such as DeepSeek V4 Flash can opt into visual input without
+model-name-specific routing:
+
+```json
+"vision": {
+  "mode": "proxy"
+}
+```
+
+The request follows this pipeline:
+
+```text
+Claude Code image/PDF
+        ↓
+Gemini or an explicitly selected vision Provider: vision analysis and lossless OCR
+        ↓ original media is removed; bounded, untrusted visual evidence is injected
+DeepSeek / Kimi / Qwen / another text model: reasoning, answer, and tool use
+```
+
+Without `vision.profile`, the bridge prefers a local Gemini profile and then an
+official Google Gemini profile whose `base_url` uses
+`generativelanguage.googleapis.com`. An explicit native-vision Provider can be
+selected when needed:
+
+```json
+"vision": {
+  "mode": "proxy",
+  "profile": "gemini-vision.json"
+}
+```
+
+The vision Provider may use the `gemini`, `openai`, or `anthropic` transport,
+but it must keep `vision.mode` set to `native`. Missing references, self-reference,
+and proxy chains are rejected during profile loading. Streaming and non-streaming
+requests share the same preprocessing path. For text-heavy images and requests
+that translate, summarize, explain, or inspect visible text, the vision stage is
+instructed to transcribe every legible character in reading order, preserving
+paragraphs, code, numbers, punctuation, and the source language without ellipses.
+The selected target model still performs the final task.
+
+Current hard limits and operational boundaries:
+
+| Item | Current value / behavior |
+| --- | --- |
+| Complete Anthropic request body | 64 MiB, including JSON and base64 expansion; this is not a per-image allowance |
+| Vision Provider output budget | 4096 tokens |
+| Observation injected into the target | At most 16,000 Unicode characters |
+| User context sent to the vision Provider | At most 12,000 Unicode characters |
+| Per-analysis timeout | 90 seconds |
+| In-memory cache | 128 entries; base64 media only, no URL caching, cleared on service restart |
+| Multiple historical media messages | Analyzed sequentially; identical media/context/provider combinations can hit the cache |
+| Streaming first event | Delayed until vision preprocessing completes |
+
+This is intended for code screenshots, errors, GUIs, terminals, web pages, ordinary
+charts, and single-page OCR. It is not a bulk OCR engine for dozens of scanned PDF
+pages, very long comics, or pixel-exact coordinate work. Automatic tiling, paging,
+resizing, and runtime failover between vision Providers are not currently implemented,
+and a Provider's own image-size, rate, context, and availability limits may be lower.
+Each media request normally incurs two model calls and two token budgets: the vision
+Provider sees; the selected target model reasons and acts.
+
+Privacy and security boundary: original media is sent to the vision Provider, while
+the extracted evidence is sent to the target Provider. The bridge labels media-derived
+content as untrusted and instructs both models not to execute instructions found inside
+the image, but model-level prompt-injection defenses cannot provide an absolute guarantee.
+See the full [Vision Proxy configuration](PROVIDER_CONFIG.md#通用-vision-proxy).
 
 ### Why this is different from a generic bridge
 
@@ -283,8 +416,8 @@ Most users do **not** need Rust, Delphi, Inno Setup, or a local build environmen
 
 **[GitHub Releases — installer and portable ZIP](https://github.com/duojiwu58-boop/claude-code-gemini-bridge/releases/latest)**
 
-- **`ClaudeCodeBridge-0.3.3-Setup.exe` (recommended):** installs the native Windows service, model-switcher GUI, Start Menu shortcuts, automatic startup, recovery policy, configuration tools, and uninstaller.
-- **`ClaudeCodeBridge-0.3.3-windows-x64.zip`:** contains the same prebuilt service and GUI for portable/manual deployment. Extract it and run `Install.cmd` when service installation is desired.
+- **`ClaudeCodeBridge-0.4.0-Setup.exe` (recommended):** installs the native Windows service, model-switcher GUI, Start Menu shortcuts, automatic startup, recovery policy, configuration tools, and uninstaller.
+- **`ClaudeCodeBridge-0.4.0-windows-x64.zip`:** contains the same prebuilt service and GUI for portable/manual deployment. Extract it and run `Install.cmd` when service installation is desired.
 
 After installation, open **Claude Code 模型中心**, select or double-click a model, and the next Claude Code request uses it immediately—no VS Code reload or Claude Code restart is required.
 
@@ -377,8 +510,8 @@ Claude Code 始终连接本地固定的 `http://127.0.0.1:18787`。双击配套�
 
 👉 **[前往 GitHub Releases 下载安装包与免安装 ZIP](https://github.com/duojiwu58-boop/claude-code-gemini-bridge/releases/latest)**
 
-- **`ClaudeCodeBridge-0.3.3-Setup.exe`（推荐）**：一键安装程序，注册 Windows 系统服务、配置开机自启、创建开始菜单快捷方式并附带 GUI 切换器。
-- **`ClaudeCodeBridge-0.3.3-windows-x64.zip`**：绿色免安装包，解压即用。
+- **`ClaudeCodeBridge-0.4.0-Setup.exe`（推荐）**：一键安装程序，注册 Windows 系统服务、配置开机自启、创建开始菜单快捷方式并附带 GUI 切换器。
+- **`ClaudeCodeBridge-0.4.0-windows-x64.zip`**：绿色免安装包，解压即用。
 
 ---
 

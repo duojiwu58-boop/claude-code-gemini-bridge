@@ -7,6 +7,27 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 
 ## English
 
+## [v0.4.0] - 2026-08-07
+
+### Generic Vision Proxy
+- Added an opt-in, Provider-neutral Vision Proxy for text-only targets. Any native target profile can set `"vision":{"mode":"proxy"}` without model-name-specific routing.
+- Gemini is the default vision Provider: the bridge prefers a native local Gemini profile and then an official Google Gemini profile. `vision.profile` can explicitly select another native-vision profile using the Gemini, OpenAI Chat, or Anthropic transport.
+- Vision preprocessing now runs once at the Anthropic message layer before target routing, so streaming and non-streaming requests, OpenAI-compatible targets, Anthropic targets, user images, PDFs, and media inside tool results share one implementation.
+- Original media is removed before forwarding to a text-only target and replaced with bounded visual evidence marked as untrusted data. Profiles with missing references, self-reference, or proxy chains are rejected during loading.
+
+### OCR Fidelity, Caching, and Failure Semantics
+- Changed the vision prompt from concise summarization to task-aware, lossless extraction. Text-heavy images and translation/explanation requests require complete verbatim OCR in reading order, preserving paragraphs, code, numbers, punctuation, and source language without ellipses.
+- Raised the vision output budget from 1,200 to 4,096 tokens. Vision context is capped at 12,000 Unicode characters and the injected observation at 16,000 characters.
+- Added a 90-second per-analysis timeout and a 128-entry SHA-256 in-memory cache for successful base64 media observations. URL media is never cached because its content can change; the cache is cleared on service restart.
+- Vision failures are returned explicitly instead of silently asking the text model to guess. Rate-limit and overload semantics are preserved; automatic tiling, paging, resizing, bulk OCR, and runtime vision-Provider failover are not yet implemented.
+
+### Documentation and Verification
+- Expanded the bilingual README and Provider guide with configuration examples, routing and privacy boundaries, prompt-injection cautions, hard limits, latency/cost behavior, and recommended use cases.
+- Updated the DeepSeek example profile to enable Vision Proxy.
+- 71 Rust tests passed, including profile validation, media removal, nested tool-result media, request construction, observation parsing, SHA-256 cache reuse, and a mock vision Provider integration test.
+- Live Windows-service verification paired Gemini vision with DeepSeek V4 Flash. A text-dense Chinese screenshot was transcribed through its bottom checkpoint and translated completely; the first request took about 26.7 seconds and the cached request about 7.0 seconds.
+- Delphi 11 Release GUI compiled with version `0.4.0.0`, 0 warnings, and 0 errors. Strict Clippy, the static-CRT bridge build, portable ZIP inspection, Inno Setup compilation, and SHA-256 manifest verification completed successfully.
+
 ## [v0.3.3] - 2026-08-07
 
 ### Stable GUI Cleanup
@@ -141,6 +162,27 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 ---
 
 ## 中文
+
+## [v0.4.0] - 2026-08-07
+
+### 通用 Vision Proxy
+- 新增显式启用、与目标模型名称无关的通用 Vision Proxy。任何原生目标 profile 都可以设置 `"vision":{"mode":"proxy"}`，无需为 DeepSeek 等模型写死路由分支。
+- Gemini 作为默认视觉 Provider：桥接器优先选择本地原生 Gemini profile，其次选择 Google 官方 Gemini profile；也可通过 `vision.profile` 显式指定使用 Gemini、OpenAI Chat 或 Anthropic transport 的原生视觉 profile。
+- 视觉预处理统一位于 Anthropic 消息层并发生在目标路由之前，因此流式与非流式请求、OpenAI-compatible 与 Anthropic 目标、普通用户图片、PDF 及工具结果内媒体共用同一实现。
+- 发往纯文本目标前会移除原始媒体，替换为有界且标记为“不可信数据”的视觉证据。缺失引用、自引用和多级代理链会在 profile 加载时被拒绝。
+
+### OCR 保真、缓存与故障语义
+- 将视觉提示从“简洁摘要”改为任务敏感的近乎无损提取。对于文字密集图片以及翻译、总结、解释文字等请求，要求按阅读顺序完整逐字 OCR，保留段落、代码、数字、标点和原语言，禁止用省略号替代可见内容。
+- 视觉输出预算由 1,200 提高到 4,096 tokens；视觉上下文最多 12,000 个 Unicode 字符，注入目标模型的观察最多 16,000 个字符。
+- 增加单次视觉分析 90 秒超时，以及基于 SHA-256 指纹、最多 128 项的 base64 成功结果内存缓存。URL 媒体因内容可能变化而不缓存，服务重启后缓存清空。
+- 视觉分析失败会明确返回错误，不会静默让纯文本模型猜图；保留限流和过载语义。当前尚未实现自动切图、分页、缩放、批量 OCR 和视觉 Provider 运行时故障转移。
+
+### 文档与验证
+- 扩充 README 和 Provider 配置指南的中英文说明，加入配置示例、路由与隐私边界、图片提示注入风险、硬限制、延迟/成本行为及推荐使用范围。
+- DeepSeek 示例 profile 已默认启用 Vision Proxy。
+- 71 项 Rust 测试全部通过，覆盖 profile 校验、媒体移除、工具结果嵌套媒体、请求构造、观察解析、SHA-256 缓存复用和本地 mock 视觉 Provider 集成测试。
+- Windows 服务实测完成 Gemini 视觉与 DeepSeek V4 Flash 接力：文字密集中文长图成功 OCR 到底部校验码并完整翻译；首次请求约 26.7 秒，缓存后约 7.0 秒。
+- Delphi 11 Release GUI 以 `0.4.0.0` 版本编译通过，0 警告、0 错误；严格 Clippy、静态 CRT bridge、便携 ZIP 内容检查、Inno Setup 编译及 SHA-256 清单验证均成功完成。
 
 ## [v0.3.3] - 2026-08-07
 

@@ -1,6 +1,6 @@
 [package]
 name = "claude-bridge"
-version = "0.3.3"
+version = "0.4.0"
 edition = "2021"
 description = "Claude Code <-> Gemini deep-compatibility bridge with live model switching"
 repository = "https://github.com/duojiwu58-boop/claude-code-gemini-bridge"
@@ -13,7 +13,8 @@ idna_adapter = "=1.0.0"
 indexmap = "=2.2.6"
 reqwest = { version = "=0.11.27", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde_json = "=1.0.117"
-tokio = { version = "=1.37.0", features = ["macros", "rt-multi-thread", "signal"] }
+sha2 = "=0.10.8"
+tokio = { version = "=1.37.0", features = ["macros", "rt-multi-thread", "signal", "time"] }
 tower-http = { version = "=0.5.2", features = ["limit", "trace"] }
 tracing = "=0.1.40"
 tracing-appender = "=0.2.5"
