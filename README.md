@@ -59,6 +59,21 @@ Gemini / DeepSeek / Kimi / Qwen / OpenRouter / 其他兼容模型
    }
    ```
 
+   如果访问该供应商必须经过本机 HTTP 代理，请在同一个 Provider 文件中增加 `proxy`：
+
+   ```json
+   {
+     "name": "Google Gemini",
+     "model": "gemini-3.6-flash",
+     "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+     "api_key": "你的 API Key",
+     "protocol": "openai",
+     "proxy": "http://127.0.0.1:8080"
+   }
+   ```
+
+   > **代理特别提醒：** 每个原生 OpenAI Provider 都使用独立的 HTTP 客户端，不会自动继承旧配置里的 `HTTPS_PROXY`、桥接服务的 `GEMINI_BRIDGE_PROXY`、GUI 中的 Gemini 专用代理或 Windows 系统代理。直连可用时可以省略 `proxy`；如果配置能够加载，但真实调用出现连接超时、连接重置或无法访问上游，请首先检查并填写这一字段。修改后在模型中心点击“刷新配置”，并确认列表的“代理”列显示了正确地址。
+
 3. 字段与官网示例一一对应：
 
    | 供应商官网 OpenAI 示例 | Provider JSON | 说明 |
@@ -94,6 +109,13 @@ Claude Code can now keep its agent, MCP, tool-use, and orchestration workflow wh
 > `%USERPROFILE%\.claude\bridge-providers\`. See the detailed
 > [Provider configuration guide](PROVIDER_CONFIG.md) and the ready-to-copy
 > [templates](examples/providers).
+
+> **Proxy note:** every native Provider owns an independent HTTP client. It does
+> not automatically inherit legacy `HTTPS_PROXY`, `GEMINI_BRIDGE_PROXY`, the
+> GUI's Gemini-specific proxy, or the Windows system proxy. If that provider
+> requires a local HTTP proxy, add a per-profile field such as
+> `"proxy": "http://127.0.0.1:8080"`, reload profiles, and confirm the GUI's
+> Proxy column before testing the route.
 
 ### Why this is different from a generic bridge
 
