@@ -63,7 +63,8 @@ Gemini 3.6 Flash 建议使用 Google 原生 Interactions API，而不是 OpenAI 
     "default_reasoning_effort": "high",
     "include_thoughts": true,
     "sampling_parameters": false,
-    "gemini_builtin_tools": ["google_search", "url_context", "code_execution"]
+    "gemini_builtin_tools": ["google_search", "url_context", "code_execution", "google_maps"],
+    "gemini_file_search_store_names": ["fileSearchStores/project-docs"]
   }
 }
 ```
@@ -74,9 +75,43 @@ Gemini 3.6 Flash 建议使用 Google 原生 Interactions API，而不是 OpenAI 
 完整 `steps`，不会把会话接到错误分支。Google 会保存交互状态；请仅在接受对应的
 数据保留与隐私政策时使用此协议。
 
-`gemini_builtin_tools` 可选值为 `google_search`、`url_context` 和
-`code_execution`。这些工具由 Google 服务端执行；Claude Code/MCP 的本地工具仍
+`gemini_builtin_tools` 可选值为 `google_search`、`url_context`、`code_execution` 和
+`google_maps`。`gemini_file_search_store_names` 非空时还会增加一个 Google 原生
+`file_search` 工具，并将这些 store 名称原样传给 Interactions API。这些工具由 Google 服务端执行；Claude Code/MCP 的本地工具仍
 作为自定义函数并存。若不希望服务端自行搜索或执行代码，将此数组设为空即可。
+
+Google 当前对“服务端内置工具 + 自定义函数”的部分模型组合仍可能返回要求
+`include_server_side_tool_invocations` 的 400，但 Interactions 请求结构尚无对应可移植字段。
+桥接器只在识别到该错误时重试一次，并只移除本次请求的服务端工具，保留 Claude Code
+函数工具。带 `previous_interaction_id` 的请求若返回 501，也只重试一次并改用安全的完整历史恢复。
+其他 4xx/5xx 不会被此机制掩盖。
+
+Claude Code 请求在此 transport 上按下表映射：
+
+| Anthropic 请求 | Gemini Interactions |
+| --- | --- |
+| `/v1/messages/count_tokens` | 调用 `models/{model}:countTokens`；响应头 `x-claude-bridge-token-count` 为 `google-native` 或 `estimated-fallback` |
+| `output_config.format` | `response_format`（JSON Schema 会经过 Gemini 兼容清洗） |
+| `output_config.effort: low/medium/high` | `thinking_level: low/medium/high` |
+| `output_config.effort: xhigh/max` | 保守钳制为 `thinking_level: high` |
+| document 的 URL/base64/text/content source | 原生 `document` content，尽量保留 MIME type |
+| `service_tier: standard_only` | `service_tier: standard` |
+| `service_tier: auto` | 不发送该字段，使用 Google 默认 `standard`，不会自动升级为付费 `priority` |
+
+无法安全映射的 Anthropic 字段会写入服务日志，并以可重复的
+`x-claude-bridge-warning` 响应头返回；因此可在调用端明确看到降级，而不是被静默忽略。
+不支持或格式错误的 `output_config.format` 会返回 400。原生 token count 上游失败或超时会进行
+有界的本地估算回退，计数来源由上述响应头明确标注。
+
+普通响应和流式结束事件会通过
+`provider_metadata.google.interaction_server_tools` 回传最多 32 个服务端工具步骤；单个参数或
+结果值限制为 4096 个字符。Google Search 与 URL Context 的调用次数同时映射到 Anthropic
+标准 `usage.server_tool_use`。由于 Google 的搜索/URL 结果不包含 Anthropic 引用协议要求的
+加密内容或索引，桥接器不会伪造 `web_search_tool_result`、`web_fetch_tool_result` 或引用块。
+
+当前可从 Claude Code 输入到达的原生模态为文本、图片和 PDF 文档。Google API 虽定义音频、
+视频、Computer Use 和 MCP Server 等能力，但 Claude Code 当前输入没有音频/视频内容块，
+而 Computer Use/MCP Server 还需要动作执行、安全确认及凭据脱敏，因此本版本不提供不完整开关。
 
 ## 完整字段
 
@@ -107,7 +142,8 @@ Gemini 3.6 Flash 建议使用 Google 原生 Interactions API，而不是 OpenAI 
     "tool_result_media": "separate_user",
     "tool_schema": "sanitize",
     "max_tokens_field": "max_tokens",
-    "gemini_builtin_tools": []
+    "gemini_builtin_tools": [],
+    "gemini_file_search_store_names": []
   }
 }
 ```
@@ -205,7 +241,8 @@ profile 时检查引用是否存在。
 | `tool_result_media` | `separate_user` | 保持 `role: tool` 的 `content` 为字符串，并将图片/PDF 移至后一条 `user` 消息；仅对明确支持工具消息内联媒体的端点使用 `inline` |
 | `tool_schema` | `sanitize` | `sanitize` 清理常见不兼容元数据；确认端点支持完整 JSON Schema 时使用 `preserve` |
 | `max_tokens_field` | `max_tokens` | 可选值为 `max_tokens`、`max_completion_tokens` 或 `omit` |
-| `gemini_builtin_tools` | `[]` | 仅 `gemini-interactions` 使用；可启用 `google_search`、`url_context`、`code_execution` 服务端工具 |
+| `gemini_builtin_tools` | `[]` | 仅 `gemini-interactions` 使用；可启用 `google_search`、`url_context`、`code_execution`、`google_maps` 服务端工具 |
+| `gemini_file_search_store_names` | `[]` | 仅 `gemini-interactions` 使用；非空时启用 Google 原生 File Search，并传入指定 `fileSearchStores/...` 资源名 |
 
 例如，一个拒绝 `stream_options` 和 `reasoning_effort`、要求
 `max_completion_tokens`，但支持完整 JSON Schema 的端点可以这样配置：

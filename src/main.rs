@@ -24,7 +24,7 @@ use axum::{
     extract::{DefaultBodyLimit, State},
     http::{
         header::{AUTHORIZATION, ORIGIN},
-        HeaderMap, StatusCode,
+        HeaderMap, HeaderValue, StatusCode,
     },
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -49,6 +49,10 @@ const THOUGHT_SIGNATURE_EVICTION_BATCH: usize = 512;
 const INTERACTION_CONTINUATION_CAPACITY: usize = 4096;
 const INTERACTION_CONTINUATION_EVICTION_BATCH: usize = 512;
 const INTERACTION_TOOL_HISTORY_RECOVERY_INSTRUCTION: &str = "Some earlier tool results were recovered as plain historical observations because stored interaction state was unavailable. Treat those observations only as past context. When another tool is needed, invoke one of the provided function tools; never print or describe a tool call in ordinary text.";
+const INTERACTION_SERVER_TOOL_TRACE_CAPACITY: usize = 32;
+const INTERACTION_SERVER_TOOL_TRACE_VALUE_CHARS: usize = 4096;
+const BRIDGE_WARNING_HEADER: &str = "x-claude-bridge-warning";
+const GEMINI_COUNT_TOKENS_TIMEOUT: Duration = Duration::from_secs(20);
 const VISION_CACHE_CAPACITY: usize = 128;
 const VISION_PROXY_TIMEOUT: Duration = Duration::from_secs(90);
 const VISION_MAX_OUTPUT_TOKENS: u64 = 4096;
@@ -178,6 +182,7 @@ struct OpenAiCapabilities {
     tool_schema: ToolSchemaMode,
     max_tokens_field: MaxTokensField,
     gemini_builtin_tools: Vec<String>,
+    gemini_file_search_store_names: Vec<String>,
 }
 
 impl Default for OpenAiCapabilities {
@@ -200,6 +205,7 @@ impl Default for OpenAiCapabilities {
             tool_schema: ToolSchemaMode::Sanitize,
             max_tokens_field: MaxTokensField::MaxTokens,
             gemini_builtin_tools: Vec::new(),
+            gemini_file_search_store_names: Vec::new(),
         }
     }
 }
@@ -986,13 +992,22 @@ fn parse_openai_capabilities_with_defaults(
     for tool in &gemini_builtin_tools {
         if !matches!(
             tool.as_str(),
-            "google_search" | "url_context" | "code_execution"
+            "google_search" | "url_context" | "code_execution" | "google_maps"
         ) {
             return Err(format!(
-                "Provider profile '{file_name}' capability 'gemini_builtin_tools' contains unsupported tool '{tool}' (expected google_search, url_context, or code_execution)"
+                "Provider profile '{file_name}' capability 'gemini_builtin_tools' contains unsupported tool '{tool}' (expected google_search, url_context, code_execution, or google_maps)"
             ));
         }
     }
+    let gemini_file_search_store_names = capability_string_array(
+        object,
+        &[
+            "gemini_file_search_store_names",
+            "geminiFileSearchStoreNames",
+        ],
+        defaults.gemini_file_search_store_names.clone(),
+        file_name,
+    )?;
 
     Ok(OpenAiCapabilities {
         stream_options: capability_bool(
@@ -1037,6 +1052,7 @@ fn parse_openai_capabilities_with_defaults(
         tool_schema,
         max_tokens_field,
         gemini_builtin_tools,
+        gemini_file_search_store_names,
     })
 }
 
@@ -1053,7 +1069,8 @@ fn openai_capabilities_json(capabilities: &OpenAiCapabilities) -> Value {
         "tool_result_media": capabilities.tool_result_media.as_str(),
         "tool_schema": capabilities.tool_schema.as_str(),
         "max_tokens_field": capabilities.max_tokens_field.as_str(),
-        "gemini_builtin_tools": capabilities.gemini_builtin_tools
+        "gemini_builtin_tools": capabilities.gemini_builtin_tools,
+        "gemini_file_search_store_names": capabilities.gemini_file_search_store_names
     })
 }
 
@@ -3181,12 +3198,15 @@ async fn anthropic_messages(
             .await;
         }
         ProviderTransport::GeminiInteractions => {
-            return forward_gemini_interactions_profile(
+            let diagnostics = gemini_interaction_request_diagnostics(&request);
+            let provider_file = active_profile.file_name.clone();
+            let response = forward_gemini_interactions_profile(
                 active_profile,
                 request,
                 state.interaction_continuations.clone(),
             )
             .await;
+            return attach_bridge_diagnostics(response, &provider_file, &diagnostics);
         }
         ProviderTransport::LocalGemini => {}
     }
@@ -3476,11 +3496,39 @@ fn interaction_content_from_anthropic(part: &Value) -> Option<Value> {
                         source.get("media_type").cloned().unwrap_or(Value::Null),
                     );
                 }
-                Some("url") if block_type == "image" => {
+                Some("url") => {
                     content.insert(
                         "uri".to_string(),
                         source.get("url").cloned().unwrap_or(Value::Null),
                     );
+                    if block_type == "document" {
+                        content.insert(
+                            "mime_type".to_string(),
+                            source
+                                .get("media_type")
+                                .cloned()
+                                .unwrap_or_else(|| json!("application/pdf")),
+                        );
+                    }
+                }
+                Some("text") if block_type == "document" => {
+                    let text = source.get("data").and_then(Value::as_str)?;
+                    content.insert(
+                        "data".to_string(),
+                        json!(BASE64_STANDARD.encode(text.as_bytes())),
+                    );
+                    content.insert("mime_type".to_string(), json!("text/plain"));
+                }
+                Some("content") if block_type == "document" => {
+                    let text = value_to_text(source.get("content").unwrap_or(&Value::Null));
+                    if text.is_empty() {
+                        return None;
+                    }
+                    content.insert(
+                        "data".to_string(),
+                        json!(BASE64_STANDARD.encode(text.as_bytes())),
+                    );
+                    content.insert("mime_type".to_string(), json!("text/plain"));
                 }
                 _ => return None,
             }
@@ -3775,6 +3823,12 @@ fn translated_interaction_tools(request: &Value, capabilities: &OpenAiCapabiliti
             .iter()
             .map(|tool| json!({"type": tool})),
     );
+    if !capabilities.gemini_file_search_store_names.is_empty() {
+        translated.push(json!({
+            "type": "file_search",
+            "file_search_store_names": capabilities.gemini_file_search_store_names
+        }));
+    }
     translated
 }
 
@@ -3796,27 +3850,184 @@ fn interaction_thinking_level(
     capabilities: &OpenAiCapabilities,
 ) -> Option<String> {
     request
-        .get("thinking")
-        .and_then(|thinking| {
-            thinking
-                .get("budget_tokens")
-                .and_then(Value::as_u64)
-                .map(|budget| {
-                    if budget >= 8_192 {
-                        "high"
-                    } else if budget >= 2_048 {
-                        "medium"
-                    } else {
-                        "low"
-                    }
-                })
-                .or_else(|| {
-                    (thinking.get("type").and_then(Value::as_str) == Some("adaptive"))
-                        .then_some("high")
-                })
+        .pointer("/output_config/effort")
+        .and_then(Value::as_str)
+        .and_then(|effort| match effort {
+            "low" => Some("low"),
+            "medium" => Some("medium"),
+            "high" | "xhigh" | "max" => Some("high"),
+            _ => None,
         })
         .map(str::to_owned)
+        .or_else(|| {
+            request
+                .get("thinking")
+                .and_then(|thinking| {
+                    thinking
+                        .get("budget_tokens")
+                        .and_then(Value::as_u64)
+                        .map(|budget| {
+                            if budget >= 8_192 {
+                                "high"
+                            } else if budget >= 2_048 {
+                                "medium"
+                            } else {
+                                "low"
+                            }
+                        })
+                        .or_else(|| {
+                            (thinking.get("type").and_then(Value::as_str) == Some("adaptive"))
+                                .then_some("high")
+                        })
+                })
+                .map(str::to_owned)
+        })
         .or_else(|| capabilities.default_reasoning_effort.clone())
+}
+
+fn interaction_response_format(request: &Value) -> Result<Option<Value>, String> {
+    let Some(format) = request
+        .pointer("/output_config/format")
+        .or_else(|| request.get("output_format"))
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(None);
+    };
+    let format_type = format
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Anthropic output format must have a string 'type'".to_string())?;
+    if format_type == "text" {
+        return Ok(None);
+    }
+    if format_type != "json_schema" {
+        return Err(format!(
+            "Unsupported Anthropic output format '{format_type}' for Gemini Interactions"
+        ));
+    }
+    let mut schema = format
+        .get("schema")
+        .cloned()
+        .filter(Value::is_object)
+        .ok_or_else(|| {
+            "Anthropic json_schema output format requires an object 'schema'".to_string()
+        })?;
+    sanitize_json_schema(&mut schema);
+    Ok(Some(json!({
+        "type": "text",
+        "mime_type": "application/json",
+        "schema": schema
+    })))
+}
+
+fn interaction_service_tier(request: &Value) -> Option<&'static str> {
+    match request.get("service_tier").and_then(Value::as_str) {
+        Some("standard_only") => Some("standard"),
+        _ => None,
+    }
+}
+
+fn json_contains_key(value: &Value, key: &str) -> bool {
+    match value {
+        Value::Array(values) => values.iter().any(|value| json_contains_key(value, key)),
+        Value::Object(object) => {
+            object.contains_key(key) || object.values().any(|value| json_contains_key(value, key))
+        }
+        _ => false,
+    }
+}
+
+fn gemini_interaction_request_diagnostics(request: &Value) -> Vec<String> {
+    let mut diagnostics = Vec::new();
+    let mut add = |message: &str| {
+        if !diagnostics.iter().any(|existing| existing == message) {
+            diagnostics.push(message.to_string());
+        }
+    };
+
+    for field in [
+        "metadata",
+        "container",
+        "context_management",
+        "inference_geo",
+        "mcp_servers",
+    ] {
+        if request.get(field).is_some_and(|value| !value.is_null()) {
+            add(&format!(
+                "Ignored Anthropic field '{field}': Gemini Interactions has no equivalent on this model transport"
+            ));
+        }
+    }
+    let ignored_sampling: Vec<&str> = ["temperature", "top_p", "top_k"]
+        .into_iter()
+        .filter(|field| request.get(*field).is_some())
+        .collect();
+    if !ignored_sampling.is_empty() {
+        add(&format!(
+            "Ignored Anthropic sampling fields for this Gemini thinking profile: {}",
+            ignored_sampling.join(", ")
+        ));
+    }
+    if let Some(effort) = request
+        .pointer("/output_config/effort")
+        .and_then(Value::as_str)
+    {
+        if !matches!(effort, "low" | "medium" | "high" | "xhigh" | "max") {
+            add(&format!(
+                "Ignored unsupported Anthropic output_config.effort '{effort}'"
+            ));
+        }
+    }
+    if let Some(tier) = request.get("service_tier").and_then(Value::as_str) {
+        match tier {
+            "standard_only" => {}
+            "auto" => add(
+                "Anthropic service_tier 'auto' is left unset; Gemini uses its default standard tier",
+            ),
+            _ => add(&format!(
+                "Ignored unsupported Anthropic service_tier '{tier}'"
+            )),
+        }
+    }
+    if request
+        .pointer("/tool_choice/disable_parallel_tool_use")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        add("Ignored Anthropic disable_parallel_tool_use: Gemini Interactions has no equivalent control");
+    }
+    for field in [
+        "cache_control",
+        "citations",
+        "defer_loading",
+        "input_examples",
+        "allowed_callers",
+        "eager_input_streaming",
+    ] {
+        if json_contains_key(request, field) {
+            add(&format!(
+                "Ignored Anthropic extension '{field}' while translating to Gemini Interactions"
+            ));
+        }
+    }
+    diagnostics
+}
+
+fn attach_bridge_diagnostics(
+    mut response: Response,
+    provider_file: &str,
+    diagnostics: &[String],
+) -> Response {
+    for diagnostic in diagnostics {
+        warn!(
+            provider = provider_file,
+            diagnostic, "Gemini request compatibility downgrade"
+        );
+        if let Ok(value) = HeaderValue::from_str(diagnostic) {
+            response.headers_mut().append(BRIDGE_WARNING_HEADER, value);
+        }
+    }
+    response
 }
 
 fn interaction_continuation_for_request(
@@ -3887,6 +4098,15 @@ fn translate_gemini_interactions_request(
     profile: &ProviderProfile,
     continuations: &InteractionContinuationState,
 ) -> Result<Value, String> {
+    translate_gemini_interactions_request_with_continuation(request, profile, continuations, true)
+}
+
+fn translate_gemini_interactions_request_with_continuation(
+    request: &Value,
+    profile: &ProviderProfile,
+    continuations: &InteractionContinuationState,
+    allow_continuation: bool,
+) -> Result<Value, String> {
     let messages = request
         .get("messages")
         .and_then(Value::as_array)
@@ -3894,8 +4114,16 @@ fn translate_gemini_interactions_request(
     if messages.is_empty() {
         return Err("Gemini Interactions requires at least one message".to_string());
     }
-    let continuation =
-        interaction_continuation_for_request(&profile.file_name, request, messages, continuations);
+    let continuation = allow_continuation
+        .then(|| {
+            interaction_continuation_for_request(
+                &profile.file_name,
+                request,
+                messages,
+                continuations,
+            )
+        })
+        .flatten();
     let text_tool_history =
         continuation.is_none() && interaction_messages_have_tool_history(messages);
     let input = if let Some((_, tool_names, _)) = &continuation {
@@ -3961,6 +4189,12 @@ fn translate_gemini_interactions_request(
         "generation_config".to_string(),
         Value::Object(generation_config),
     );
+    if let Some(response_format) = interaction_response_format(request)? {
+        body.insert("response_format".to_string(), response_format);
+    }
+    if let Some(service_tier) = interaction_service_tier(request) {
+        body.insert("service_tier".to_string(), json!(service_tier));
+    }
     let tools = translated_interaction_tools(request, &profile.openai_capabilities);
     if !tools.is_empty() {
         body.insert("tools".to_string(), Value::Array(tools));
@@ -3987,6 +4221,42 @@ fn translate_gemini_interactions_request(
     Ok(Value::Object(body))
 }
 
+fn interaction_request_has_mixed_tools(request: &Value) -> bool {
+    let Some(tools) = request.get("tools").and_then(Value::as_array) else {
+        return false;
+    };
+    let has_function = tools
+        .iter()
+        .any(|tool| tool.get("type").and_then(Value::as_str) == Some("function"));
+    let has_server_tool = tools
+        .iter()
+        .any(|tool| tool.get("type").and_then(Value::as_str) != Some("function"));
+    has_function && has_server_tool
+}
+
+fn remove_interaction_server_tools(request: &mut Value) -> bool {
+    let Some(tools) = request.get_mut("tools").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let original_len = tools.len();
+    tools.retain(|tool| tool.get("type").and_then(Value::as_str) == Some("function"));
+    original_len != tools.len()
+}
+
+fn is_mixed_interaction_tools_error(status: u16, message: &str) -> bool {
+    if status != 400 {
+        return false;
+    }
+    let message = message.to_ascii_lowercase();
+    message.contains("include_server_side_tool_invocations")
+        || (message.contains("server-side tool") && message.contains("function"))
+        || (message.contains("built-in tool") && message.contains("function"))
+}
+
+fn is_interaction_continuation_not_implemented(status: u16, request: &Value) -> bool {
+    status == 501 && request.get("previous_interaction_id").is_some()
+}
+
 struct InteractionResponseTranslation {
     message: Value,
     interaction_id: String,
@@ -4003,7 +4273,114 @@ fn is_gemini_server_tool_step(step_type: &str) -> bool {
             | "url_context_result"
             | "code_execution_call"
             | "code_execution_result"
+            | "google_maps_call"
+            | "google_maps_result"
+            | "file_search_call"
+            | "file_search_result"
+            | "mcp_server_tool_call"
+            | "mcp_server_tool_result"
     )
+}
+
+#[derive(Default)]
+struct InteractionServerToolTrace {
+    steps: Vec<Value>,
+    web_search_requests: u64,
+    web_fetch_requests: u64,
+}
+
+impl InteractionServerToolTrace {
+    fn capture(&mut self, step: &Value) {
+        let Some(step_type) = step.get("type").and_then(Value::as_str) else {
+            return;
+        };
+        if !is_gemini_server_tool_step(step_type) {
+            return;
+        }
+        let key = interaction_server_tool_trace_key(step);
+        let summary = interaction_server_tool_summary(step);
+        if let Some(index) = key.as_ref().and_then(|key| {
+            self.steps.iter().position(|existing| {
+                interaction_server_tool_trace_key(existing).as_ref() == Some(key)
+            })
+        }) {
+            self.steps[index] = summary;
+            return;
+        }
+        if self.steps.len() >= INTERACTION_SERVER_TOOL_TRACE_CAPACITY {
+            return;
+        }
+        if step_type == "google_search_call" {
+            self.web_search_requests = self.web_search_requests.saturating_add(1);
+        } else if step_type == "url_context_call" {
+            self.web_fetch_requests = self.web_fetch_requests.saturating_add(1);
+        }
+        self.steps.push(summary);
+    }
+
+    fn provider_metadata(&self) -> Option<Value> {
+        (!self.steps.is_empty()).then(|| {
+            json!({
+                "google": {
+                    "interaction_server_tools": self.steps
+                }
+            })
+        })
+    }
+
+    fn anthropic_usage(&self) -> Option<Value> {
+        (self.web_search_requests > 0 || self.web_fetch_requests > 0).then(|| {
+            json!({
+                "web_search_requests": self.web_search_requests,
+                "web_fetch_requests": self.web_fetch_requests
+            })
+        })
+    }
+}
+
+fn interaction_server_tool_trace_key(step: &Value) -> Option<String> {
+    let step_type = step.get("type").and_then(Value::as_str)?;
+    let id = step
+        .get("id")
+        .or_else(|| step.get("call_id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Some(format!("{step_type}\0{id}"))
+}
+
+fn bounded_interaction_trace_value(value: &Value) -> Value {
+    let serialized = serde_json::to_string(value).unwrap_or_default();
+    if serialized.chars().count() <= INTERACTION_SERVER_TOOL_TRACE_VALUE_CHARS {
+        return value.clone();
+    }
+    let preview = serialized
+        .chars()
+        .take(INTERACTION_SERVER_TOOL_TRACE_VALUE_CHARS)
+        .collect::<String>();
+    json!({"truncated": true, "preview": preview})
+}
+
+fn interaction_server_tool_summary(step: &Value) -> Value {
+    let mut summary = Map::new();
+    for field in [
+        "type",
+        "id",
+        "call_id",
+        "name",
+        "server_name",
+        "is_error",
+        "search_type",
+    ] {
+        if let Some(value) = step.get(field) {
+            summary.insert(field.to_string(), value.clone());
+        }
+    }
+    for field in ["arguments", "result"] {
+        if let Some(value) = step.get(field) {
+            summary.insert(field.to_string(), bounded_interaction_trace_value(value));
+        }
+    }
+    Value::Object(summary)
 }
 
 fn translate_gemini_interactions_response(
@@ -4034,6 +4411,7 @@ fn translate_gemini_interactions_response(
         .ok_or_else(|| "Gemini Interactions response has no steps array".to_string())?;
     let mut content = Vec::new();
     let mut calls = Vec::new();
+    let mut server_tools = InteractionServerToolTrace::default();
     for step in steps {
         match step.get("type").and_then(Value::as_str) {
             Some("thought") => {
@@ -4082,6 +4460,7 @@ fn translate_gemini_interactions_response(
                 }));
             }
             Some(step_type) if is_gemini_server_tool_step(step_type) => {
+                server_tools.capture(step);
                 info!(step_type, "Gemini server-side tool step completed");
             }
             _ => {}
@@ -4097,7 +4476,7 @@ fn translate_gemini_interactions_response(
     } else {
         "end_turn"
     };
-    let message = json!({
+    let mut message = json!({
         "id": format!("msg_{}", Uuid::new_v4().simple()),
         "type": "message",
         "role": "assistant",
@@ -4110,6 +4489,12 @@ fn translate_gemini_interactions_response(
             "output_tokens": output_tokens
         }
     });
+    if let Some(usage) = server_tools.anthropic_usage() {
+        message["usage"]["server_tool_use"] = usage;
+    }
+    if let Some(metadata) = server_tools.provider_metadata() {
+        message["provider_metadata"] = metadata;
+    }
     Ok(InteractionResponseTranslation {
         message,
         interaction_id,
@@ -4123,7 +4508,7 @@ async fn forward_gemini_interactions_profile(
     request: Value,
     continuations: Arc<InteractionContinuationState>,
 ) -> Response {
-    let interaction_request =
+    let mut interaction_request =
         match translate_gemini_interactions_request(&request, &profile, &continuations) {
             Ok(value) => value,
             Err(message) => {
@@ -4143,26 +4528,31 @@ async fn forward_gemini_interactions_profile(
             "The active Gemini Interactions profile has no API key",
         );
     };
-    let upstream = match profile
-        .client
-        .post(&profile.upstream_url)
-        .header("x-goog-api-key", api_key)
-        .json(&interaction_request)
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(err) => {
-            error!(
-                "Provider '{}' Gemini Interactions request to '{}' failed: {err}",
-                profile.file_name, profile.upstream_url
-            );
-            return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", &err.to_string());
+    let mut mixed_tools_fallback = false;
+    let mut continuation_fallback = false;
+    let upstream = loop {
+        let response = match profile
+            .client
+            .post(&profile.upstream_url)
+            .header("x-goog-api-key", api_key)
+            .json(&interaction_request)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                error!(
+                    "Provider '{}' Gemini Interactions request to '{}' failed: {err}",
+                    profile.file_name, profile.upstream_url
+                );
+                return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", &err.to_string());
+            }
+        };
+        let status = response.status();
+        if status.is_success() {
+            break response;
         }
-    };
-    let status = upstream.status();
-    if !status.is_success() {
-        let response_text = match read_response_text_limited(upstream).await {
+        let response_text = match read_response_text_limited(response).await {
             Ok(text) => text,
             Err(err) => format!("Cannot read provider error response: {err}"),
         };
@@ -4170,6 +4560,49 @@ async fn forward_gemini_interactions_profile(
             .ok()
             .map(|value| safe_error_message(&value))
             .unwrap_or(response_text);
+
+        if !mixed_tools_fallback
+            && interaction_request_has_mixed_tools(&interaction_request)
+            && is_mixed_interaction_tools_error(status.as_u16(), &message)
+            && remove_interaction_server_tools(&mut interaction_request)
+        {
+            mixed_tools_fallback = true;
+            warn!(
+                provider = %profile.file_name,
+                "Gemini rejected mixed function and server-side tools; retrying this request with Claude Code function tools only"
+            );
+            continue;
+        }
+
+        if !continuation_fallback
+            && is_interaction_continuation_not_implemented(status.as_u16(), &interaction_request)
+        {
+            interaction_request = match translate_gemini_interactions_request_with_continuation(
+                &request,
+                &profile,
+                &continuations,
+                false,
+            ) {
+                Ok(value) => value,
+                Err(translation_error) => {
+                    return anthropic_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        &translation_error,
+                    )
+                }
+            };
+            if mixed_tools_fallback {
+                remove_interaction_server_tools(&mut interaction_request);
+            }
+            continuation_fallback = true;
+            warn!(
+                provider = %profile.file_name,
+                "Gemini did not implement this stored continuation; retrying with safe full-history recovery"
+            );
+            continue;
+        }
+
         error!(
             "Provider '{}' Gemini Interactions returned HTTP {status}: {message}",
             profile.file_name
@@ -4178,7 +4611,7 @@ async fn forward_gemini_interactions_profile(
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         let (response_status, error_type) = openai_error_contract(response_status, &message);
         return anthropic_error(response_status, error_type, &message);
-    }
+    };
     let model = display_model_name(&profile.model);
     if stream_requested {
         return gemini_interactions_stream_response(
@@ -4390,6 +4823,7 @@ struct GeminiInteractionsStreamTranslator {
     active_blocks: IndexMap<usize, ActiveInteractionStreamingBlock>,
     assistant_content: Vec<Value>,
     calls: Vec<(String, String)>,
+    server_tools: InteractionServerToolTrace,
     completed: bool,
     finished: bool,
 }
@@ -4416,6 +4850,7 @@ impl GeminiInteractionsStreamTranslator {
             active_blocks: IndexMap::new(),
             assistant_content: Vec::new(),
             calls: Vec::new(),
+            server_tools: InteractionServerToolTrace::default(),
             completed: false,
             finished: false,
         }
@@ -4505,6 +4940,11 @@ impl GeminiInteractionsStreamTranslator {
             self.input_tokens =
                 usage_token(usage, &["total_input_tokens"]).unwrap_or(self.input_tokens);
         }
+        if let Some(steps) = interaction.get("steps").and_then(Value::as_array) {
+            for step in steps {
+                self.server_tools.capture(step);
+            }
+        }
         self.completed |= completed;
         if let Some(interaction_id) = self.interaction_id.as_deref() {
             remember_interaction_calls(
@@ -4564,6 +5004,7 @@ impl GeminiInteractionsStreamTranslator {
             }
             _ => {
                 if is_gemini_server_tool_step(step_type) {
+                    self.server_tools.capture(step);
                     info!(
                         provider = %self.profile_file,
                         step_type,
@@ -4690,6 +5131,9 @@ impl GeminiInteractionsStreamTranslator {
     }
 
     fn stop_step(&mut self, event: &Value) -> Result<Vec<Event>, String> {
+        if let Some(step) = event.get("step") {
+            self.server_tools.capture(step);
+        }
         let Some(index) = event
             .get("index")
             .and_then(Value::as_u64)
@@ -4786,13 +5230,21 @@ impl GeminiInteractionsStreamTranslator {
         let output_tokens = usage_token(&self.usage, &["total_output_tokens"]).unwrap_or(0);
         self.finished = true;
         let mut events = Vec::new();
+        let mut delta = json!({"stop_reason": stop_reason, "stop_sequence": Value::Null});
+        if let Some(metadata) = self.server_tools.provider_metadata() {
+            delta["provider_metadata"] = metadata;
+        }
+        let mut usage = json!({"output_tokens": output_tokens});
+        if let Some(server_tool_use) = self.server_tools.anthropic_usage() {
+            usage["server_tool_use"] = server_tool_use;
+        }
         push_anthropic_event(
             &mut events,
             "message_delta",
             json!({
                 "type": "message_delta",
-                "delta": {"stop_reason": stop_reason, "stop_sequence": Value::Null},
-                "usage": {"output_tokens": output_tokens}
+                "delta": delta,
+                "usage": usage
             }),
         )?;
         push_anthropic_event(&mut events, "message_stop", json!({"type": "message_stop"}))?;
@@ -5941,6 +6393,196 @@ fn anthropic_stream_error_event(message: &str) -> Event {
     )
 }
 
+fn gemini_count_token_parts(content: &Value, tool_names: &HashMap<String, String>) -> Vec<Value> {
+    let Some(parts) = content.as_array() else {
+        return content
+            .as_str()
+            .filter(|text| !text.is_empty())
+            .map(|text| vec![json!({"text": text})])
+            .unwrap_or_default();
+    };
+    let mut translated = Vec::new();
+    for part in parts {
+        match part.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    translated.push(json!({"text": text}));
+                }
+            }
+            Some("image" | "document") => {
+                let Some(source) = part.get("source") else {
+                    continue;
+                };
+                match source.get("type").and_then(Value::as_str) {
+                    Some("base64") => translated.push(json!({
+                        "inlineData": {
+                            "mimeType": source.get("media_type").cloned().unwrap_or_else(|| json!("application/octet-stream")),
+                            "data": source.get("data").cloned().unwrap_or(Value::Null)
+                        }
+                    })),
+                    Some("url") => translated.push(json!({
+                        "fileData": {
+                            "mimeType": source.get("media_type").cloned().unwrap_or_else(|| {
+                                if part.get("type").and_then(Value::as_str) == Some("document") {
+                                    json!("application/pdf")
+                                } else {
+                                    json!("application/octet-stream")
+                                }
+                            }),
+                            "fileUri": source.get("url").cloned().unwrap_or(Value::Null)
+                        }
+                    })),
+                    Some("text") => {
+                        if let Some(text) = source.get("data").and_then(Value::as_str) {
+                            translated.push(json!({"text": text}));
+                        }
+                    }
+                    Some("content") => {
+                        let text = value_to_text(source.get("content").unwrap_or(&Value::Null));
+                        if !text.is_empty() {
+                            translated.push(json!({"text": text}));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some("tool_use") => {
+                let Some(name) = part.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                translated.push(json!({
+                    "functionCall": {
+                        "name": name,
+                        "args": part.get("input").cloned().unwrap_or_else(|| json!({}))
+                    }
+                }));
+            }
+            Some("tool_result") => {
+                let call_id = part
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let name = tool_names
+                    .get(call_id)
+                    .map(String::as_str)
+                    .unwrap_or("unknown_function");
+                translated.push(json!({
+                    "functionResponse": {
+                        "name": name,
+                        "response": {
+                            "result": interaction_tool_result_value(part.get("content").unwrap_or(&Value::Null)),
+                            "is_error": part.get("is_error").and_then(Value::as_bool).unwrap_or(false)
+                        }
+                    }
+                }));
+            }
+            _ => {}
+        }
+    }
+    translated
+}
+
+fn gemini_count_tokens_request(
+    request: &Value,
+    profile: &ProviderProfile,
+) -> Result<Value, String> {
+    let messages = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Missing required array field 'messages'".to_string())?;
+    let tool_names = interaction_tool_names_from_messages(messages);
+    let contents: Vec<Value> = messages
+        .iter()
+        .filter_map(|message| {
+            let role = match message.get("role").and_then(Value::as_str) {
+                Some("user") => "user",
+                Some("assistant") => "model",
+                _ => return None,
+            };
+            let parts = gemini_count_token_parts(
+                message.get("content").unwrap_or(&Value::Null),
+                &tool_names,
+            );
+            (!parts.is_empty()).then(|| json!({"role": role, "parts": parts}))
+        })
+        .collect();
+    if contents.is_empty() {
+        return Err("Gemini token count request produced no supported contents".to_string());
+    }
+
+    let model = display_model_name(&profile.model);
+    let model = model.strip_prefix("models/").unwrap_or(&model);
+    let mut generate = Map::new();
+    generate.insert("model".to_string(), json!(format!("models/{model}")));
+    generate.insert("contents".to_string(), Value::Array(contents));
+    let system = value_to_text(request.get("system").unwrap_or(&Value::Null));
+    if !system.is_empty() {
+        generate.insert(
+            "systemInstruction".to_string(),
+            json!({"parts": [{"text": system}]}),
+        );
+    }
+    let functions: Vec<Value> = translated_interaction_tools(request, &profile.openai_capabilities)
+        .into_iter()
+        .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("function"))
+        .map(|tool| {
+            let mut function = Map::new();
+            for field in ["name", "description"] {
+                if let Some(value) = tool.get(field) {
+                    function.insert(field.to_string(), value.clone());
+                }
+            }
+            if let Some(parameters) = tool.get("parameters") {
+                function.insert("parameters".to_string(), parameters.clone());
+            }
+            Value::Object(function)
+        })
+        .collect();
+    if !functions.is_empty() {
+        generate.insert(
+            "tools".to_string(),
+            json!([{"functionDeclarations": functions}]),
+        );
+    }
+    if let Some(format) = interaction_response_format(request)? {
+        generate.insert(
+            "generationConfig".to_string(),
+            json!({
+                "responseMimeType": "application/json",
+                "responseJsonSchema": format.get("schema").cloned().unwrap_or_else(|| json!({}))
+            }),
+        );
+    }
+    Ok(json!({"generateContentRequest": generate}))
+}
+
+fn gemini_count_tokens_url(profile: &ProviderProfile) -> Result<String, String> {
+    let model = display_model_name(&profile.model);
+    let model = model.strip_prefix("models/").unwrap_or(&model);
+    if model.is_empty()
+        || !model.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+    {
+        return Err(format!(
+            "Unsupported Gemini model id for token counting: {model}"
+        ));
+    }
+    Ok(format!(
+        "{}/models/{model}:countTokens",
+        profile.base_url.trim_end_matches('/')
+    ))
+}
+
+fn anthropic_token_count_response(input_tokens: usize, source: &'static str) -> Response {
+    let mut response = Json(json!({"input_tokens": input_tokens})).into_response();
+    response.headers_mut().insert(
+        "x-claude-bridge-token-count",
+        HeaderValue::from_static(source),
+    );
+    response
+}
+
 async fn anthropic_count_tokens(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -5957,8 +6599,9 @@ async fn anthropic_count_tokens(
         );
     }
 
-    if let Some(profile) = active_provider_profile(&state) {
-        if let Some(identity) = upstream_identity_label(&profile, &state.model) {
+    let active_profile = active_provider_profile(&state);
+    if let Some(profile) = active_profile.as_ref() {
+        if let Some(identity) = upstream_identity_label(profile, &state.model) {
             if let Err(message) = append_bridge_identity(&mut request, &identity) {
                 return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message);
             }
@@ -5966,7 +6609,62 @@ async fn anthropic_count_tokens(
     }
 
     let input_tokens = estimate_anthropic_input_tokens(&request);
-    Json(json!({"input_tokens": input_tokens})).into_response()
+    let Some(profile) =
+        active_profile.filter(|profile| profile.transport == ProviderTransport::GeminiInteractions)
+    else {
+        return anthropic_token_count_response(input_tokens, "estimated");
+    };
+    let diagnostics = gemini_interaction_request_diagnostics(&request);
+    let native_result = async {
+        let api_key = profile
+            .api_key
+            .as_ref()
+            .ok_or_else(|| "Gemini Interactions profile has no Google credential".to_string())?;
+        let url = gemini_count_tokens_url(&profile)?;
+        let body = gemini_count_tokens_request(&request, &profile)?;
+        let response = profile
+            .client
+            .post(url)
+            .header("x-goog-api-key", api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| format!("Gemini countTokens request failed: {error}"))?;
+        let status = response.status();
+        let body = read_response_json_limited(response)
+            .await
+            .map_err(|error| format!("Cannot read Gemini countTokens response: {error}"))?;
+        if !status.is_success() {
+            return Err(format!(
+                "Gemini countTokens returned HTTP {status}: {}",
+                safe_error_message(&body)
+            ));
+        }
+        body.get("totalTokens")
+            .or_else(|| body.get("total_tokens"))
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| "Gemini countTokens response has no valid totalTokens".to_string())
+    };
+    let response = match tokio::time::timeout(GEMINI_COUNT_TOKENS_TIMEOUT, native_result).await {
+        Ok(Ok(native_tokens)) => anthropic_token_count_response(native_tokens, "google-native"),
+        Ok(Err(message)) => {
+            warn!(
+                provider = %profile.file_name,
+                error = message,
+                "Falling back to estimated Anthropic input token count"
+            );
+            anthropic_token_count_response(input_tokens, "estimated-fallback")
+        }
+        Err(_) => {
+            warn!(
+                provider = %profile.file_name,
+                "Gemini countTokens timed out; falling back to estimated Anthropic input token count"
+            );
+            anthropic_token_count_response(input_tokens, "estimated-fallback")
+        }
+    };
+    attach_bridge_diagnostics(response, &profile.file_name, &diagnostics)
 }
 
 fn estimate_anthropic_input_tokens(request: &Value) -> usize {
@@ -10573,6 +11271,428 @@ mod tests {
     }
 
     #[test]
+    fn detects_and_removes_only_mixed_interaction_server_tools() {
+        let mut request = json!({
+            "tools": [
+                {"type": "function", "name": "read_file"},
+                {"type": "google_search"},
+                {"type": "url_context"}
+            ]
+        });
+        assert!(interaction_request_has_mixed_tools(&request));
+        assert!(is_mixed_interaction_tools_error(
+            400,
+            "Set tool_config.include_server_side_tool_invocations when combining built-in tools and function calling"
+        ));
+        assert!(!is_mixed_interaction_tools_error(
+            500,
+            "built-in tool function"
+        ));
+        assert!(remove_interaction_server_tools(&mut request));
+        assert!(!interaction_request_has_mixed_tools(&request));
+        assert_eq!(request["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(request["tools"][0]["name"], "read_file");
+    }
+
+    #[test]
+    fn configures_google_maps_and_native_file_search() {
+        let raw = json!({
+            "capabilities": {
+                "gemini_builtin_tools": ["google_maps"],
+                "gemini_file_search_store_names": ["fileSearchStores/project-docs"]
+            }
+        });
+        let capabilities = parse_openai_capabilities_with_defaults(
+            raw.as_object().unwrap(),
+            "gemini-interactions.json",
+            OpenAiCapabilities::gemini_interactions(),
+        )
+        .unwrap();
+        assert_eq!(capabilities.gemini_builtin_tools, ["google_maps"]);
+        assert_eq!(
+            capabilities.gemini_file_search_store_names,
+            ["fileSearchStores/project-docs"]
+        );
+        let tools = translated_interaction_tools(&json!({}), &capabilities);
+        assert_eq!(tools[0]["type"], "google_maps");
+        assert_eq!(tools[1]["type"], "file_search");
+        assert_eq!(
+            tools[1]["file_search_store_names"][0],
+            "fileSearchStores/project-docs"
+        );
+    }
+
+    #[test]
+    fn maps_structured_output_effort_service_tier_and_document_sources() {
+        let profile = interactions_test_profile("gemini-interactions.json");
+        let request = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "document", "source": {"type": "url", "url": "https://example.com/report.pdf"}},
+                    {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "plain report"}},
+                    {"type": "document", "source": {"type": "content", "content": [{"type": "text", "text": "block report"}]}}
+                ]
+            }],
+            "output_config": {
+                "effort": "xhigh",
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"]
+                    }
+                }
+            },
+            "service_tier": "standard_only"
+        });
+        let translated = translate_gemini_interactions_request(
+            &request,
+            &profile,
+            &RwLock::new(InteractionContinuationCache::default()),
+        )
+        .unwrap();
+        assert_eq!(translated["generation_config"]["thinking_level"], "high");
+        assert_eq!(translated["service_tier"], "standard");
+        assert_eq!(
+            translated["response_format"]["mime_type"],
+            "application/json"
+        );
+        assert!(translated["response_format"]["schema"]
+            .get("$schema")
+            .is_none());
+        let content = translated["input"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "document");
+        assert_eq!(content[0]["uri"], "https://example.com/report.pdf");
+        assert_eq!(content[0]["mime_type"], "application/pdf");
+        assert_eq!(
+            BASE64_STANDARD
+                .decode(content[1]["data"].as_str().unwrap())
+                .unwrap(),
+            b"plain report"
+        );
+        assert_eq!(
+            BASE64_STANDARD
+                .decode(content[2]["data"].as_str().unwrap())
+                .unwrap(),
+            b"block report"
+        );
+    }
+
+    #[test]
+    fn exposes_explicit_diagnostics_for_unmapped_anthropic_fields() {
+        let request = json!({
+            "metadata": {"user_id": "test"},
+            "container": "container-1",
+            "temperature": 0.7,
+            "service_tier": "auto",
+            "tool_choice": {"type": "auto", "disable_parallel_tool_use": true},
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}}]
+            }]
+        });
+        let diagnostics = gemini_interaction_request_diagnostics(&request).join("\n");
+        assert!(diagnostics.contains("metadata"));
+        assert!(diagnostics.contains("container"));
+        assert!(diagnostics.contains("temperature"));
+        assert!(diagnostics.contains("default standard tier"));
+        assert!(diagnostics.contains("disable_parallel_tool_use"));
+        assert!(diagnostics.contains("cache_control"));
+    }
+
+    #[test]
+    fn builds_google_native_count_tokens_request_with_prompt_and_tools() {
+        let profile = interactions_test_profile("gemini-interactions.json");
+        let request = json!({
+            "system": "You are a coding agent.",
+            "messages": [
+                {"role": "user", "content": "Read Cargo.toml"},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "call-1", "name": "read_file", "input": {"path": "Cargo.toml"}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call-1", "content": "package data"}]}
+            ],
+            "tools": [{
+                "name": "read_file",
+                "description": "Read a file",
+                "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}
+            }],
+            "output_config": {"format": {"type": "json_schema", "schema": {"type": "object"}}}
+        });
+        let translated = gemini_count_tokens_request(&request, &profile).unwrap();
+        let generate = &translated["generateContentRequest"];
+        assert_eq!(generate["model"], "models/gemini-3.6-flash");
+        assert_eq!(
+            generate["systemInstruction"]["parts"][0]["text"],
+            "You are a coding agent."
+        );
+        assert_eq!(
+            generate["contents"][1]["parts"][0]["functionCall"]["name"],
+            "read_file"
+        );
+        assert_eq!(
+            generate["contents"][2]["parts"][0]["functionResponse"]["name"],
+            "read_file"
+        );
+        assert_eq!(
+            generate["tools"][0]["functionDeclarations"][0]["name"],
+            "read_file"
+        );
+        assert_eq!(
+            generate["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_count_tokens_uses_google_native_endpoint() {
+        let captured = Arc::new(tokio::sync::Mutex::new(None::<Value>));
+        let captured_for_handler = captured.clone();
+        let mock = Router::new().route(
+            "/v1beta/models/gemini-3.6-flash:countTokens",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let captured = captured_for_handler.clone();
+                async move {
+                    assert_eq!(
+                        headers
+                            .get("x-goog-api-key")
+                            .and_then(|value| value.to_str().ok()),
+                        Some("test-key")
+                    );
+                    *captured.lock().await = Some(body);
+                    Json(json!({"totalTokens": 321}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        let mut profile = interactions_test_profile("gemini-interactions.json");
+        profile.base_url = format!("http://{address}/v1beta");
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let state = Arc::new(AppState {
+            gemini_transport: Arc::new(RwLock::new(GeminiTransport {
+                client: Client::builder().build().unwrap(),
+                proxy_url: None,
+            })),
+            fallback_api_key: Some("local-token".to_string()),
+            upstream_url: "https://example.invalid".to_string(),
+            model: "gemini-3.6-flash".to_string(),
+            thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
+            interaction_continuations: Arc::new(RwLock::new(
+                InteractionContinuationCache::default(),
+            )),
+            vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
+            routing: Arc::new(RwLock::new(ProviderRoutingState {
+                profiles: vec![profile],
+                active_file: "gemini-interactions.json".to_string(),
+                source: ProviderProfileSource::Native,
+            })),
+            shutdown_tx,
+            settings_dir: PathBuf::new(),
+            providers_dir: PathBuf::new(),
+            bridge_state_path: PathBuf::new(),
+            image_output_dir: env::temp_dir(),
+            image_model: DEFAULT_IMAGE_MODEL.to_string(),
+            image_upstream_url: DEFAULT_IMAGE_UPSTREAM.to_string(),
+            local_bridge_base_url: "http://127.0.0.1:18787".to_string(),
+            admin_state_lock: Arc::new(tokio::sync::Mutex::new(())),
+        });
+        let response = anthropic_count_tokens(
+            State(state),
+            HeaderMap::new(),
+            Json(json!({
+                "system": "Count this too.",
+                "messages": [{"role": "user", "content": "hello"}]
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-claude-bridge-token-count")
+                .unwrap(),
+            "google-native"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["input_tokens"], 321);
+        assert!(
+            captured.lock().await.as_ref().unwrap()["generateContentRequest"]["systemInstruction"]
+                ["parts"][0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Count this too.")
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn returns_bounded_gemini_server_tool_metadata_and_standard_usage_counts() {
+        let upstream = json!({
+            "id": "interaction-server-tools-1",
+            "status": "completed",
+            "steps": [
+                {"type": "google_search_call", "id": "search-1", "arguments": {"query": "Rust"}},
+                {"type": "google_search_result", "call_id": "search-1", "result": [{"search_suggestions": ["Rust language"]}]},
+                {"type": "url_context_call", "id": "fetch-1", "arguments": {"urls": ["https://example.com"]}},
+                {"type": "url_context_result", "call_id": "fetch-1", "result": [{"url": "https://example.com", "status": "success"}]},
+                {"type": "model_output", "content": [{"type": "text", "text": "Done."}]}
+            ],
+            "usage": {"total_input_tokens": 12, "total_output_tokens": 4}
+        });
+        let translated =
+            translate_gemini_interactions_response(&upstream, "gemini-3.6-flash").unwrap();
+        assert_eq!(translated.message["content"][0]["text"], "Done.");
+        assert_eq!(
+            translated.message["usage"]["server_tool_use"]["web_search_requests"],
+            1
+        );
+        assert_eq!(
+            translated.message["usage"]["server_tool_use"]["web_fetch_requests"],
+            1
+        );
+        assert_eq!(
+            translated.message["provider_metadata"]["google"]["interaction_server_tools"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn retries_known_mixed_tools_rejection_with_function_tools_only() {
+        let requests = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let captured = requests.clone();
+        let mock = Router::new().route(
+            "/interactions",
+            post(move |Json(body): Json<Value>| {
+                let captured = captured.clone();
+                async move {
+                    let mut requests = captured.lock().await;
+                    requests.push(body);
+                    if requests.len() == 1 {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({"error": {"message": "tool_config.include_server_side_tool_invocations is required when combining built-in tools and function calling"}})),
+                        )
+                            .into_response();
+                    }
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "id": "interaction-retry-1",
+                            "status": "completed",
+                            "steps": [{"type": "model_output", "content": [{"type": "text", "text": "Recovered."}]}],
+                            "usage": {"total_input_tokens": 5, "total_output_tokens": 2}
+                        })),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        let mut profile = interactions_test_profile("gemini-interactions.json");
+        profile.upstream_url = format!("http://{address}/interactions");
+        let response = forward_gemini_interactions_profile(
+            profile,
+            json!({
+                "stream": false,
+                "messages": [{"role": "user", "content": "Read Cargo.toml"}],
+                "tools": [{
+                    "name": "read_file",
+                    "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}
+                }]
+            }),
+            Arc::new(RwLock::new(InteractionContinuationCache::default())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["tools"].as_array().unwrap().len(), 4);
+        assert_eq!(requests[1]["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(requests[1]["tools"][0]["type"], "function");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn retries_unimplemented_interaction_continuation_with_full_history() {
+        let requests = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let captured = requests.clone();
+        let mock = Router::new().route(
+            "/interactions",
+            post(move |Json(body): Json<Value>| {
+                let captured = captured.clone();
+                async move {
+                    let mut requests = captured.lock().await;
+                    requests.push(body);
+                    if requests.len() == 1 {
+                        return (
+                            StatusCode::NOT_IMPLEMENTED,
+                            Json(json!({"error": {"message": "previous_interaction_id is not implemented for this interaction"}})),
+                        )
+                            .into_response();
+                    }
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "id": "interaction-recovered-2",
+                            "status": "completed",
+                            "steps": [{"type": "model_output", "content": [{"type": "text", "text": "Recovered history."}]}],
+                            "usage": {"total_input_tokens": 9, "total_output_tokens": 3}
+                        })),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        let mut profile = interactions_test_profile("gemini-interactions.json");
+        profile.openai_capabilities.gemini_builtin_tools.clear();
+        profile.upstream_url = format!("http://{address}/interactions");
+        let continuations = Arc::new(RwLock::new(InteractionContinuationCache::default()));
+        let first = json!({"messages": [{"role": "user", "content": "Remember alpha."}]});
+        let assistant_content = vec![json!({"type": "text", "text": "Stored alpha."})];
+        remember_interaction_continuation(
+            &continuations,
+            &profile.file_name,
+            &first,
+            "interaction-prior-1",
+            &assistant_content,
+            &[],
+        );
+        let request = json!({
+            "stream": false,
+            "messages": [
+                {"role": "user", "content": "Remember alpha."},
+                {"role": "assistant", "content": assistant_content},
+                {"role": "user", "content": "What did I ask you to remember?"}
+            ]
+        });
+        let response = forward_gemini_interactions_profile(profile, request, continuations).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0]["previous_interaction_id"],
+            "interaction-prior-1"
+        );
+        assert!(requests[1].get("previous_interaction_id").is_none());
+        assert_eq!(requests[1]["input"].as_array().unwrap().len(), 3);
+        server.abort();
+    }
+
+    #[test]
     fn builds_stateful_interactions_delta_only_after_exact_transcript_match() {
         let profile = interactions_test_profile("gemini-interactions.json");
         let continuations = RwLock::new(InteractionContinuationCache::default());
@@ -10624,6 +11744,16 @@ mod tests {
             "What did I ask you to remember?"
         );
         assert!(continued.get("system_instruction").is_none());
+
+        let recovered = translate_gemini_interactions_request_with_continuation(
+            &second,
+            &profile,
+            &continuations,
+            false,
+        )
+        .unwrap();
+        assert!(recovered.get("previous_interaction_id").is_none());
+        assert_eq!(recovered["input"].as_array().unwrap().len(), 3);
 
         let mut edited = second.clone();
         edited["messages"][1]["content"][0]["text"] = json!("Edited history.");

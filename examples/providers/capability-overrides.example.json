@@ -18,6 +18,7 @@
     "tool_result_media": "separate_user",
     "tool_schema": "preserve",
     "max_tokens_field": "max_completion_tokens",
-    "gemini_builtin_tools": []
+    "gemini_builtin_tools": [],
+    "gemini_file_search_store_names": []
   }
 }

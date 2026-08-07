@@ -26,7 +26,10 @@ The bridge indexes tool continuations by Google's opaque call ID and ordinary tu
 fingerprint of the provider, system prompt, and complete message prefix. Only an exact match uses
 delta-only continuation; edited history, cache eviction, or a service restart safely falls back to
 full `steps`. Claude Code's client-side tools can coexist with Google's server-side `google_search`,
-`url_context`, and `code_execution` tools.
+`url_context`, `code_execution`, `google_maps`, and configured File Search tools. If Google rejects
+a mixed server/client tool request, the bridge retries once with Claude Code's function tools only.
+If a stored continuation returns the known HTTP 501 incompatibility, it retries once with safe
+full-history recovery instead of ending the agent turn.
 
 ```json
 {
@@ -38,10 +41,55 @@ full `steps`. Claude Code's client-side tools can coexist with Google's server-s
     "default_reasoning_effort": "high",
     "include_thoughts": true,
     "sampling_parameters": false,
-    "gemini_builtin_tools": ["google_search", "url_context", "code_execution"]
+    "gemini_builtin_tools": ["google_search", "url_context", "code_execution", "google_maps"],
+    "gemini_file_search_store_names": ["fileSearchStores/project-docs"]
   }
 }
 ```
+
+Google server-tool calls/results are returned in bounded `provider_metadata.google.interaction_server_tools`
+for unary responses and the final stream delta. Standard Anthropic usage counters are also populated for
+web search and URL fetch requests. Search/URL results are not fabricated as Anthropic citation blocks:
+Google does not return the encrypted citation fields required by that contract.
+
+### Native Claude Code request semantics / Claude Code 请求语义原生映射
+
+The native route now maps the high-value Claude Code controls directly instead of treating Gemini as an
+Anthropic-shaped endpoint:
+
+| Claude Code / Anthropic input | Google native behavior |
+| --- | --- |
+| `/v1/messages/count_tokens` | Calls `models/{model}:countTokens`; `x-claude-bridge-token-count` reports `google-native` or the bounded `estimated-fallback`. |
+| `output_config.format` | Becomes Interactions `response_format` with a sanitized JSON Schema. |
+| `output_config.effort` | Becomes `thinking_level`; `xhigh` and `max` are conservatively clamped to Gemini `high`. |
+| Document URL, base64, text, or content source | Becomes native Interactions document input, preserving the declared MIME type where available. |
+| `service_tier: standard_only` | Becomes Gemini `standard`; `auto` is omitted so Google uses its standard default rather than silently selecting a paid priority tier. |
+
+Fields without a safe Interactions equivalent are no longer silently ignored. The bridge logs each unique
+downgrade and repeats it in `x-claude-bridge-warning` response headers. Unsupported or malformed structured
+output formats fail as request errors because silently returning unstructured text would violate the caller's
+contract.
+
+原生路径现在会直接映射 Claude Code 的高价值请求语义：token 计数调用 Google 原生
+`models/{model}:countTokens`；结构化输出进入 `response_format`；effort 进入 `thinking_level`；文档
+URL、base64、文本和 content source 进入原生 document；`standard_only` 保守映射为 `standard`，
+`auto` 则保持 Google 的标准默认层级。无法安全映射的字段会同时写入日志和
+`x-claude-bridge-warning` 响应头，不再静默忽略；不支持或格式错误的结构化输出直接返回请求错误。
+
+服务端工具调用和结果不再只写日志：普通响应及流式结束事件都会携带有界的
+`provider_metadata.google.interaction_server_tools`，搜索与 URL 获取还会写入 Anthropic 标准 usage
+计数。Google 未返回 Anthropic 引用块所要求的加密引用字段，因此桥接器不会伪造引用。
+混合工具遇到 Google 已知拒绝时仅回退当前请求的服务端工具，保留 Claude Code 函数工具；
+`previous_interaction_id` 遇到已知 501 时则自动安全重放完整历史。
+
+Images and PDF documents already pass through native Interactions content. Audio/video are valid Google
+modalities, but Claude Code's current Anthropic Messages input does not emit corresponding blocks, so the
+bridge does not claim an unreachable input path. Computer Use and remote MCP server tools likewise remain
+disabled until an execution/safety boundary and credential-redaction contract exist.
+
+图片与 PDF 文档已经通过原生 Interactions content 传递。Google 虽支持音频/视频，但 Claude Code
+当前的 Anthropic Messages 输入不会产生对应内容块，因此这里不虚报一条客户端无法到达的能力。
+Computer Use 与远程 MCP Server 工具也要等动作执行、安全边界和凭据脱敏闭环后再开放。
 
 对 Gemini 3.6 Flash，当前推荐使用独立的 `gemini-interactions` 原生有状态通道，而不是
 OpenAI Chat 兼容包装。桥接器固定发送 `store: true`，按精确会话分支续传

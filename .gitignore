@@ -4,6 +4,7 @@
 # Release packages and locally deployed service artifacts
 /dist/
 /service/*.exe
+/service/*.bak-*
 /service/logs/
 /ClaudeBridgeManager.exe
 

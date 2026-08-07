@@ -11,7 +11,9 @@
     "gemini_builtin_tools": [
       "google_search",
       "url_context",
-      "code_execution"
-    ]
+      "code_execution",
+      "google_maps"
+    ],
+    "gemini_file_search_store_names": []
   }
 }

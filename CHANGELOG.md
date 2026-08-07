@@ -7,6 +7,17 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 
 ## English
 
+## [Unreleased]
+
+### Gemini Interactions Compatibility and Native Tools
+- Replaced local estimation on `/v1/messages/count_tokens` with Google's native `models.countTokens` for `gemini-interactions` profiles. The request includes the translated prompt, system instruction, custom function declarations, structured-output schema, and supported media; bounded upstream failures fall back to the local estimate and expose the count source through `x-claude-bridge-token-count`.
+- Mapped Anthropic `output_config.format` to native Interactions `response_format`, `output_config.effort` to `thinking_level` with conservative `xhigh`/`max` → `high` clamping, document URL/text/content sources to native document input, and `service_tier: standard_only` to Gemini `standard` while leaving `auto` at Google's standard default.
+- Added explicit compatibility diagnostics for Anthropic fields that Gemini Interactions cannot represent. Diagnostics are logged and returned through repeatable `x-claude-bridge-warning` headers instead of being silently discarded; malformed or unsupported structured-output formats return a request error.
+- Added bounded server-tool event return through `provider_metadata.google.interaction_server_tools` for unary and streaming responses, plus standard Anthropic usage counters for Google Search and URL Context calls. The bridge does not fabricate Anthropic citation/result blocks when Google does not provide the required encrypted citation fields.
+- Added one-shot compatibility fallbacks for two upstream gaps: mixed Google server tools plus Claude Code function tools retry with function tools only after the known 400 rejection, and unsupported `previous_interaction_id` requests retry with safe full-history recovery after HTTP 501.
+- Added native `google_maps` configuration and File Search through `gemini_file_search_store_names`. Documented the current reachable modality and safety boundaries for audio/video, Computer Use, and remote MCP Server tools.
+- Expanded regression coverage to 98 Rust tests, including native token-count endpoint verification, request-semantic mappings, explicit diagnostics, both compatibility fallback paths, and server-tool metadata/usage translation.
+
 ## [v0.5.0] - 2026-08-08
 
 ### Native Stateful Gemini Interactions
@@ -191,6 +202,17 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 ---
 
 ## 中文
+
+## [未发布]
+
+### Gemini Interactions 兼容性与原生工具
+- `gemini-interactions` profile 的 `/v1/messages/count_tokens` 已由本地估算改为调用 Google 原生 `models.countTokens`，请求包含转换后的提示、系统指令、自定义函数声明、结构化输出 schema 和受支持媒体；受限的上游失败会回退到本地估算，并通过 `x-claude-bridge-token-count` 标明计数来源。
+- 新增 Anthropic 请求语义映射：`output_config.format` → 原生 Interactions `response_format`，`output_config.effort` → `thinking_level`（`xhigh`/`max` 保守钳制为 `high`），文档 URL/文本/content → 原生文档输入，`service_tier: standard_only` → Gemini `standard`；`auto` 保持 Google 默认标准层级。
+- 对 Gemini Interactions 无法表达的 Anthropic 字段新增明确兼容诊断：同时写入日志与可重复的 `x-claude-bridge-warning` 响应头，不再静默丢弃；格式错误或不支持的结构化输出会直接返回请求错误。
+- 普通响应和流式响应新增有界的 `provider_metadata.google.interaction_server_tools` 服务端工具事件回传，并为 Google Search 与 URL Context 调用补充 Anthropic 标准 usage 计数。Google 未提供所需加密引用字段时，桥接器不会伪造 Anthropic 引用或工具结果块。
+- 针对两个上游缺口增加单次兼容降级：混合 Google 服务端工具与 Claude Code 函数工具遇到已知 400 时仅用函数工具重试；`previous_interaction_id` 遇到 HTTP 501 时使用安全完整历史恢复重试。
+- 新增原生 `google_maps` 配置，以及通过 `gemini_file_search_store_names` 配置 File Search；同时明确音频/视频、Computer Use 与远程 MCP Server 工具当前可达性和安全边界。
+- Rust 回归测试扩充至 98 项，包括 Google 原生 token count 端点验证、请求语义映射、明确诊断、两条兼容降级路径及服务端工具元数据/usage 转换。
 
 ## [v0.5.0] - 2026-08-08
 
