@@ -171,6 +171,31 @@ Provider。两者属于不同厂商时，应同时评估双方的数据政策。
 提供绝对安全保证。完整字段说明见
 [Vision Proxy 配置](PROVIDER_CONFIG.md#通用-vision-proxy)。
 
+### Gemini 3.1 高质量生图
+
+Windows 安装器会为 Claude Code 自动注册本地 `gemini-image` MCP 服务。重新启动
+Claude Code 会话后，直接说“生成图片：一只可爱的小狗”即可；无论当前目标模型是
+DeepSeek、Kimi、Qwen 还是 Gemini，它都可以调用桥接器提供的 `generate_image`
+工具。生图固定使用 `gemini-3.1-flash-image`，不会替换负责看图/OCR 的
+`gemini-3.6-flash`。
+
+默认使用高思考和 2K 输出；工具也支持 1K、2K、4K，以及 1:1、16:9、9:16 等
+官方宽高比。结果会作为图片预览返回 Claude Code，同时保存到：
+
+```text
+%USERPROFILE%\Pictures\ClaudeCodeBridge\
+```
+
+安装器使用 Windows 的系统“图片”已知目录；如果它被重定向到 OneDrive 或其他位置，
+实际输出目录也会随之调整，而不是写死为上述路径。
+
+当前边界：每次工具调用只保留上游返回的第一张图片；提示最多 20,000 个 Unicode
+字符；响应体最多 64 MiB；解码后的单图最多 32 MiB；完整生成过程超时 180 秒。
+生图会产生独立的 Gemini API 费用，并受 Google 的配额、内容安全和可用性策略约束；
+所有生成图片都带有 Google SynthID。桥接器只允许服务写入固定生图目录，模型不能
+借此指定任意系统路径。若升级后工具尚未出现，请完全退出并重新打开 Claude Code，
+再在 `/mcp` 中确认 `gemini-image` 已连接。
+
 ### 三分钟添加一个 OpenAI Provider
 
 1. 打开配置目录：
@@ -326,6 +351,28 @@ the extracted evidence is sent to the target Provider. The bridge labels media-d
 content as untrusted and instructs both models not to execute instructions found inside
 the image, but model-level prompt-injection defenses cannot provide an absolute guarantee.
 See the full [Vision Proxy configuration](PROVIDER_CONFIG.md#通用-vision-proxy).
+
+### High-quality image generation with Gemini 3.1
+
+The Windows installer registers a local `gemini-image` MCP server with Claude Code.
+After restarting the Claude Code session, a request such as “Generate an image of a
+cute puppy” can invoke the bridge's `generate_image` tool regardless of whether the
+active target is DeepSeek, Kimi, Qwen, or Gemini. Generation always uses
+`gemini-3.1-flash-image`; it does not replace `gemini-3.6-flash`, which remains the
+default model for vision input and OCR.
+
+The tool defaults to high thinking and 2K output, supports 1K/2K/4K and the official
+aspect ratios, returns an inline preview, and saves the file under
+the Windows known Pictures folder, normally
+`%USERPROFILE%\Pictures\ClaudeCodeBridge\`. If Pictures is redirected to OneDrive
+or another location, the installer follows that system location.
+
+Current boundaries: one saved image per tool call, a 20,000-character prompt, a
+64 MiB upstream response limit, a 32 MiB decoded-image limit, and a 180-second total
+timeout. Image generation incurs a separate Gemini API charge and remains subject to
+Google quota, safety, and availability policies; generated images contain SynthID.
+The service writes only to its fixed generated-images directory. If the tool is not
+visible after an upgrade, fully restart Claude Code and verify `gemini-image` in `/mcp`.
 
 ### Why this is different from a generic bridge
 

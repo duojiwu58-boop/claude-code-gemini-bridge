@@ -34,6 +34,7 @@ $installDir = Join-Path $env:ProgramFiles 'ClaudeCodeBridge'
 $programDataDir = Join-Path $env:ProgramData 'ClaudeCodeBridge'
 $desktop = [Environment]::GetFolderPath('DesktopDirectory')
 $shortcutPath = Join-Path $desktop 'Claude Code 模型切换器.lnk'
+$claudeUserConfig = Join-Path $env:USERPROFILE '.claude.json'
 
 $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
 if ($null -ne $service) {
@@ -52,6 +53,30 @@ if ($null -ne $service) {
 
 if (Test-Path -LiteralPath $shortcutPath -PathType Leaf) {
     Remove-Item -LiteralPath $shortcutPath -Force
+}
+
+if (Test-Path -LiteralPath $claudeUserConfig -PathType Leaf) {
+    try {
+        $claudeUser = [System.IO.File]::ReadAllText($claudeUserConfig) |
+            ConvertFrom-Json
+        if ($null -ne $claudeUser.PSObject.Properties['mcpServers'] -and
+            $null -ne $claudeUser.mcpServers -and
+            $null -ne $claudeUser.mcpServers.PSObject.Properties['gemini-image']) {
+            Copy-Item `
+                -LiteralPath $claudeUserConfig `
+                -Destination "$claudeUserConfig.backup-$(Get-Date -Format 'yyyyMMdd-HHmmss')" `
+                -Force
+            $claudeUser.mcpServers.PSObject.Properties.Remove('gemini-image')
+            [System.IO.File]::WriteAllText(
+                $claudeUserConfig,
+                ($claudeUser | ConvertTo-Json -Depth 100),
+                [System.Text.UTF8Encoding]::new($false)
+            )
+        }
+    }
+    catch {
+        Write-Warning "无法移除 Gemini 生图工具配置：$($_.Exception.Message)"
+    }
 }
 
 $expectedInstallDir = [System.IO.Path]::GetFullPath(

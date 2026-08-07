@@ -22,7 +22,10 @@ use std::{
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, State},
-    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    http::{
+        header::{AUTHORIZATION, ORIGIN},
+        HeaderMap, StatusCode,
+    },
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
@@ -30,6 +33,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use futures_util::{stream, Stream, StreamExt};
 use indexmap::IndexMap;
 use reqwest::{Client, Proxy};
@@ -48,12 +52,19 @@ const VISION_MAX_OUTPUT_TOKENS: u64 = 4096;
 const MAX_VISION_CONTEXT_CHARS: usize = 12_000;
 const MAX_VISION_OBSERVATION_CHARS: usize = 16_000;
 const MAX_UPSTREAM_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_IMAGE_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_GENERATED_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_IMAGE_PROMPT_CHARS: usize = 20_000;
 const MAX_UPSTREAM_SSE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const UPSTREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 const BRIDGE_IDENTITY_MARKER: &str = "<bridge_runtime_identity>";
 const MAX_UPSTREAM_IDENTITY_CHARS: usize = 200;
+const DEFAULT_IMAGE_MODEL: &str = "gemini-3.1-flash-image";
+const DEFAULT_IMAGE_UPSTREAM: &str =
+    "https://generativelanguage.googleapis.com/v1beta/interactions";
+const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 // Identity phrases Claude Code injects into system prompts. These are matched
 // as phrases/patterns rather than whole declarations so that subagent persona
 // variants ("You are a file search specialist for Claude Code, ...", "You are
@@ -265,6 +276,9 @@ struct AppState {
     settings_dir: PathBuf,
     providers_dir: PathBuf,
     bridge_state_path: PathBuf,
+    image_output_dir: PathBuf,
+    image_model: String,
+    image_upstream_url: String,
     local_bridge_base_url: String,
     admin_state_lock: Arc<tokio::sync::Mutex<()>>,
 }
@@ -367,6 +381,25 @@ where
                 .map_err(|_| env::VarError::NotPresent)
         })
         .map_err(|_| "Cannot resolve bridge state file path".to_string())?;
+    let image_output_dir = env::var("GEMINI_BRIDGE_IMAGE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            settings_dir
+                .parent()
+                .unwrap_or(&settings_dir)
+                .join("Pictures")
+                .join("ClaudeCodeBridge")
+        });
+    fs::create_dir_all(&image_output_dir).map_err(|err| {
+        format!(
+            "Cannot create generated image directory '{}': {err}",
+            image_output_dir.display()
+        )
+    })?;
+    let image_model =
+        env::var("GEMINI_BRIDGE_IMAGE_MODEL").unwrap_or_else(|_| DEFAULT_IMAGE_MODEL.to_string());
+    let image_upstream_url = env::var("GEMINI_BRIDGE_IMAGE_UPSTREAM")
+        .unwrap_or_else(|_| DEFAULT_IMAGE_UPSTREAM.to_string());
     let local_bridge_base_url = format!("http://{listen}");
     let loaded_profiles =
         load_provider_profiles(&providers_dir, &settings_dir, &local_bridge_base_url)
@@ -399,6 +432,9 @@ where
         settings_dir,
         providers_dir,
         bridge_state_path,
+        image_output_dir,
+        image_model,
+        image_upstream_url,
         local_bridge_base_url,
         admin_state_lock: Arc::new(tokio::sync::Mutex::new(())),
     });
@@ -409,6 +445,7 @@ where
         .route("/v1/responses", post(responses))
         .route("/v1/messages", post(anthropic_messages))
         .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
+        .route("/mcp", post(mcp))
         .route("/admin/status", get(admin_status))
         .route("/admin/profiles", get(admin_profiles))
         .route("/admin/active-profile", post(admin_set_active_profile))
@@ -1502,6 +1539,414 @@ fn active_provider_profile(state: &AppState) -> Option<ProviderProfile> {
         .iter()
         .find(|profile| profile.file_name == routing.active_file)
         .cloned()
+}
+
+fn mcp_json_response(id: Value, result: Value) -> Response {
+    Json(json!({"jsonrpc": "2.0", "id": id, "result": result})).into_response()
+}
+
+fn mcp_protocol_error(id: Value, code: i64, message: impl Into<String>) -> Response {
+    Json(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {"code": code, "message": message.into()}
+    }))
+    .into_response()
+}
+
+fn valid_mcp_origin(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(ORIGIN) else {
+        return true;
+    };
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    let Ok(url) = url::Url::parse(origin) else {
+        return false;
+    };
+    matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"))
+}
+
+fn image_generation_tool() -> Value {
+    json!({
+        "name": "generate_image",
+        "title": "Generate image with Gemini",
+        "description": "Generate a new high-quality image with Gemini 3.1 Flash Image. Use this whenever the user asks to draw, create, or generate an image. The tool saves the image in the bridge's generated-images directory and returns both a preview and the absolute file path.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "A complete, detailed description of the image to generate. Preserve the user's requested language and visible text exactly."
+                },
+                "aspect_ratio": {
+                    "type": "string",
+                    "enum": ["1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"],
+                    "default": "1:1"
+                },
+                "image_size": {
+                    "type": "string",
+                    "enum": ["1K", "2K", "4K"],
+                    "default": "2K"
+                }
+            },
+            "required": ["prompt"],
+            "additionalProperties": false
+        },
+        "annotations": {
+            "readOnlyHint": false,
+            "destructiveHint": false,
+            "idempotentHint": false,
+            "openWorldHint": true
+        }
+    })
+}
+
+fn mcp_tool_result(text: impl Into<String>, is_error: bool) -> Value {
+    json!({
+        "content": [{"type": "text", "text": text.into()}],
+        "isError": is_error
+    })
+}
+
+async fn mcp(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<Value>,
+) -> Response {
+    if !valid_mcp_origin(&headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if request.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return mcp_protocol_error(Value::Null, -32600, "Invalid JSON-RPC request");
+    }
+
+    let id = request.get("id").cloned();
+    let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+    if id.is_none() {
+        return StatusCode::ACCEPTED.into_response();
+    }
+    let id = id.unwrap_or(Value::Null);
+
+    match method {
+        "initialize" => {
+            let requested_version = request
+                .pointer("/params/protocolVersion")
+                .and_then(Value::as_str)
+                .unwrap_or(MCP_PROTOCOL_VERSION);
+            let protocol_version = match requested_version {
+                "2025-11-25" | "2025-06-18" | "2025-03-26" => requested_version,
+                _ => MCP_PROTOCOL_VERSION,
+            };
+            mcp_json_response(
+                id,
+                json!({
+                    "protocolVersion": protocol_version,
+                    "capabilities": {"tools": {"listChanged": false}},
+                    "serverInfo": {
+                        "name": "claude-code-gemini-image",
+                        "version": env!("CARGO_PKG_VERSION")
+                    },
+                    "instructions": "Use generate_image when the user asks to create or draw an image. It returns a rendered image and a saved local file path."
+                }),
+            )
+        }
+        "ping" => mcp_json_response(id, json!({})),
+        "tools/list" => mcp_json_response(id, json!({"tools": [image_generation_tool()]})),
+        "tools/call" => {
+            let name = request.pointer("/params/name").and_then(Value::as_str);
+            if name != Some("generate_image") {
+                return mcp_protocol_error(id, -32602, "Unknown tool");
+            }
+            match generate_image(&state, request.pointer("/params/arguments")).await {
+                Ok(image) => mcp_json_response(
+                    id,
+                    json!({
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": format!(
+                                    "Image generated with {} and saved to: {}",
+                                    state.image_model,
+                                    image.path.display()
+                                )
+                            },
+                            {
+                                "type": "image",
+                                "data": image.base64_data,
+                                "mimeType": image.mime_type
+                            }
+                        ],
+                        "structuredContent": {
+                            "path": image.path,
+                            "mime_type": image.mime_type,
+                            "model": state.image_model
+                        },
+                        "isError": false
+                    }),
+                ),
+                Err(message) => mcp_json_response(id, mcp_tool_result(message, true)),
+            }
+        }
+        _ => mcp_protocol_error(id, -32601, "Method not found"),
+    }
+}
+
+#[derive(Clone)]
+struct ImageProvider {
+    client: Client,
+    api_key: String,
+}
+
+struct GeneratedImage {
+    path: PathBuf,
+    mime_type: String,
+    base64_data: String,
+}
+
+fn official_google_profile(profile: &ProviderProfile) -> bool {
+    url::Url::parse(&profile.base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .as_deref()
+        == Some("generativelanguage.googleapis.com")
+}
+
+fn image_provider(state: &AppState) -> Result<ImageProvider, String> {
+    if let Some(api_key) = state
+        .fallback_api_key
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let transport = current_gemini_transport(state)?;
+        return Ok(ImageProvider {
+            client: transport.client,
+            api_key: api_key.clone(),
+        });
+    }
+
+    let routing = state
+        .routing
+        .read()
+        .map_err(|_| "Cannot read provider routing state for image generation".to_string())?;
+    routing
+        .profiles
+        .iter()
+        .find_map(|profile| {
+            if !official_google_profile(profile) {
+                return None;
+            }
+            let api_key = profile.auth_token.as_ref().or(profile.api_key.as_ref())?;
+            Some(ImageProvider {
+                client: profile.client.clone(),
+                api_key: api_key.clone(),
+            })
+        })
+        .ok_or_else(|| "Gemini API key is not configured for image generation".to_string())
+}
+
+fn validate_image_option<'a>(
+    arguments: &'a Map<String, Value>,
+    name: &str,
+    default: &'static str,
+    allowed: &[&str],
+) -> Result<&'a str, String> {
+    let value = arguments
+        .get(name)
+        .and_then(Value::as_str)
+        .unwrap_or(default);
+    allowed
+        .contains(&value)
+        .then_some(value)
+        .ok_or_else(|| format!("Unsupported {name} '{value}'"))
+}
+
+fn generated_image_extension(mime_type: &str) -> Option<&'static str> {
+    match mime_type {
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpg"),
+        "image/webp" => Some("webp"),
+        _ => None,
+    }
+}
+
+fn extract_generated_image(body: &Value) -> Result<(String, String), String> {
+    fn image_data(value: &Value) -> Option<&Value> {
+        value
+            .get("inlineData")
+            .or_else(|| value.get("inline_data"))
+            .or_else(|| {
+                (value.get("type").and_then(Value::as_str) == Some("image")).then_some(value)
+            })
+    }
+
+    let mut candidates = Vec::new();
+    if let Some(output_image) = body.get("output_image") {
+        candidates.push(output_image);
+    }
+    if let Some(parts) = body
+        .pointer("/candidates/0/content/parts")
+        .and_then(Value::as_array)
+    {
+        candidates.extend(parts.iter());
+    }
+    if let Some(steps) = body.get("steps").and_then(Value::as_array) {
+        for step in steps {
+            if let Some(content) = step.get("content").and_then(Value::as_array) {
+                candidates.extend(content.iter());
+            }
+        }
+    }
+
+    for candidate in candidates {
+        let Some(inline) = image_data(candidate) else {
+            continue;
+        };
+        let mime_type = inline
+            .get("mimeType")
+            .or_else(|| inline.get("mime_type"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Gemini image response has no MIME type".to_string())?;
+        if generated_image_extension(mime_type).is_none() {
+            return Err(format!(
+                "Gemini returned unsupported image type '{mime_type}'"
+            ));
+        }
+        let data = inline
+            .get("data")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Gemini image response has no image data".to_string())?;
+        return Ok((mime_type.to_string(), data.to_string()));
+    }
+    Err(format!(
+        "Gemini returned no generated image: {}",
+        safe_error_message(body)
+    ))
+}
+
+fn write_generated_image(
+    output_dir: &Path,
+    mime_type: &str,
+    bytes: &[u8],
+) -> Result<PathBuf, String> {
+    fs::create_dir_all(output_dir).map_err(|err| {
+        format!(
+            "Cannot create generated image directory '{}': {err}",
+            output_dir.display()
+        )
+    })?;
+    let extension = generated_image_extension(mime_type)
+        .ok_or_else(|| format!("Unsupported generated image type '{mime_type}'"))?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let unique = Uuid::new_v4().simple().to_string();
+    let file_name = format!("gemini-image-{timestamp}-{}.{}", &unique[..8], extension);
+    let path = output_dir.join(file_name);
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&path)
+        .map_err(|err| format!("Cannot create generated image '{}': {err}", path.display()))?;
+    if let Err(err) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(&path);
+        return Err(format!(
+            "Cannot write generated image '{}': {err}",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+async fn generate_image(
+    state: &AppState,
+    arguments: Option<&Value>,
+) -> Result<GeneratedImage, String> {
+    let arguments = arguments
+        .and_then(Value::as_object)
+        .ok_or_else(|| "Image tool arguments must be a JSON object".to_string())?;
+    let prompt = arguments
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Image prompt must be a non-empty string".to_string())?;
+    if prompt.chars().count() > MAX_IMAGE_PROMPT_CHARS {
+        return Err(format!(
+            "Image prompt exceeds {MAX_IMAGE_PROMPT_CHARS} characters"
+        ));
+    }
+    let aspect_ratio = validate_image_option(
+        arguments,
+        "aspect_ratio",
+        "1:1",
+        &[
+            "1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16",
+            "16:9", "21:9",
+        ],
+    )?;
+    let image_size = validate_image_option(arguments, "image_size", "2K", &["1K", "2K", "4K"])?;
+    let provider = image_provider(state)?;
+    let request_body = json!({
+        "model": state.image_model,
+        "input": prompt,
+        "response_format": {
+            "type": "image",
+            "mime_type": "image/jpeg",
+            "aspect_ratio": aspect_ratio,
+            "image_size": image_size
+        },
+        "generation_config": {"thinking_level": "high"}
+    });
+    let operation = async {
+        let response = provider
+            .client
+            .post(&state.image_upstream_url)
+            .header("x-goog-api-key", &provider.api_key)
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|err| format!("Gemini image request failed: {err}"))?;
+        let status = response.status();
+        let bytes = read_response_bytes_limited(response, MAX_IMAGE_RESPONSE_BYTES).await?;
+        let body: Value = serde_json::from_slice(&bytes)
+            .map_err(|err| format!("Gemini returned invalid image JSON: {err}"))?;
+        if !status.is_success() {
+            return Err(format!(
+                "Gemini image request returned HTTP {}: {}",
+                status.as_u16(),
+                safe_error_message(&body)
+            ));
+        }
+        Ok(body)
+    };
+    let body = tokio::time::timeout(Duration::from_secs(180), operation)
+        .await
+        .map_err(|_| "Gemini image generation timed out after 180 seconds".to_string())??;
+    let (mime_type, base64_data) = extract_generated_image(&body)?;
+    let bytes = BASE64_STANDARD
+        .decode(&base64_data)
+        .map_err(|err| format!("Gemini returned invalid base64 image data: {err}"))?;
+    if bytes.len() > MAX_GENERATED_IMAGE_BYTES {
+        return Err(format!(
+            "Generated image exceeds {MAX_GENERATED_IMAGE_BYTES} bytes"
+        ));
+    }
+    let output_dir = state.image_output_dir.clone();
+    let write_mime_type = mime_type.clone();
+    let path = tokio::task::spawn_blocking(move || {
+        write_generated_image(&output_dir, &write_mime_type, &bytes)
+    })
+    .await
+    .map_err(|err| format!("Cannot join generated image writer: {err}"))??;
+    Ok(GeneratedImage {
+        path,
+        mime_type,
+        base64_data,
+    })
 }
 
 #[derive(Debug)]
@@ -6079,6 +6524,9 @@ mod tests {
             settings_dir: PathBuf::new(),
             providers_dir: PathBuf::new(),
             bridge_state_path: PathBuf::new(),
+            image_output_dir: env::temp_dir(),
+            image_model: DEFAULT_IMAGE_MODEL.to_string(),
+            image_upstream_url: DEFAULT_IMAGE_UPSTREAM.to_string(),
             local_bridge_base_url: "http://127.0.0.1:18787".to_string(),
             admin_state_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
@@ -6103,6 +6551,121 @@ mod tests {
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_generate_image_calls_gemini_saves_file_and_returns_preview() {
+        let captured = Arc::new(tokio::sync::Mutex::new(None::<Value>));
+        let captured_for_handler = captured.clone();
+        let mock = Router::new().route(
+            "/generate",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let captured = captured_for_handler.clone();
+                async move {
+                    assert_eq!(
+                        headers
+                            .get("x-goog-api-key")
+                            .and_then(|value| value.to_str().ok()),
+                        Some("image-secret")
+                    );
+                    *captured.lock().await = Some(body);
+                    Json(json!({
+                        "status": "completed",
+                        "steps": [{
+                            "type": "model_output",
+                            "content": [{
+                                "type": "image",
+                                "mime_type": "image/png",
+                                "data": "aGVsbG8="
+                            }]
+                        }]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        let client = Client::builder().build().unwrap();
+        let output_dir = env::temp_dir().join(format!("claude-bridge-images-{}", Uuid::new_v4()));
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let state = Arc::new(AppState {
+            gemini_transport: Arc::new(RwLock::new(GeminiTransport {
+                client,
+                proxy_url: None,
+            })),
+            fallback_api_key: Some("image-secret".to_string()),
+            upstream_url: "https://example.invalid/gemini".to_string(),
+            model: "fallback".to_string(),
+            thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
+            vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
+            routing: Arc::new(RwLock::new(ProviderRoutingState {
+                profiles: Vec::new(),
+                active_file: String::new(),
+                source: ProviderProfileSource::Native,
+            })),
+            shutdown_tx,
+            settings_dir: PathBuf::new(),
+            providers_dir: PathBuf::new(),
+            bridge_state_path: PathBuf::new(),
+            image_output_dir: output_dir.clone(),
+            image_model: DEFAULT_IMAGE_MODEL.to_string(),
+            image_upstream_url: format!("http://{address}/generate"),
+            local_bridge_base_url: "http://127.0.0.1:18787".to_string(),
+            admin_state_lock: Arc::new(tokio::sync::Mutex::new(())),
+        });
+
+        let response = mcp(
+            State(state),
+            HeaderMap::new(),
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {
+                    "name": "generate_image",
+                    "arguments": {
+                        "prompt": "一只可爱的小狗",
+                        "aspect_ratio": "16:9",
+                        "image_size": "4K"
+                    }
+                }
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), MAX_IMAGE_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["result"]["isError"], false);
+        assert_eq!(result["result"]["content"][1]["type"], "image");
+        assert_eq!(result["result"]["content"][1]["data"], "aGVsbG8=");
+        let path = PathBuf::from(
+            result["result"]["structuredContent"]["path"]
+                .as_str()
+                .unwrap(),
+        );
+        assert!(path.starts_with(&output_dir));
+        assert_eq!(fs::read(&path).unwrap(), b"hello");
+        let request = captured.lock().await.clone().unwrap();
+        assert_eq!(request["model"], DEFAULT_IMAGE_MODEL);
+        assert_eq!(request["response_format"]["aspect_ratio"], "16:9");
+        assert_eq!(request["response_format"]["image_size"], "4K");
+        assert_eq!(request["generation_config"]["thinking_level"], "high");
+
+        fs::remove_dir_all(&output_dir).unwrap();
+        server.abort();
+    }
+
+    #[test]
+    fn mcp_origin_allows_only_local_browser_origins() {
+        let mut headers = HeaderMap::new();
+        assert!(valid_mcp_origin(&headers));
+        headers.insert(ORIGIN, "http://localhost:18787".parse().unwrap());
+        assert!(valid_mcp_origin(&headers));
+        headers.insert(ORIGIN, "https://example.com".parse().unwrap());
+        assert!(!valid_mcp_origin(&headers));
     }
 
     #[tokio::test]

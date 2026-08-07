@@ -25,6 +25,13 @@ $serviceDir = Join-Path $projectDir 'service'
 $serviceExe = Join-Path $serviceDir 'claude-bridge.exe'
 $legacyServiceExe = Join-Path $serviceDir 'codex-gemini-bridge.exe'
 $logDir = Join-Path $serviceDir 'logs'
+$picturesDir = [Environment]::GetFolderPath(
+    [Environment+SpecialFolder]::MyPictures
+)
+if ([string]::IsNullOrWhiteSpace($picturesDir)) {
+    $picturesDir = Join-Path (Split-Path -Parent $ClaudeSettingsDir) 'Pictures'
+}
+$imageDir = Join-Path $picturesDir 'ClaudeCodeBridge'
 $stateFile = Join-Path $projectDir 'bridge-state.json'
 $legacyPidFile = Join-Path $projectDir 'target\bridge.pid'
 $registryPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$serviceName"
@@ -87,6 +94,7 @@ else {
     [System.IO.Path]::GetFullPath($ProviderConfigDir)
 }
 New-Item -ItemType Directory -Path $resolvedProviderConfigDir -Force | Out-Null
+New-Item -ItemType Directory -Path $imageDir -Force | Out-Null
 
 if (-not $SkipBuild) {
     $env:CARGO_TARGET_DIR = $buildTargetDir
@@ -260,6 +268,7 @@ $serviceEnvironment = @(
     "GEMINI_BRIDGE_API_KEY_PROFILE=$ApiKeyProfile"
     "GEMINI_BRIDGE_STATE_FILE=$stateFile"
     "GEMINI_BRIDGE_LOG_DIR=$logDir"
+    "GEMINI_BRIDGE_IMAGE_DIR=$imageDir"
     "CLAUDE_SETTINGS_DIR=$ClaudeSettingsDir"
     "CLAUDE_BRIDGE_PROVIDERS_DIR=$resolvedProviderConfigDir"
     'RUST_LOG=claude_bridge=info,tower_http=info'
@@ -283,6 +292,9 @@ Grant-ServicePathAccess `
     -Rights ([Security.AccessControl.FileSystemRights]::ReadAndExecute)
 Grant-ServicePathAccess `
     -Path $logDir `
+    -Rights ([Security.AccessControl.FileSystemRights]::Modify)
+Grant-ServicePathAccess `
+    -Path $imageDir `
     -Rights ([Security.AccessControl.FileSystemRights]::Modify)
 Grant-ServicePathAccess `
     -Path $ClaudeSettingsDir `

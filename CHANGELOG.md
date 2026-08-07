@@ -21,10 +21,16 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 - Added a 90-second per-analysis timeout and a 128-entry SHA-256 in-memory cache for successful base64 media observations. URL media is never cached because its content can change; the cache is cleared on service restart.
 - Vision failures are returned explicitly instead of silently asking the text model to guess. Rate-limit and overload semantics are preserved; automatic tiling, paging, resizing, bulk OCR, and runtime vision-Provider failover are not yet implemented.
 
+### Gemini Image Generation
+- Added a loopback Streamable HTTP MCP endpoint exposing `generate_image`, backed by the high-quality `gemini-3.1-flash-image` model with high thinking and 1K/2K/4K output options.
+- Generated images are returned as MCP image previews and saved under `Pictures\ClaudeCodeBridge` in the user's Windows known Pictures folder, including redirected/OneDrive locations. The service never accepts arbitrary output paths from the model.
+- The Windows installer automatically registers the user-scoped `gemini-image` MCP server and removes only that registration during uninstall. Existing Claude MCP configuration is backed up and preserved.
+- Added bounded prompt, response, decoded-image, and total-time limits, local-Origin validation, safe MIME handling, and fallback to credentials/proxy settings from an official Google Gemini profile.
+
 ### Documentation and Verification
 - Expanded the bilingual README and Provider guide with configuration examples, routing and privacy boundaries, prompt-injection cautions, hard limits, latency/cost behavior, and recommended use cases.
 - Updated the DeepSeek example profile to enable Vision Proxy.
-- 71 Rust tests passed, including profile validation, media removal, nested tool-result media, request construction, observation parsing, SHA-256 cache reuse, and a mock vision Provider integration test.
+- 82 Rust tests passed, including profile validation, media removal, nested tool-result media, request construction, observation parsing, SHA-256 cache reuse, mock vision Provider integration, MCP Origin checks, and an end-to-end mock image-generation tool call.
 - Live Windows-service verification paired Gemini vision with DeepSeek V4 Flash. A text-dense Chinese screenshot was transcribed through its bottom checkpoint and translated completely; the first request took about 26.7 seconds and the cached request about 7.0 seconds.
 - Delphi 11 Release GUI compiled with version `0.4.0.0`, 0 warnings, and 0 errors. Strict Clippy, the static-CRT bridge build, portable ZIP inspection, Inno Setup compilation, and SHA-256 manifest verification completed successfully.
 
@@ -177,10 +183,16 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 - 增加单次视觉分析 90 秒超时，以及基于 SHA-256 指纹、最多 128 项的 base64 成功结果内存缓存。URL 媒体因内容可能变化而不缓存，服务重启后缓存清空。
 - 视觉分析失败会明确返回错误，不会静默让纯文本模型猜图；保留限流和过载语义。当前尚未实现自动切图、分页、缩放、批量 OCR 和视觉 Provider 运行时故障转移。
 
+### Gemini 图片生成
+- 新增仅监听本机的 Streamable HTTP MCP 入口，向 Claude Code 提供 `generate_image` 工具；默认使用高质量 `gemini-3.1-flash-image`、高思考，并支持 1K/2K/4K 输出。
+- 生成结果既作为 MCP 图片预览返回，也保存到用户 Windows“图片”已知目录下的 `ClaudeCodeBridge` 文件夹，兼容重定向和 OneDrive；服务不接受模型指定任意输出路径。
+- Windows 安装器会自动注册用户级 `gemini-image` MCP 服务；卸载时仅移除这一项。修改前会备份并保留用户原有 Claude MCP 配置。
+- 增加提示长度、上游响应、解码后图片和总时长上限，并校验本机 Origin、图片 MIME；没有桥接器主密钥时，可复用 Google 官方 Gemini profile 的凭据和代理。
+
 ### 文档与验证
 - 扩充 README 和 Provider 配置指南的中英文说明，加入配置示例、路由与隐私边界、图片提示注入风险、硬限制、延迟/成本行为及推荐使用范围。
 - DeepSeek 示例 profile 已默认启用 Vision Proxy。
-- 71 项 Rust 测试全部通过，覆盖 profile 校验、媒体移除、工具结果嵌套媒体、请求构造、观察解析、SHA-256 缓存复用和本地 mock 视觉 Provider 集成测试。
+- 82 项 Rust 测试全部通过，覆盖 profile 校验、媒体移除、工具结果嵌套媒体、请求构造、观察解析、SHA-256 缓存复用、本地 mock 视觉 Provider 集成、MCP Origin 校验和端到端 mock 生图工具调用。
 - Windows 服务实测完成 Gemini 视觉与 DeepSeek V4 Flash 接力：文字密集中文长图成功 OCR 到底部校验码并完整翻译；首次请求约 26.7 秒，缓存后约 7.0 秒。
 - Delphi 11 Release GUI 以 `0.4.0.0` 版本编译通过，0 警告、0 错误；严格 Clippy、静态 CRT bridge、便携 ZIP 内容检查、Inno Setup 编译及 SHA-256 清单验证均成功完成。
 

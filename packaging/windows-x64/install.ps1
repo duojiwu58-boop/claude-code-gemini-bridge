@@ -127,6 +127,14 @@ else {
     [System.IO.Path]::GetFullPath($ClaudeSettingsDir)
 }
 $claudeSettings = Join-Path $claudeDir 'settings.json'
+$claudeUserConfig = Join-Path (Split-Path -Parent $claudeDir) '.claude.json'
+$picturesDir = [Environment]::GetFolderPath(
+    [Environment+SpecialFolder]::MyPictures
+)
+if ([string]::IsNullOrWhiteSpace($picturesDir)) {
+    $picturesDir = Join-Path (Split-Path -Parent $claudeDir) 'Pictures'
+}
+$imageDir = Join-Path $picturesDir 'ClaudeCodeBridge'
 $providersDir = if ([string]::IsNullOrWhiteSpace($ProviderConfigDir)) {
     Join-Path $claudeDir 'bridge-providers'
 }
@@ -334,6 +342,7 @@ New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 New-Item -ItemType Directory -Path $programDataDir -Force | Out-Null
 New-Item -ItemType Directory -Path $scriptsDir -Force | Out-Null
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+New-Item -ItemType Directory -Path $imageDir -Force | Out-Null
 New-Item -ItemType Directory -Path $claudeDir -Force | Out-Null
 
 Copy-FileIfNeeded -Source $packageExe -Destination $serviceExe
@@ -439,6 +448,51 @@ foreach ($property in $template.env.PSObject.Properties) {
     $utf8NoBom
 )
 
+try {
+    if (Test-Path -LiteralPath $claudeUserConfig -PathType Leaf) {
+        Copy-Item `
+            -LiteralPath $claudeUserConfig `
+            -Destination "$claudeUserConfig.backup-$timestamp" `
+            -Force
+        $claudeUser = [System.IO.File]::ReadAllText($claudeUserConfig) |
+            ConvertFrom-Json
+    }
+    else {
+        $claudeUser = [pscustomobject]@{}
+    }
+    if ($null -eq $claudeUser.PSObject.Properties['mcpServers']) {
+        $claudeUser | Add-Member `
+            -MemberType NoteProperty `
+            -Name mcpServers `
+            -Value ([pscustomobject]@{})
+    }
+    elseif ($null -eq $claudeUser.mcpServers) {
+        $claudeUser.mcpServers = [pscustomobject]@{}
+    }
+    $imageMcp = [pscustomobject]@{
+        type = 'http'
+        url = "http://127.0.0.1:$Port/mcp"
+    }
+    $existingImageMcp = $claudeUser.mcpServers.PSObject.Properties['gemini-image']
+    if ($null -eq $existingImageMcp) {
+        $claudeUser.mcpServers | Add-Member `
+            -MemberType NoteProperty `
+            -Name 'gemini-image' `
+            -Value $imageMcp
+    }
+    else {
+        $existingImageMcp.Value = $imageMcp
+    }
+    [System.IO.File]::WriteAllText(
+        $claudeUserConfig,
+        ($claudeUser | ConvertTo-Json -Depth 100),
+        $utf8NoBom
+    )
+}
+catch {
+    Write-Warning "无法自动注册 Gemini 生图工具：$($_.Exception.Message)"
+}
+
 $binaryPath = "`"$serviceExe`" --windows-service"
 $scBinaryPath = '\"' + $serviceExe + '\" --windows-service'
 if ($null -eq $existingService) {
@@ -512,6 +566,7 @@ $serviceEnvironment = @(
     "GEMINI_BRIDGE_LISTEN=127.0.0.1:$Port"
     "GEMINI_BRIDGE_STATE_FILE=$stateFile"
     "GEMINI_BRIDGE_LOG_DIR=$logDir"
+    "GEMINI_BRIDGE_IMAGE_DIR=$imageDir"
     "CLAUDE_SETTINGS_DIR=$claudeDir"
     "CLAUDE_BRIDGE_PROVIDERS_DIR=$providersDir"
     'RUST_LOG=claude_bridge=info,tower_http=info'
@@ -580,6 +635,9 @@ Grant-ServicePathAccess `
     -Rights ([Security.AccessControl.FileSystemRights]::ReadAndExecute)
 Grant-ServicePathAccess `
     -Path $programDataDir `
+    -Rights ([Security.AccessControl.FileSystemRights]::Modify)
+Grant-ServicePathAccess `
+    -Path $imageDir `
     -Rights ([Security.AccessControl.FileSystemRights]::Modify)
 Grant-ServicePathAccess `
     -Path $claudeDir `
@@ -653,8 +711,9 @@ Write-Host "  服务：$serviceName（延迟自动启动）"
 Write-Host "  地址：http://127.0.0.1:$Port"
 Write-Host "  程序：$installDir"
 Write-Host "  日志：$logDir"
+Write-Host "  生图目录：$imageDir"
 Write-Host "  Claude 配置：$claudeSettings"
 Write-Host "  Provider 配置：$providersDir"
 Write-Host "  Gemini：$(if ($configureGemini) { '已配置' } else { '未配置（可稍后添加）' })"
 Write-Host ''
-Write-Host '请重新启动正在运行的 Claude Code 会话，使新环境配置生效。'
+Write-Host '请重新启动正在运行的 Claude Code 会话，使环境配置和 Gemini 生图工具生效。'
