@@ -1,0 +1,7 @@
+{
+  "name": "My OpenAI-Compatible Model",
+  "model": "<MODEL_ID>",
+  "base_url": "https://provider.example/v1",
+  "api_key": "<API_KEY>",
+  "identity": "<REAL_MODEL_NAME>"
+}

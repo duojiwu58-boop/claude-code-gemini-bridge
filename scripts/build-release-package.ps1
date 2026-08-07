@@ -1,5 +1,5 @@
 ﻿param(
-    [string]$Version = '0.1.4'
+    [string]$Version = '0.2.0'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -14,6 +14,8 @@ $appIcon = Join-Path `
     'gui\delphi11\ClaudeBridgeManager\assets\ClaudeBridgeManager.ico'
 $settingsTemplate = Join-Path $projectDir 'claude-settings.example.json'
 $bridgeSettingsTemplate = Join-Path $projectDir 'claude-settings.bridge.json'
+$providerGuide = Join-Path $projectDir 'PROVIDER_CONFIG.md'
+$providerExamples = Join-Path $projectDir 'examples\providers'
 $licenseFile = Join-Path $projectDir 'LICENSE'
 $innoScript = Join-Path $projectDir 'packaging\inno\ClaudeCodeBridge.iss'
 $distDir = Join-Path $projectDir 'dist'
@@ -29,6 +31,8 @@ foreach ($requiredPath in @(
     $appIcon
     $settingsTemplate
     $bridgeSettingsTemplate
+    $providerGuide
+    $providerExamples
     $licenseFile
     $innoScript
 )) {
@@ -99,6 +103,17 @@ Copy-Item `
 Copy-Item `
     -LiteralPath $bridgeSettingsTemplate `
     -Destination (Join-Path $stagingDir 'claude-settings.bridge.json')
+Copy-Item `
+    -LiteralPath $providerGuide `
+    -Destination (Join-Path $stagingDir 'PROVIDER_CONFIG.md')
+New-Item `
+    -ItemType Directory `
+    -Path (Join-Path $stagingDir 'examples') `
+    -Force | Out-Null
+Copy-Item `
+    -LiteralPath $providerExamples `
+    -Destination (Join-Path $stagingDir 'examples\providers') `
+    -Recurse
 Copy-Item `
     -LiteralPath $licenseFile `
     -Destination (Join-Path $stagingDir 'LICENSE')

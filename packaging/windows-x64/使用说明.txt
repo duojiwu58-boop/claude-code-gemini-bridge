@@ -28,9 +28,14 @@ The installer creates a Start Menu shortcut and optionally a Desktop shortcut.
 The GUI allows inspecting bridge status, reloading profiles, and switching active models live.
 Gemini proxy settings can be inspected, edited, tested, and applied instantly from the GUI without reinstalling or restarting the service (clearing proxy and saving selects direct connection).
 
-When Gemini is not enabled, the GUI reads existing provider profiles from:
-%USERPROFILE%\.claude\settings - *.json
-If no profiles exist yet, the service still installs normally; add profiles and click Reload in the GUI when ready.
+The GUI reads bridge-owned provider profiles from:
+%USERPROFILE%\.claude\bridge-providers\*.json
+Copy a template from the installed examples\providers directory, remove
+".example" from its filename, and fill in the provider's official OpenAI-compatible
+base_url, api_key, and model values. Then click Reload in the GUI.
+See PROVIDER_CONFIG.md for the full field reference and migration guide.
+Legacy settings - *.json profiles remain available during gradual migration;
+equivalent native profiles take precedence.
 
 3. File Locations
 
@@ -42,6 +47,9 @@ C:\ProgramData\ClaudeCodeBridge
 
 Claude Code configuration:
 %USERPROFILE%\.claude
+
+Bridge Provider configuration:
+%USERPROFILE%\.claude\bridge-providers
 
 The installer creates a timestamped backup before modifying `settings.json`.
 

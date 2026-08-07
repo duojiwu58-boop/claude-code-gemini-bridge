@@ -13,7 +13,87 @@
 
 ---
 
+## Claude Code × 原生 OpenAI 接口：这次升级为什么重要
+
+这不是简单地“多支持了几个模型”，而是把 Claude Code 的 Agent 能力与模型供应商的 API 协议真正解耦了：
+
+```text
+Claude Code（Agent、MCP、工具调用、任务编排）
+        ↓ Anthropic Messages
+Claude Code Multi-Model Bridge（协议转换、身份适配、热路由）
+        ↓ OpenAI Chat Completions
+Gemini / DeepSeek / Kimi / Qwen / OpenRouter / 其他兼容模型
+```
+
+过去，下游供应商必须提供 Anthropic 兼容地址，用户还要把它的配置写进 `ANTHROPIC_*` 历史字段。现在，供应商只要提供较完整的 OpenAI Chat Completions 接口，就可以通过桥接器成为 Claude Code 的真实下游模型。Claude Code 继续提供成熟的编程 Agent、MCP 和工具生态；模型请求则发送到供应商官方原生 OpenAI 接口。
+
+这带来了几个直接收益：
+
+- **可用模型范围显著扩大：** 不再等待供应商单独实现 Anthropic Messages 接口；已有 OpenAI 兼容接口即可接入。
+- **使用供应商原生路径：** `base_url`、API Key 和模型 ID 直接来自供应商官网 OpenAI SDK 示例，不再把非 Claude 模型伪装成 Anthropic Provider。
+- **回答仍由下游模型生成：** 桥接器负责协议转换、路由和必要的身份提示适配，不通过关键词代答，也不改写模型最终输出。
+- **配置成本大幅降低：** 通常只需 `model`、`base_url`、`api_key` 三个字段；一个 JSON 文件就是一个可切换模型。
+- **保留 Claude Code 的工作流价值：** 多轮任务、代码工具、MCP、并行工具调用与 GUI 热切换仍由 Claude Code 和桥接器共同承载。
+- **切换无需重启：** 新增或修改 Provider 文件后，在模型中心点击刷新并切换，下一个请求立即走新模型。
+
+这里有一个重要边界：支持 OpenAI Chat Completions 并不代表所有普通聊天模型都能完整胜任 Claude Code。要获得可靠的 Coding Agent 体验，下游模型仍应正确支持流式输出、工具调用、结构化参数，并具备足够的上下文长度和代码能力。
+
+### 三分钟添加一个 OpenAI Provider
+
+1. 打开配置目录：
+
+   ```text
+   %USERPROFILE%\.claude\bridge-providers\
+   ```
+
+2. 参考供应商官网的 OpenAI SDK 示例，新建一个 `.json` 文件，例如 `deepseek.json`：
+
+   ```json
+   {
+     "name": "DeepSeek",
+     "model": "deepseek-chat",
+     "base_url": "https://api.deepseek.com",
+     "api_key": "sk-...",
+     "protocol": "openai",
+     "identity": "DeepSeek"
+   }
+   ```
+
+3. 字段与官网示例一一对应：
+
+   | 供应商官网 OpenAI 示例 | Provider JSON | 说明 |
+   | --- | --- | --- |
+   | `OpenAI(api_key=...)` | `api_key` | API Key；也可用 `api_key_env` 引用服务环境变量 |
+   | `OpenAI(base_url=...)` | `base_url` | 复制 SDK 基地址，桥接器自动补 `/chat/completions` |
+   | `chat.completions.create(model=...)` | `model` | 原样填写供应商当前模型 ID |
+
+4. 保存后打开“Claude Code 模型中心”，点击“刷新配置”，选择该模型即可。无需修改 Claude Code 的活动配置，也无需重启 VS Code、Claude Code 或桥接服务。
+
+常见官方 OpenAI 兼容基地址示例：
+
+| Provider | `base_url` |
+| --- | --- |
+| DeepSeek | `https://api.deepseek.com` |
+| Kimi / Moonshot | `https://api.moonshot.cn/v1` |
+| Qwen / 百炼（中国区） | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
+| OpenRouter | `https://openrouter.ai/api/v1` |
+| Google Gemini | `https://generativelanguage.googleapis.com/v1beta/openai` |
+
+如供应商给出的是完整请求地址，或者网关路径不遵循 SDK 基地址规则，可以额外填写 `endpoint`。代理、身份名称、禁用开关、密钥环境变量和旧配置迁移方法见完整的 [Provider 配置指南](PROVIDER_CONFIG.md)，也可以直接复制 [Provider 模板](examples/providers) 修改。
+
+> Claude Code 自己的 `%USERPROFILE%\.claude\settings.json` 仍然使用 `ANTHROPIC_BASE_URL=http://127.0.0.1:18787` 连接本地桥接器。这是 Claude Code 客户端协议的入口，不是上游模型配置；上游 Provider 已经不再依赖 `ANTHROPIC_*` 字段。
+
+### Why this matters
+
+Claude Code can now keep its agent, MCP, tool-use, and orchestration workflow while the actual model is reached through the provider's native OpenAI Chat Completions API. Providers no longer need to implement an Anthropic-compatible endpoint. The bridge translates the protocol and routes requests; the selected downstream model still generates the answer. In most cases, users only copy `model`, `base_url`, and `api_key` from the provider's official OpenAI SDK example into one JSON file.
+
 ## English Version
+
+> New provider configuration: copy the three values from a provider's official
+> OpenAI-compatible example into a JSON file under
+> `%USERPROFILE%\.claude\bridge-providers\`. See the detailed
+> [Provider configuration guide](PROVIDER_CONFIG.md) and the ready-to-copy
+> [templates](examples/providers).
 
 ### Why this is different from a generic bridge
 
@@ -33,7 +113,7 @@ This bridge handles those behaviors explicitly:
 | Safety filtering | Crashes on an empty `choices` array | Converts Gemini `promptFeedback.blockReason` into a valid Anthropic `refusal` message with a readable reason |
 | Truncated tool calls | Executes malformed/empty arguments or reports the wrong stop reason | Maps cutoff responses to `max_tokens` and suppresses incomplete tool calls and uncached signatures |
 | Token accounting | Uses a byte-only estimate that undercounts non-ASCII prompts | Uses a Unicode-aware conservative input estimate and updates usage from streamed Gemini usage data when available |
-| Live model switching | Requires editing Claude settings and restarting/reloading the client whenever the provider changes | Keeps Claude Code connected to one stable local endpoint and switches Gemini or another Anthropic-compatible profile from the GUI without restarting VS Code, Claude Code, or the bridge service |
+| Live model switching | Requires editing Claude settings and restarting/reloading the client whenever the provider changes | Keeps Claude Code connected to one stable local endpoint and switches OpenAI-compatible or Anthropic profiles from the GUI without restarting VS Code, Claude Code, or the bridge service |
 | Operations | Runs as an ad hoc console proxy | Includes a native Windows service, delayed auto-start, recovery policy, graceful shutdown, health checks, persistent routing state, packaging, and a Delphi model-switcher GUI |
 
 ### Deep compatibility details
@@ -85,14 +165,15 @@ The SSE decoder also tolerates CRLF/LF framing, multiple data lines, partial net
 
 #### Models can be hot-switched without restarting VS Code or Claude Code
 
-Claude Code stays pointed at the bridge's stable local endpoint: `http://127.0.0.1:18787`. The bundled Delphi GUI discovers usable `%USERPROFILE%\.claude\settings - *.json` provider profiles and changes the bridge's active upstream route through its local management API. Subsequent Claude Code requests use the newly selected provider immediately.
+Claude Code stays pointed at the bridge's stable local endpoint: `http://127.0.0.1:18787`. The bundled Delphi GUI discovers bridge-owned `%USERPROFILE%\.claude\bridge-providers\*.json` profiles and changes the bridge's active upstream route through its local management API. Subsequent Claude Code requests use the newly selected provider immediately. Legacy `%USERPROFILE%\.claude\settings - *.json` profiles remain available during migration, with equivalent native profiles taking precedence.
 
 This makes it practical to move between:
 - Google Gemini through the bridge's deep protocol translator
-- Other Anthropic-compatible providers already represented by Claude settings
+- Providers using native OpenAI Chat Completions, including DeepSeek, Kimi, Qwen, Gemini, and OpenRouter models
+- Legacy Anthropic-compatible providers during migration
 - Different Gemini configurations, including runtime proxy/direct-mode changes
 
-The switch does **not** rewrite the active Claude Code configuration, reload the VS Code window, restart Claude Code, or restart the Windows bridge service. Provider credentials remain in their original local profile files and are never returned by the management API; only the selected profile filename and Gemini proxy mode are persisted.
+The switch does **not** rewrite the active Claude Code configuration, reload the VS Code window, restart Claude Code, or restart the Windows bridge service. Provider credentials remain in the bridge-owned local Provider files and are never returned by the management API; only the selected profile filename and Gemini proxy mode are persisted.
 
 ### Download and use without compiling
 
@@ -100,8 +181,8 @@ Most users do **not** need Rust, Delphi, Inno Setup, or a local build environmen
 
 **[GitHub Releases — installer and portable ZIP](https://github.com/duojiwu58-boop/claude-code-gemini-bridge/releases/latest)**
 
-- **`ClaudeCodeBridge-0.1.4-Setup.exe` (recommended):** installs the native Windows service, model-switcher GUI, Start Menu shortcuts, automatic startup, recovery policy, configuration tools, and uninstaller.
-- **`ClaudeCodeBridge-0.1.4-windows-x64.zip`:** contains the same prebuilt service and GUI for portable/manual deployment. Extract it and run `Install.cmd` when service installation is desired.
+- **`ClaudeCodeBridge-0.2.0-Setup.exe` (recommended):** installs the native Windows service, model-switcher GUI, Start Menu shortcuts, automatic startup, recovery policy, configuration tools, and uninstaller.
+- **`ClaudeCodeBridge-0.2.0-windows-x64.zip`:** contains the same prebuilt service and GUI for portable/manual deployment. Extract it and run `Install.cmd` when service installation is desired.
 
 After installation, open **Claude Code 模型中心**, select or double-click a model, and the next Claude Code request uses it immediately—no VS Code reload or Claude Code restart is required.
 
@@ -115,7 +196,8 @@ After installation, open **Claude Code 模型中心**, select or double-click a 
 - `GEMINI_BRIDGE_API_KEY_PROFILE` (optional Codex TOML profile)
 - `GEMINI_BRIDGE_STATE_FILE` (optional model-switcher state file)
 - `GEMINI_BRIDGE_LOG_DIR` (Windows service log directory)
-- `CLAUDE_SETTINGS_DIR` (Claude provider profile directory)
+- `CLAUDE_SETTINGS_DIR` (Claude Code settings directory; native Provider files default to its `bridge-providers` child directory)
+- `CLAUDE_BRIDGE_PROVIDERS_DIR` (optional override for the bridge-owned Provider directory)
 - `CLAUDE_BRIDGE_UPSTREAM_IDENTITY` (optional per-profile model identity shown to the upstream model)
 - `CLAUDE_BRIDGE_IDENTITY_OVERRIDE` (optional per-profile switch; defaults to `true`)
 - `CLAUDE_BRIDGE_TRANSPORT` (optional per-profile transport: `auto`, `anthropic`, or `openai-chat`; defaults to `auto`)
@@ -123,7 +205,7 @@ After installation, open **Claude Code 模型中心**, select or double-click a 
 
 When the override is active for a non-Claude profile, the bridge adapts the request's system prompt before routing: it replaces the Claude persona declarations Claude Code injects (main, coordinator, and subagent variants, plus the "powered by the model" environment line and the `Co-Authored-By: Claude` git attribution) with the true upstream identity, and appends a factual `<bridge_runtime_identity>` routing note naming the real upstream model. Identity questions pass through verbatim and are answered by the upstream model itself; the bridge never generates answers or rewrites upstream content. Factual references to Claude Code as a tool stay untouched. If `CLAUDE_BRIDGE_UPSTREAM_IDENTITY` is unset, the identity falls back to the profile model name (with provider routing suffixes such as `[1m]` removed).
 
-In `auto` mode, known non-Claude Anthropic-compatible profiles for Qwen/DashScope, DeepSeek, and Kimi/Moonshot are routed through each provider's native OpenAI Chat Completions endpoint. The bridge converts only the wire protocol; the downstream model still produces the answer. Claude profiles and unknown providers remain on Anthropic pass-through for compatibility. Custom providers can opt in with `CLAUDE_BRIDGE_TRANSPORT=openai-chat` and an exact `CLAUDE_BRIDGE_UPSTREAM_URL`.
+The `CLAUDE_BRIDGE_*` per-profile fields above apply only to legacy `settings - *.json` profiles. New profiles should use the bridge-owned format documented in [PROVIDER_CONFIG.md](PROVIDER_CONFIG.md). OpenAI Chat Completions is the native format's default protocol, so a typical configuration needs only `model`, `base_url`, and `api_key`.
 
 ### Run from Source
 
@@ -191,8 +273,8 @@ Claude Code 始终连接本地固定的 `http://127.0.0.1:18787`。双击配套�
 
 👉 **[前往 GitHub Releases 下载安装包与免安装 ZIP](https://github.com/duojiwu58-boop/claude-code-gemini-bridge/releases/latest)**
 
-- **`ClaudeCodeBridge-0.1.4-Setup.exe`（推荐）**：一键安装程序，注册 Windows 系统服务、配置开机自启、创建开始菜单快捷方式并附带 GUI 切换器。
-- **`ClaudeCodeBridge-0.1.4-windows-x64.zip`**：绿色免安装包，解压即用。
+- **`ClaudeCodeBridge-0.2.0-Setup.exe`（推荐）**：一键安装程序，注册 Windows 系统服务、配置开机自启、创建开始菜单快捷方式并附带 GUI 切换器。
+- **`ClaudeCodeBridge-0.2.0-windows-x64.zip`**：绿色免安装包，解压即用。
 
 ---
 

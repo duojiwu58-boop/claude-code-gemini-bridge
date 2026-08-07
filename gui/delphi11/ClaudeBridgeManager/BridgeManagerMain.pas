@@ -305,7 +305,8 @@ begin
   FStatusBar.Panels.Add;
   FStatusBar.Panels.Add;
   FStatusBar.Panels[0].Text := '桥接地址：' + FBridgeUrl;
-  FStatusBar.Panels[1].Text := '配置目录：%USERPROFILE%\.claude';
+  FStatusBar.Panels[1].Text :=
+    '配置目录：%USERPROFILE%\.claude\bridge-providers';
   FStatusBar.Font.Name := 'Segoe UI';
 
   FContentPanel := TPanel.Create(Self);
@@ -988,8 +989,12 @@ begin
               LSnapshot.FileName := JsonText(LProfile, 'file');
             end;
             LSnapshot.Proxy := JsonText(LJson, 'gemini_proxy');
-            LSnapshot.Stamp := JsonText(LJson, 'settings_stamp');
-            LSnapshot.SettingsDir := JsonText(LJson, 'settings_dir');
+            LSnapshot.Stamp := JsonText(LJson, 'config_stamp');
+            if LSnapshot.Stamp = '' then
+              LSnapshot.Stamp := JsonText(LJson, 'settings_stamp');
+            LSnapshot.SettingsDir := JsonText(LJson, 'providers_dir');
+            if LSnapshot.SettingsDir = '' then
+              LSnapshot.SettingsDir := JsonText(LJson, 'settings_dir');
           finally
             LJson.Free;
           end;
@@ -1033,7 +1038,7 @@ begin
       FCurrentModelLabel.Caption := '当前模型：暂无可用配置';
       SetBridgeState(
         True,
-        '桥接器运行中，请添加 settings - *.json 模型配置'
+        '桥接器运行中，请在 bridge-providers 目录添加 JSON 配置'
       );
       FSwitchButton.Enabled := False;
     end;
@@ -1078,6 +1083,7 @@ begin
       LRow: TProfileRow;
       LStamp: string;
       LTransport: string;
+      LName: string;
       LError: string;
       I: Integer;
     begin
@@ -1096,6 +1102,9 @@ begin
               LProfile := LArray.Items[I] as TJSONObject;
               LRow := Default(TProfileRow);
               LRow.Model := JsonText(LProfile, 'model');
+              LName := JsonText(LProfile, 'name');
+              if (LName <> '') and not SameText(LName, LRow.Model) then
+                LRow.Model := LName + ' (' + LRow.Model + ')';
               LRow.FileName := JsonText(LProfile, 'file');
               LRow.BaseUrl := JsonText(LProfile, 'base_url');
               LRow.Proxy := JsonText(LProfile, 'proxy');
@@ -1115,7 +1124,9 @@ begin
                 LRow.Proxy := '(直连)';
               LRows[I] := LRow;
             end;
-            LStamp := JsonText(LJson, 'settings_stamp');
+            LStamp := JsonText(LJson, 'config_stamp');
+            if LStamp = '' then
+              LStamp := JsonText(LJson, 'settings_stamp');
           finally
             LJson.Free;
           end;

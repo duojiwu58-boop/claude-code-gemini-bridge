@@ -6,6 +6,7 @@
     [string]$GeminiMode = 'Prompt',
     [string]$ApiKeyFile,
     [string]$ClaudeSettingsDir,
+    [string]$ProviderConfigDir,
     [switch]$NonInteractive,
     [switch]$SkipShortcuts
 )
@@ -109,7 +110,6 @@ $packageDir = Split-Path -Parent $PSCommandPath
 $packageExe = Join-Path $packageDir 'claude-bridge.exe'
 $packageGui = Join-Path $packageDir 'ClaudeBridgeManager.exe'
 $bridgeSettingsTemplate = Join-Path $packageDir 'claude-settings.bridge.json'
-$geminiSettingsTemplate = Join-Path $packageDir 'claude-settings.example.json'
 $installDir = Join-Path $env:ProgramFiles 'ClaudeCodeBridge'
 $programDataDir = Join-Path $env:ProgramData 'ClaudeCodeBridge'
 $serviceExe = Join-Path $installDir 'claude-bridge.exe'
@@ -126,9 +126,16 @@ else {
     [System.IO.Path]::GetFullPath($ClaudeSettingsDir)
 }
 $claudeSettings = Join-Path $claudeDir 'settings.json'
-$geminiProfile = Join-Path $claudeDir 'settings - gemini3.6 bridge.json'
+$providersDir = if ([string]::IsNullOrWhiteSpace($ProviderConfigDir)) {
+    Join-Path $claudeDir 'bridge-providers'
+}
+else {
+    [System.IO.Path]::GetFullPath($ProviderConfigDir)
+}
+$geminiProfile = Join-Path $providersDir 'gemini.json'
 $serviceRegistry = "HKLM:\SYSTEM\CurrentControlSet\Services\$serviceName"
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+New-Item -ItemType Directory -Path $providersDir -Force | Out-Null
 
 if ($Port -ne 18787) {
     throw '当前 GUI 发布版固定使用端口 18787。'
@@ -167,9 +174,6 @@ if ($GeminiMode -eq 'Prompt') {
 $configureGemini = $GeminiMode -eq 'Configure'
 $apiKey = $null
 if ($configureGemini) {
-    if (-not (Test-Path -LiteralPath $geminiSettingsTemplate -PathType Leaf)) {
-        throw "发布包不完整，缺少文件：$geminiSettingsTemplate"
-    }
     Write-Host 'API Key 只会保存在本机受限文件中，不会写入服务注册表。'
     if (-not [string]::IsNullOrWhiteSpace($ApiKeyFile)) {
         if (-not (Test-Path -LiteralPath $ApiKeyFile -PathType Leaf)) {
@@ -349,9 +353,13 @@ if ($configureGemini) {
 $template = [System.IO.File]::ReadAllText($bridgeSettingsTemplate) | ConvertFrom-Json
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 if ($configureGemini) {
-    $geminiTemplate = [System.IO.File]::ReadAllText(
-        $geminiSettingsTemplate
-    ) | ConvertFrom-Json
+    $geminiTemplate = [ordered]@{
+        name = 'Google Gemini'
+        model = 'gemini-3.6-flash'
+        base_url = "http://127.0.0.1:$Port"
+        protocol = 'gemini'
+        identity = 'Google Gemini (gemini-3.6-flash)'
+    }
     if (Test-Path -LiteralPath $geminiProfile -PathType Leaf) {
         Copy-Item `
             -LiteralPath $geminiProfile `
@@ -360,7 +368,7 @@ if ($configureGemini) {
     }
     [System.IO.File]::WriteAllText(
         $geminiProfile,
-        ($geminiTemplate | ConvertTo-Json -Depth 100),
+        ($geminiTemplate | ConvertTo-Json -Depth 8),
         $utf8NoBom
     )
 }
@@ -464,6 +472,7 @@ $serviceEnvironment = @(
     "GEMINI_BRIDGE_STATE_FILE=$stateFile"
     "GEMINI_BRIDGE_LOG_DIR=$logDir"
     "CLAUDE_SETTINGS_DIR=$claudeDir"
+    "CLAUDE_BRIDGE_PROVIDERS_DIR=$providersDir"
     'RUST_LOG=claude_bridge=info,tower_http=info'
 )
 $keyProfileEntry = $null
@@ -511,7 +520,7 @@ else {
 if ($null -eq $bridgeState.PSObject.Properties['active_profile']) {
     $bridgeState | Add-Member `
         -NotePropertyName active_profile `
-        -NotePropertyValue 'settings - gemini3.6 bridge.json'
+        -NotePropertyValue 'gemini.json'
 }
 if ($null -eq $bridgeState.PSObject.Properties['gemini_proxy']) {
     $bridgeState | Add-Member -NotePropertyName gemini_proxy -NotePropertyValue $ProxyUrl
@@ -585,6 +594,7 @@ Write-Host "  地址：http://127.0.0.1:$Port"
 Write-Host "  程序：$installDir"
 Write-Host "  日志：$logDir"
 Write-Host "  Claude 配置：$claudeSettings"
+Write-Host "  Provider 配置：$providersDir"
 Write-Host "  Gemini：$(if ($configureGemini) { '已配置' } else { '未配置（可稍后添加）' })"
 Write-Host ''
 Write-Host '请重新启动正在运行的 Claude Code 会话，使新环境配置生效。'

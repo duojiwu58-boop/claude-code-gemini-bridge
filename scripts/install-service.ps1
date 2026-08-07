@@ -7,6 +7,7 @@ param(
     [string]$ClaudeSettingsDir = (
         Join-Path $env:USERPROFILE '.claude'
     ),
+    [string]$ProviderConfigDir,
     [switch]$SkipBuild
 )
 
@@ -47,6 +48,13 @@ if (-not $keyMatch.Success) {
 if (-not (Test-Path -LiteralPath $ClaudeSettingsDir -PathType Container)) {
     throw "Claude settings directory does not exist: $ClaudeSettingsDir"
 }
+$resolvedProviderConfigDir = if ([string]::IsNullOrWhiteSpace($ProviderConfigDir)) {
+    Join-Path $ClaudeSettingsDir 'bridge-providers'
+}
+else {
+    [System.IO.Path]::GetFullPath($ProviderConfigDir)
+}
+New-Item -ItemType Directory -Path $resolvedProviderConfigDir -Force | Out-Null
 
 if (-not $SkipBuild) {
     $env:CARGO_TARGET_DIR = $buildTargetDir
@@ -212,6 +220,7 @@ $serviceEnvironment = @(
     "GEMINI_BRIDGE_STATE_FILE=$stateFile"
     "GEMINI_BRIDGE_LOG_DIR=$logDir"
     "CLAUDE_SETTINGS_DIR=$ClaudeSettingsDir"
+    "CLAUDE_BRIDGE_PROVIDERS_DIR=$resolvedProviderConfigDir"
     'RUST_LOG=claude_bridge=info,tower_http=info'
 )
 New-ItemProperty `

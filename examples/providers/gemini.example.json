@@ -1,0 +1,6 @@
+{
+  "name": "Google Gemini",
+  "model": "gemini-2.5-pro",
+  "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+  "api_key": "<GEMINI_API_KEY>"
+}

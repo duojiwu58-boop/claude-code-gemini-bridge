@@ -1,5 +1,5 @@
 ﻿#ifndef AppVersion
-  #define AppVersion "0.1.4"
+  #define AppVersion "0.2.0"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\windows-x64"
@@ -43,12 +43,16 @@ Source: "{#SourceDir}\install.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\update-api-key.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\uninstall.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\使用说明.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\PROVIDER_CONFIG.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\examples\providers\*"; DestDir: "{app}\examples\providers"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\scripts\*"; DestDir: "{app}\scripts"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceDir}\scripts\stop-bridge.ps1"; Flags: dontcopy
 
 [Icons]
 Name: "{group}\模型切换器"; Filename: "{app}\ClaudeBridgeManager.exe"; WorkingDir: "{app}"
+Name: "{group}\Provider 配置目录"; Filename: "{sys}\explorer.exe"; Parameters: """{%USERPROFILE}\.claude\bridge-providers"""
+Name: "{group}\Provider 配置指南"; Filename: "{app}\PROVIDER_CONFIG.md"; WorkingDir: "{app}"
 Name: "{group}\配置或更新 Gemini API Key"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\update-api-key.ps1"""; WorkingDir: "{app}"
 Name: "{group}\卸载"; Filename: "{uninstallexe}"
 Name: "{commondesktop}\Claude Code 模型切换器"; Filename: "{app}\ClaudeBridgeManager.exe"; WorkingDir: "{app}"; Tasks: desktopicon

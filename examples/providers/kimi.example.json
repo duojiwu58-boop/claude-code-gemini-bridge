@@ -1,0 +1,6 @@
+{
+  "name": "Kimi",
+  "model": "moonshot-v1-8k",
+  "base_url": "https://api.moonshot.cn/v1",
+  "api_key": "<MOONSHOT_API_KEY>"
+}

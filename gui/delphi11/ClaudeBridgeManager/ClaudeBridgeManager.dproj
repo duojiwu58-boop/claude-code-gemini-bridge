@@ -32,7 +32,7 @@
         <SanitizedProjectName>ClaudeBridgeManager</SanitizedProjectName>
         <VerInfo_Locale>2052</VerInfo_Locale>
         <VerInfo_IncludeVerInfo>true</VerInfo_IncludeVerInfo>
-        <VerInfo_Keys>CompanyName=;FileDescription=Claude Code Model Switcher;FileVersion=1.0.0.0;InternalName=ClaudeBridgeManager;LegalCopyright=;LegalTrademarks=;OriginalFilename=ClaudeBridgeManager.exe;ProductName=Claude Bridge Manager;ProductVersion=1.0.0.0;Comments=;</VerInfo_Keys>
+        <VerInfo_Keys>CompanyName=;FileDescription=Claude Code Model Switcher;FileVersion=0.2.0.0;InternalName=ClaudeBridgeManager;LegalCopyright=;LegalTrademarks=;OriginalFilename=ClaudeBridgeManager.exe;ProductName=Claude Bridge Manager;ProductVersion=0.2.0.0;Comments=;</VerInfo_Keys>
         <Icon_MainIcon>assets\ClaudeBridgeManager.ico</Icon_MainIcon>
         <Manifest_File>ClaudeBridgeManager.manifest</Manifest_File>
         <DCC_Namespace>System;Xml;Data;Datasnap;Web;Soap;Vcl;Winapi;$(DCC_Namespace)</DCC_Namespace>

@@ -79,6 +79,8 @@ impl ProviderTransport {
 #[derive(Clone)]
 struct ProviderProfile {
     file_name: String,
+    display_name: String,
+    source: ProviderProfileSource,
     model: String,
     upstream_identity: Option<String>,
     identity_override: bool,
@@ -92,9 +94,32 @@ struct ProviderProfile {
     client: Client,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderProfileSource {
+    Native,
+    Legacy,
+    Mixed,
+}
+
+impl ProviderProfileSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Legacy => "legacy",
+            Self::Mixed => "native+legacy",
+        }
+    }
+}
+
+struct LoadedProviderProfiles {
+    profiles: Vec<ProviderProfile>,
+    source: ProviderProfileSource,
+}
+
 struct ProviderRoutingState {
     profiles: Vec<ProviderProfile>,
     active_file: String,
+    source: ProviderProfileSource,
 }
 
 #[derive(Clone)]
@@ -113,6 +138,7 @@ struct AppState {
     routing: Arc<RwLock<ProviderRoutingState>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     settings_dir: PathBuf,
+    providers_dir: PathBuf,
     bridge_state_path: PathBuf,
     local_bridge_base_url: String,
     admin_state_lock: Arc<Mutex<()>>,
@@ -199,6 +225,15 @@ where
         .map(PathBuf::from)
         .or_else(|_| env::var("USERPROFILE").map(|profile| PathBuf::from(profile).join(".claude")))
         .map_err(|_| "CLAUDE_SETTINGS_DIR or USERPROFILE is required".to_string())?;
+    let providers_dir = env::var("CLAUDE_BRIDGE_PROVIDERS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| settings_dir.join("bridge-providers"));
+    fs::create_dir_all(&providers_dir).map_err(|err| {
+        format!(
+            "Cannot create provider configuration directory '{}': {err}",
+            providers_dir.display()
+        )
+    })?;
     let bridge_state_path = env::var("GEMINI_BRIDGE_STATE_FILE")
         .map(PathBuf::from)
         .or_else(|_| {
@@ -208,9 +243,10 @@ where
         })
         .map_err(|_| "Cannot resolve bridge state file path".to_string())?;
     let local_bridge_base_url = format!("http://{listen}");
-    let profiles = load_provider_profiles(&settings_dir, &local_bridge_base_url)
-        .map_err(|err| format!("Cannot load Claude provider profiles: {err}"))?;
-    let active_profile = select_initial_profile(&profiles, &bridge_state_path);
+    let loaded_profiles =
+        load_provider_profiles(&providers_dir, &settings_dir, &local_bridge_base_url)
+            .map_err(|err| format!("Cannot load provider profiles: {err}"))?;
+    let active_profile = select_initial_profile(&loaded_profiles.profiles, &bridge_state_path);
     let proxy_url = load_persisted_gemini_proxy(&bridge_state_path).unwrap_or_else(|| {
         env::var("GEMINI_BRIDGE_PROXY")
             .ok()
@@ -229,11 +265,13 @@ where
         model,
         thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
         routing: Arc::new(RwLock::new(ProviderRoutingState {
-            profiles,
+            profiles: loaded_profiles.profiles,
             active_file: active_profile,
+            source: loaded_profiles.source,
         })),
         shutdown_tx,
         settings_dir,
+        providers_dir,
         bridge_state_path,
         local_bridge_base_url,
         admin_state_lock: Arc::new(Mutex::new(())),
@@ -346,12 +384,50 @@ fn is_provider_profile_file_name(file_name: &str) -> bool {
         && file_name.ends_with(".json")
 }
 
+fn is_native_provider_file_name(file_name: &str) -> bool {
+    file_name.to_ascii_lowercase().ends_with(".json")
+        && !file_name.to_ascii_lowercase().ends_with(".example.json")
+}
+
 fn load_provider_profiles(
-    settings_dir: &Path,
+    providers_dir: &Path,
+    legacy_settings_dir: &Path,
     local_bridge_base_url: &str,
-) -> Result<Vec<ProviderProfile>, String> {
-    let entries = fs::read_dir(settings_dir)
-        .map_err(|err| format!("Cannot read '{}': {err}", settings_dir.display()))?;
+) -> Result<LoadedProviderProfiles, String> {
+    let native_paths = provider_profile_paths(providers_dir, is_native_provider_file_name)?;
+    if !native_paths.is_empty() {
+        let mut profiles = load_native_provider_profiles(native_paths, local_bridge_base_url)?;
+        let mut legacy_profiles =
+            load_legacy_provider_profiles(legacy_settings_dir, local_bridge_base_url)?;
+        legacy_profiles.retain(|legacy| {
+            !profiles.iter().any(|native| {
+                native.file_name.eq_ignore_ascii_case(&legacy.file_name)
+                    || (native.model.eq_ignore_ascii_case(&legacy.model)
+                        && normalize_base_url(&native.base_url)
+                            == normalize_base_url(&legacy.base_url))
+            })
+        });
+        let source = if legacy_profiles.is_empty() {
+            ProviderProfileSource::Native
+        } else {
+            ProviderProfileSource::Mixed
+        };
+        profiles.extend(legacy_profiles);
+        return Ok(LoadedProviderProfiles { profiles, source });
+    }
+
+    Ok(LoadedProviderProfiles {
+        profiles: load_legacy_provider_profiles(legacy_settings_dir, local_bridge_base_url)?,
+        source: ProviderProfileSource::Legacy,
+    })
+}
+
+fn provider_profile_paths(
+    directory: &Path,
+    predicate: fn(&str) -> bool,
+) -> Result<Vec<PathBuf>, String> {
+    let entries = fs::read_dir(directory)
+        .map_err(|err| format!("Cannot read '{}': {err}", directory.display()))?;
     let mut paths = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|err| err.to_string())?;
@@ -362,16 +438,164 @@ fn load_provider_profiles(
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if !is_provider_profile_file_name(file_name) {
-            continue;
+        if predicate(file_name) {
+            paths.push(path);
         }
-        paths.push(path);
     }
     paths.sort_by_key(|path| {
         path.file_name()
             .map(|name| name.to_string_lossy().to_lowercase())
             .unwrap_or_default()
     });
+    Ok(paths)
+}
+
+fn read_profile_json(path: &Path) -> Result<Value, String> {
+    let text = fs::read_to_string(path)
+        .map_err(|err| format!("Cannot read '{}': {err}", path.display()))?;
+    let json_text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    serde_json::from_str(json_text)
+        .map_err(|err| format!("Invalid JSON in '{}': {err}", path.display()))
+}
+
+fn profile_string(object: &Map<String, Value>, names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        object
+            .get(*name)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+fn build_provider_client(file_name: &str, proxy_url: Option<&str>) -> Result<Client, String> {
+    let mut client_builder = Client::builder();
+    if let Some(proxy_url) = proxy_url {
+        client_builder = client_builder.proxy(
+            Proxy::all(proxy_url)
+                .map_err(|err| format!("Invalid proxy in '{file_name}': {err}"))?,
+        );
+    } else {
+        client_builder = client_builder.no_proxy();
+    }
+    client_builder
+        .build()
+        .map_err(|err| format!("Cannot create HTTP client for '{file_name}': {err}"))
+}
+
+fn load_native_provider_profiles(
+    paths: Vec<PathBuf>,
+    local_bridge_base_url: &str,
+) -> Result<Vec<ProviderProfile>, String> {
+    let mut profiles = Vec::new();
+    for path in paths {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| format!("Invalid profile file name '{}'", path.display()))?
+            .to_string();
+        let settings = read_profile_json(&path)?;
+        let object = settings
+            .as_object()
+            .ok_or_else(|| format!("Provider profile '{file_name}' must be a JSON object"))?;
+        if object
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .is_some_and(|enabled| !enabled)
+        {
+            continue;
+        }
+
+        let model = profile_string(object, &["model"])
+            .ok_or_else(|| format!("Provider profile '{file_name}' has no model"))?;
+        let display_name = profile_string(object, &["name"]).unwrap_or_else(|| model.clone());
+        let base_url = profile_string(object, &["base_url", "baseURL"])
+            .ok_or_else(|| format!("Provider profile '{file_name}' has no base_url"))?;
+        let protocol = profile_string(object, &["protocol"])
+            .unwrap_or_else(|| "openai".to_string())
+            .to_ascii_lowercase();
+        let transport = match protocol.as_str() {
+            "openai" | "openai-chat" | "chat-completions" => ProviderTransport::OpenAiChat,
+            "anthropic" | "messages" => ProviderTransport::Anthropic,
+            "gemini" | "local-gemini" => ProviderTransport::LocalGemini,
+            other => {
+                return Err(format!(
+                    "Provider profile '{file_name}' has unsupported protocol '{other}' (expected openai, anthropic, or gemini)"
+                ))
+            }
+        };
+        if transport == ProviderTransport::LocalGemini
+            && normalize_base_url(&base_url) != normalize_base_url(local_bridge_base_url)
+        {
+            return Err(format!(
+                "Provider profile '{file_name}' uses protocol 'gemini' but base_url is not the local bridge URL '{local_bridge_base_url}'"
+            ));
+        }
+        let upstream_url =
+            profile_string(object, &["endpoint"]).unwrap_or_else(|| match transport {
+                ProviderTransport::OpenAiChat => openai_compatible_chat_endpoint(&base_url),
+                ProviderTransport::Anthropic => anthropic_messages_endpoint(&base_url),
+                ProviderTransport::LocalGemini => base_url.clone(),
+            });
+        let api_key = profile_string(object, &["api_key", "apiKey"]);
+        let api_key_env = profile_string(object, &["api_key_env", "apiKeyEnv"]);
+        let api_key = match (api_key, api_key_env) {
+            (Some(api_key), _) => Some(api_key),
+            (None, Some(variable)) => Some(
+                env::var(&variable)
+                    .map_err(|_| format!("Provider profile '{file_name}' requires environment variable '{variable}'"))?
+                    .trim()
+                    .to_string(),
+            ),
+            (None, None) => None,
+        }
+        .filter(|value| !value.is_empty());
+        if transport != ProviderTransport::LocalGemini && api_key.is_none() {
+            return Err(format!(
+                "Provider profile '{file_name}' has no API credential"
+            ));
+        }
+        let proxy_url = profile_string(object, &["proxy", "proxy_url"]);
+        let client = build_provider_client(&file_name, proxy_url.as_deref())?;
+        let upstream_identity = profile_string(object, &["identity"]);
+        let identity_override = object
+            .get("identity_override")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        profiles.push(ProviderProfile {
+            file_name,
+            display_name,
+            source: ProviderProfileSource::Native,
+            model,
+            upstream_identity,
+            identity_override,
+            base_url,
+            auth_token: if transport == ProviderTransport::OpenAiChat {
+                api_key.clone()
+            } else {
+                None
+            },
+            api_key: if transport == ProviderTransport::Anthropic {
+                api_key
+            } else {
+                None
+            },
+            proxy_url,
+            local_gemini: transport == ProviderTransport::LocalGemini,
+            transport,
+            upstream_url,
+            client,
+        });
+    }
+    Ok(profiles)
+}
+
+fn load_legacy_provider_profiles(
+    settings_dir: &Path,
+    local_bridge_base_url: &str,
+) -> Result<Vec<ProviderProfile>, String> {
+    let paths = provider_profile_paths(settings_dir, is_provider_profile_file_name)?;
 
     let mut profiles = Vec::new();
     for path in paths {
@@ -380,11 +604,7 @@ fn load_provider_profiles(
             .and_then(|name| name.to_str())
             .ok_or_else(|| format!("Invalid profile file name '{}'", path.display()))?
             .to_string();
-        let text = fs::read_to_string(&path)
-            .map_err(|err| format!("Cannot read '{}': {err}", path.display()))?;
-        let json_text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-        let settings: Value = serde_json::from_str(json_text)
-            .map_err(|err| format!("Invalid JSON in '{}': {err}", path.display()))?;
+        let settings = read_profile_json(&path)?;
         let env = settings
             .get("env")
             .and_then(Value::as_object)
@@ -413,18 +633,7 @@ fn load_provider_profiles(
         let proxy_url = get_env("HTTPS_PROXY")
             .or_else(|| get_env("HTTP_PROXY"))
             .or_else(|| get_env("ALL_PROXY"));
-        let mut client_builder = Client::builder();
-        if let Some(proxy_url) = &proxy_url {
-            client_builder = client_builder.proxy(
-                Proxy::all(proxy_url)
-                    .map_err(|err| format!("Invalid proxy in '{file_name}': {err}"))?,
-            );
-        } else {
-            client_builder = client_builder.no_proxy();
-        }
-        let client = client_builder
-            .build()
-            .map_err(|err| format!("Cannot create HTTP client for '{file_name}': {err}"))?;
+        let client = build_provider_client(&file_name, proxy_url.as_deref())?;
         let local_gemini =
             normalize_base_url(&base_url) == normalize_base_url(local_bridge_base_url);
         let (transport, upstream_url) = resolve_provider_transport(
@@ -437,6 +646,8 @@ fn load_provider_profiles(
         .map_err(|err| format!("Invalid transport in profile '{file_name}': {err}"))?;
 
         profiles.push(ProviderProfile {
+            display_name: file_name.trim_end_matches(".json").to_string(),
+            source: ProviderProfileSource::Legacy,
             file_name,
             model,
             upstream_identity,
@@ -525,6 +736,18 @@ fn openai_chat_endpoint(base_url: &str) -> String {
     }
 }
 
+/// Native provider files use the same `base_url` value shown in an OpenAI SDK
+/// example. SDK base URLs already include any provider-specific version path,
+/// so only the method path is appended here.
+fn openai_compatible_chat_endpoint(base_url: &str) -> String {
+    let base_url = base_url.trim().trim_end_matches('/');
+    if base_url.ends_with("/chat/completions") {
+        base_url.to_string()
+    } else {
+        format!("{base_url}/chat/completions")
+    }
+}
+
 fn known_openai_chat_endpoint(base_url: &str) -> Option<String> {
     let normalized = normalize_base_url(base_url);
 
@@ -577,19 +800,22 @@ fn build_gemini_client(
         .map_err(|err| format!("Cannot create Gemini HTTP client: {err}"))
 }
 
-fn settings_dir_stamp(settings_dir: &Path) -> String {
-    let Ok(entries) = fs::read_dir(settings_dir) else {
-        return String::new();
-    };
-    let mut paths = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
+fn provider_config_stamp(providers_dir: &Path, legacy_settings_dir: &Path) -> String {
+    let mut paths = Vec::new();
+    if let Ok(entries) = fs::read_dir(providers_dir) {
+        paths.extend(entries.flatten().map(|entry| entry.path()).filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_native_provider_file_name)
+        }));
+    }
+    if let Ok(entries) = fs::read_dir(legacy_settings_dir) {
+        paths.extend(entries.flatten().map(|entry| entry.path()).filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(is_provider_profile_file_name)
-        })
-        .collect::<Vec<_>>();
+        }));
+    }
     paths.sort_by_key(|path| path.to_string_lossy().to_ascii_lowercase());
 
     let mut hasher = DefaultHasher::new();
@@ -717,6 +943,8 @@ fn active_provider_profile(state: &AppState) -> Option<ProviderProfile> {
 fn provider_profile_json(profile: &ProviderProfile, active_file: &str) -> Value {
     json!({
         "file": profile.file_name,
+        "name": profile.display_name,
+        "source": profile.source.as_str(),
         "model": profile.model,
         "upstream_identity": profile.upstream_identity,
         "identity_override": profile.identity_override,
@@ -758,8 +986,11 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Response {
         "gemini_proxy": transport.proxy_url,
         "gemini_proxy_mode": if transport.proxy_url.is_some() { "proxy" } else { "direct" },
         "listen_url": state.local_bridge_base_url,
+        "providers_dir": state.providers_dir.to_string_lossy(),
+        "profile_source": routing.source.as_str(),
         "settings_dir": state.settings_dir.to_string_lossy(),
-        "settings_stamp": settings_dir_stamp(&state.settings_dir)
+        "config_stamp": provider_config_stamp(&state.providers_dir, &state.settings_dir),
+        "settings_stamp": provider_config_stamp(&state.providers_dir, &state.settings_dir)
     }))
     .into_response()
 }
@@ -779,7 +1010,9 @@ async fn admin_profiles(State(state): State<Arc<AppState>>) -> Response {
         .collect::<Vec<_>>();
     Json(json!({
         "profiles": profiles,
-        "settings_stamp": settings_dir_stamp(&state.settings_dir)
+        "profile_source": routing.source.as_str(),
+        "config_stamp": provider_config_stamp(&state.providers_dir, &state.settings_dir),
+        "settings_stamp": provider_config_stamp(&state.providers_dir, &state.settings_dir)
     }))
     .into_response()
 }
@@ -853,7 +1086,11 @@ async fn admin_set_active_profile(
 }
 
 async fn admin_reload_profiles(State(state): State<Arc<AppState>>) -> Response {
-    let profiles = match load_provider_profiles(&state.settings_dir, &state.local_bridge_base_url) {
+    let loaded_profiles = match load_provider_profiles(
+        &state.providers_dir,
+        &state.settings_dir,
+        &state.local_bridge_base_url,
+    ) {
         Ok(profiles) => profiles,
         Err(message) => {
             return (StatusCode::BAD_REQUEST, Json(json!({"error": message}))).into_response();
@@ -874,15 +1111,16 @@ async fn admin_reload_profiles(State(state): State<Arc<AppState>>) -> Response {
             .into_response();
     };
     let active_file = routing.active_file.clone();
-    let selected = if profiles
+    let selected = if loaded_profiles
+        .profiles
         .iter()
         .any(|profile| profile.file_name == active_file)
     {
         active_file
     } else {
-        select_initial_profile(&profiles, &state.bridge_state_path)
+        select_initial_profile(&loaded_profiles.profiles, &state.bridge_state_path)
     };
-    let count = profiles.len();
+    let count = loaded_profiles.profiles.len();
     let proxy_url = match current_gemini_transport(&state) {
         Ok(transport) => transport.proxy_url,
         Err(message) => {
@@ -903,7 +1141,8 @@ async fn admin_reload_profiles(State(state): State<Arc<AppState>>) -> Response {
         )
             .into_response();
     }
-    routing.profiles = profiles;
+    routing.profiles = loaded_profiles.profiles;
+    routing.source = loaded_profiles.source;
     routing.active_file = selected;
     Json(json!({"status": "ok", "profile_count": count})).into_response()
 }
@@ -3554,10 +3793,157 @@ mod tests {
         let settings_dir =
             env::temp_dir().join(format!("claude-bridge-empty-profiles-{}", Uuid::new_v4()));
         fs::create_dir_all(&settings_dir).unwrap();
-        let result = load_provider_profiles(&settings_dir, "http://127.0.0.1:18787");
+        let result = load_provider_profiles(&settings_dir, &settings_dir, "http://127.0.0.1:18787");
         fs::remove_dir(&settings_dir).unwrap();
 
-        assert!(result.unwrap().is_empty());
+        let loaded = result.unwrap();
+        assert!(loaded.profiles.is_empty());
+        assert_eq!(loaded.source, ProviderProfileSource::Legacy);
+    }
+
+    #[test]
+    fn native_provider_profiles_use_openai_sdk_base_urls_and_keep_legacy_during_migration() {
+        let root =
+            env::temp_dir().join(format!("claude-bridge-native-profiles-{}", Uuid::new_v4()));
+        let providers_dir = root.join("bridge-providers");
+        let settings_dir = root.join(".claude");
+        fs::create_dir_all(&providers_dir).unwrap();
+        fs::create_dir_all(&settings_dir).unwrap();
+        fs::write(
+            providers_dir.join("deepseek.json"),
+            serde_json::to_vec_pretty(&json!({
+                "name": "DeepSeek",
+                "model": "deepseek-chat",
+                "base_url": "https://api.deepseek.com",
+                "api_key": "secret"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            settings_dir.join("settings - legacy.json"),
+            serde_json::to_vec_pretty(&json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://legacy.example",
+                    "ANTHROPIC_MODEL": "legacy-model",
+                    "ANTHROPIC_API_KEY": "legacy-secret"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let loaded =
+            load_provider_profiles(&providers_dir, &settings_dir, "http://127.0.0.1:18787")
+                .unwrap();
+        fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(loaded.source, ProviderProfileSource::Mixed);
+        assert_eq!(loaded.profiles.len(), 2);
+        let profile = &loaded.profiles[0];
+        assert_eq!(profile.display_name, "DeepSeek");
+        assert_eq!(profile.transport, ProviderTransport::OpenAiChat);
+        assert_eq!(
+            profile.upstream_url,
+            "https://api.deepseek.com/chat/completions"
+        );
+        assert_eq!(profile.auth_token.as_deref(), Some("secret"));
+        assert!(profile.api_key.is_none());
+    }
+
+    #[test]
+    fn native_openai_base_url_matches_official_sdk_semantics() {
+        let cases = [
+            (
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+            ),
+            (
+                "https://api.moonshot.cn/v1/",
+                "https://api.moonshot.cn/v1/chat/completions",
+            ),
+            (
+                "https://generativelanguage.googleapis.com/v1beta/openai",
+                "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+            ),
+        ];
+
+        for (base_url, expected) in cases {
+            assert_eq!(openai_compatible_chat_endpoint(base_url), expected);
+        }
+    }
+
+    #[test]
+    fn native_provider_endpoint_override_and_disabled_profiles_work() {
+        let root = env::temp_dir().join(format!("claude-bridge-native-options-{}", Uuid::new_v4()));
+        let providers_dir = root.join("bridge-providers");
+        let settings_dir = root.join(".claude");
+        fs::create_dir_all(&providers_dir).unwrap();
+        fs::create_dir_all(&settings_dir).unwrap();
+        fs::write(
+            providers_dir.join("custom.json"),
+            serde_json::to_vec_pretty(&json!({
+                "model": "custom-model",
+                "baseURL": "https://gateway.example/api",
+                "endpoint": "https://gateway.example/special/chat",
+                "apiKey": "secret"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            providers_dir.join("disabled.json"),
+            serde_json::to_vec_pretty(&json!({
+                "model": "disabled-model",
+                "base_url": "https://disabled.example/v1",
+                "api_key": "secret",
+                "enabled": false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let loaded =
+            load_provider_profiles(&providers_dir, &settings_dir, "http://127.0.0.1:18787")
+                .unwrap();
+        fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(loaded.source, ProviderProfileSource::Native);
+        assert_eq!(loaded.profiles.len(), 1);
+        assert_eq!(
+            loaded.profiles[0].upstream_url,
+            "https://gateway.example/special/chat"
+        );
+    }
+
+    #[test]
+    fn native_local_gemini_profile_uses_bridge_managed_credential() {
+        let root = env::temp_dir().join(format!("claude-bridge-native-gemini-{}", Uuid::new_v4()));
+        let providers_dir = root.join("bridge-providers");
+        let settings_dir = root.join(".claude");
+        fs::create_dir_all(&providers_dir).unwrap();
+        fs::create_dir_all(&settings_dir).unwrap();
+        fs::write(
+            providers_dir.join("gemini.json"),
+            serde_json::to_vec_pretty(&json!({
+                "name": "Google Gemini",
+                "model": "gemini-3.6-flash",
+                "base_url": "http://127.0.0.1:18787",
+                "protocol": "gemini"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let loaded =
+            load_provider_profiles(&providers_dir, &settings_dir, "http://127.0.0.1:18787")
+                .unwrap();
+        fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(loaded.profiles.len(), 1);
+        assert_eq!(loaded.profiles[0].transport, ProviderTransport::LocalGemini);
+        assert!(loaded.profiles[0].auth_token.is_none());
+        assert!(loaded.profiles[0].api_key.is_none());
     }
 
     #[test]
@@ -4224,6 +4610,8 @@ mod tests {
         let client = Client::builder().build().unwrap();
         let profile = ProviderProfile {
             file_name: "test.json".to_string(),
+            display_name: "Test".to_string(),
+            source: ProviderProfileSource::Native,
             model: "test-model".to_string(),
             upstream_identity: None,
             identity_override: true,
@@ -4507,6 +4895,8 @@ mod tests {
         let client = Client::builder().build().unwrap();
         let profile = ProviderProfile {
             file_name: "settings - ds4.json".to_string(),
+            display_name: "DeepSeek".to_string(),
+            source: ProviderProfileSource::Legacy,
             model: "deepseek-v4-pro[1m]".to_string(),
             upstream_identity: None,
             identity_override: true,
@@ -4577,6 +4967,8 @@ mod tests {
         let client = Client::builder().build().unwrap();
         let mut profile = ProviderProfile {
             file_name: "settings - deepseek.json".to_string(),
+            display_name: "DeepSeek".to_string(),
+            source: ProviderProfileSource::Legacy,
             model: "deepseek-chat".to_string(),
             upstream_identity: Some("  DeepSeek\nV3  ".to_string()),
             identity_override: true,
