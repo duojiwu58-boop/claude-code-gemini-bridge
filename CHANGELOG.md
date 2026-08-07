@@ -7,6 +7,33 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 
 ## English
 
+## [v0.3.2] - 2026-08-07
+
+### OpenAI Compatibility and Tool Reliability
+- Invalid or truncated arguments in one parallel tool call no longer discard valid text or other tool calls from the same response. Invalid calls are skipped individually in streaming and non-streaming paths.
+- Non-object JSON request bodies now return a controlled `400` response instead of panicking in Anthropic-transport profiles.
+- Streaming requests now honor each Provider profile's configured OpenAI capabilities, keeping reasoning fields, thinking-tag extraction, and `stream_options` behavior consistent with non-streaming requests.
+- Orphan Anthropic tool results and Responses API function outputs are filtered before forwarding, preventing upstream `400` errors.
+- Sequential anonymous streamed tool calls are kept separate, and URL-referenced Anthropic images are preserved as OpenAI `image_url` content.
+
+### Streaming, State, and Provider Resilience
+- Malformed optional legacy `settings*.json` profiles are skipped with warnings instead of preventing bridge startup or profile reload.
+- Added bounded upstream request timeouts and ensured abandoned response streams release their upstream request when the client disconnects.
+- Moved profile file reads and hashing off async request handlers, removed duplicate configuration-stamp work, and kept blocking persistence outside routing write locks.
+- Bridge state updates are serialized and persisted through same-directory temporary files with atomic replacement, preventing partial files and lost concurrent updates.
+- OpenAI-compatible SSE decoding now limits individual lines and events to 8 MiB and replaces malformed UTF-8 instead of immediately terminating the stream.
+- Streamed Gemini safety blocks are surfaced as Anthropic refusal events; poisoned thought-signature locks recover with an error log instead of becoming permanent silent failures.
+
+### Windows Service and Packaging
+- The Windows service now runs under the isolated `NT SERVICE\ClaudeCodeBridge` virtual account with explicit least-required filesystem access instead of LocalSystem.
+- Raised the installer minimum to Windows 10 so the declared platform matches the PowerShell and networking commands used by the installer.
+- Release packaging writes the bilingual usage guide with a UTF-8 BOM for reliable display in Windows Notepad.
+- Bumped the release and installer version to `0.3.2` and published matching Setup, portable ZIP, and SHA-256 manifests.
+
+### Verification
+- 66 Rust unit tests passed, including malformed parallel tools, orphan results, anonymous streamed calls, bounded SSE frames, streamed safety blocks, URL images, and poisoned-lock recovery.
+- Rust formatting, release compilation, PowerShell parser checks, static-CRT packaging, portable ZIP inspection, Inno Setup compilation, and local Windows service health checks completed successfully.
+
 ## [v0.3.1] - 2026-08-07
 
 ### Fixes
@@ -101,6 +128,33 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 ---
 
 ## 中文
+
+## [v0.3.2] - 2026-08-07
+
+### OpenAI 兼容与工具可靠性
+- 并行工具调用中即使有一个参数 JSON 非法或被截断，也不会再丢弃同一响应中的有效文本和其他工具调用；流式与非流式路径都会只跳过损坏的调用。
+- Anthropic transport profile 收到非对象 JSON 请求体时会返回受控的 `400`，不再触发 panic。
+- 流式请求现在遵循各 Provider profile 配置的 OpenAI capabilities，使 reasoning 字段、Thinking 标签提取和 `stream_options` 与非流式行为保持一致。
+- 转发前会过滤无匹配调用的 Anthropic tool result 和 Responses API function output，避免上游返回 `400`。
+- 连续到达的匿名流式工具调用不再互相污染；Anthropic URL 引用图片会保留为 OpenAI `image_url` 内容。
+
+### 流式、状态与 Provider 韧性
+- 可选的旧版 `settings*.json` profile 即使格式损坏也只会被跳过并告警，不再阻止服务启动或 profile 热重载。
+- 增加有界的上游请求超时；客户端断开并丢弃响应流后，上游请求也会随之释放。
+- Profile 文件读取与哈希已移出异步请求处理线程，消除重复配置戳计算，并避免在持有 routing 写锁时执行阻塞式状态持久化。
+- Bridge state 更新改为串行处理，并通过同目录临时文件原子替换，避免并发更新丢失和状态文件半写入。
+- OpenAI-compatible SSE 的单行和单事件上限为 8 MiB；畸形 UTF-8 会替换为恢复字符，不再立即中断整个流。
+- 流式 Gemini 安全拦截会输出 Anthropic refusal 事件；thought-signature 锁中毒后会恢复并记录错误，不再永久静默失效。
+
+### Windows 服务与安装包
+- Windows 服务由 LocalSystem 改为隔离的 `NT SERVICE\ClaudeCodeBridge` 虚拟账户，并仅授予所需文件系统权限。
+- 安装器最低系统版本提高到 Windows 10，使声明的支持范围与实际使用的 PowerShell、网络命令一致。
+- 发布流程会为双语使用说明写入 UTF-8 BOM，确保 Windows 记事本稳定显示中文。
+- 版本及安装器升级为 `0.3.2`，并发布对应的 Setup、便携 ZIP 和 SHA-256 校验清单。
+
+### 验证
+- 66 项 Rust 单元测试全部通过，覆盖畸形并行工具、孤立结果、匿名流式调用、SSE 上限、流式安全拦截、URL 图片和锁中毒恢复。
+- Rust 格式检查、Release 编译、PowerShell 语法检查、静态 CRT 打包、便携 ZIP 检查、Inno Setup 编译及本机 Windows 服务健康检查均成功完成。
 
 ## [v0.3.1] - 2026-08-07
 
