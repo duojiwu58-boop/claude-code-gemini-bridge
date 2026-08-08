@@ -61,14 +61,21 @@ Anthropic Messages · Agent · MCP · tools · thinking · media
 | 模型 | 推荐 transport | 已适配的关键能力 | 可选路径 |
 | --- | --- | --- | --- |
 | **Gemini 3.6 Flash** | `gemini-interactions` | 原生 `step.*` 流、有状态精确续接、Thinking/签名、图片与 PDF、原生 Token Count、结构化输出、Google 服务端工具 | OpenAI Chat fallback |
-| **DeepSeek V4 Flash** | `anthropic` | 最少转换保留 Claude Code 协议；Chat 路径支持 `reasoning_content` 工具轮次回放、effort/thinking 映射与 `tool_choice` 约束 | 无状态 `openai-responses`、OpenAI Chat、Vision Proxy |
-| **Qwen3.8 Max** | `anthropic` | 最少转换保留 Claude Code 协议；Responses 精确续接与会话缓存；Chat 路径支持 `enable_thinking`、`thinking_budget`、`preserve_thinking` 和 `response_format` | 有状态 `openai-responses`、OpenAI Chat |
+| **DeepSeek V4 Flash** | `anthropic` | 最少转换保留 Claude Code 协议；Anthropic 与 Chat 路径提供 disabled/high/max 三态推理并让 16K budget 保持 high；Chat 仅在请求完全不携带工具时省略普通推理，携带 `tools` 时按 API 契约完整回放全部推理 | 无状态 `openai-responses`、OpenAI Chat、Vision Proxy |
+| **Qwen3.8 Max** | `anthropic` | Anthropic/Chat 提供真正可区分的 `low/medium/xhigh` 三档并限制普通轮次预算，避免常驻最大推理；Responses 支持七档原生 effort、精确续接、会话缓存及 Usage/延迟观测 | 有状态 `openai-responses`、OpenAI Chat |
 | **Kimi K3** | `anthropic` | Bearer 鉴权、`kimi-k3`、1M 上下文元数据、原生 Token Estimate、缓存 Usage；Chat 路径支持 Kimi effort、推理回放和结构化输出 | OpenAI Chat、显式启用的 Kimi Formula MCP 工具 |
 | **其他兼容模型** | 视供应商而定 | Anthropic 直通或通用 OpenAI Chat/Responses 语义核心；可通过 `capabilities` 声明差异 | 能力完整度取决于上游 API |
 
 “可调用”不等于“深度适配”。重点模型会按供应商 API 契约审核，并用请求/响应 fixture 覆盖推理、工具、流式、Usage 和续接行为；其他兼容 Provider 则以它真实提供的字段和显式能力配置为准。
 
 供应商可能调整模型 ID、区域域名和 API 行为。仓库模板保存本项目实际验证过的配置；更新前请同时查看 [Provider 配置指南](PROVIDER_CONFIG.md) 与 [CHANGELOG](CHANGELOG.md)。
+
+### Qwen3.8 Max 推理注意事项
+
+- 仅提供 budget 时，Anthropic 与 Chat 路径在 8,192 以下使用 `low`、31,999 以下使用 `medium`、达到 31,999 后进入 `xhigh`；Responses 保留更细的 `<2K / <8K / <31,999 / >=31,999` → `low / medium / high / xhigh` 映射。这样 Claude Code 的 31,999-token ultrathink 上限能够进入 Qwen 最高档，常规轮次仍可控制费用。
+- Chat 会把实际 `low` 和 `medium` thinking budget 分别限制在 4,096 和 16,384；Anthropic 保留请求预算，并在 `max_tokens <= budget_tokens` 时把 `max_tokens` 提高到 `budget_tokens + 8,192`，为可见输出保留空间。
+- 官方 DashScope/百炼 Qwen 域名在 Responses 与 Anthropic transport 上都会自动收到 `x-dashscope-session-cache: enable`。Responses 缓存已经验证；Anthropic 请求头的实际缓存效果和端点对注入 `output_config.effort` 的接受情况仍待线上验证。可分别设置 `capabilities.responses_session_cache: false` 或 `capabilities.reasoning_effort: false` 关闭。
+- Anthropic profile 默认使用 `x-api-key`；若百炼工作区返回 HTTP 401，请设置 `auth_scheme: bearer`。完整示例和诊断说明见 [Qwen Provider 配置](PROVIDER_CONFIG.md#deepseek--qwen-推荐配置与-responses)。
 
 ## 四条一级传输路径
 

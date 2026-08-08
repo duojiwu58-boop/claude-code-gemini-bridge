@@ -16,7 +16,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -288,6 +288,17 @@ impl OpenAiCapabilities {
                 capabilities.responses_session_cache = true;
             }
             OpenAiChatDialect::Generic | OpenAiChatDialect::Kimi => {}
+        }
+        capabilities
+    }
+
+    fn for_anthropic_base_url(base_url: &str) -> Self {
+        let mut capabilities = Self::for_openai_base_url(base_url);
+        // Official Qwen Anthropic endpoints receive the same DashScope session
+        // cache header as the Responses transport so multi-turn Claude Code
+        // sessions can reuse cached context.
+        if capabilities.chat_dialect == OpenAiChatDialect::Qwen {
+            capabilities.responses_session_cache = true;
         }
         capabilities
     }
@@ -1353,7 +1364,7 @@ fn load_native_provider_profiles(
             ProviderTransport::OpenAiResponses => {
                 OpenAiCapabilities::for_responses_base_url(&base_url)
             }
-            ProviderTransport::Anthropic => OpenAiCapabilities::for_openai_base_url(&base_url),
+            ProviderTransport::Anthropic => OpenAiCapabilities::for_anthropic_base_url(&base_url),
         };
         let openai_capabilities =
             parse_openai_capabilities_with_defaults(object, &file_name, capability_defaults)?;
@@ -3696,7 +3707,16 @@ async fn anthropic_messages(
     let local_capabilities = active_profile.openai_capabilities.clone();
     match active_profile.transport {
         ProviderTransport::Anthropic => {
-            return forward_anthropic_profile(active_profile, &headers, request).await;
+            let diagnostics = match active_profile.openai_capabilities.chat_dialect {
+                OpenAiChatDialect::DeepSeek => deepseek_effort_mapping_diagnostic(&request)
+                    .into_iter()
+                    .collect(),
+                OpenAiChatDialect::Qwen => qwen_anthropic_reasoning_diagnostics(&request),
+                _ => Vec::new(),
+            };
+            let provider_file = active_profile.file_name.clone();
+            let response = forward_anthropic_profile(active_profile, &headers, request).await;
+            return attach_bridge_diagnostics(response, &provider_file, &diagnostics);
         }
         ProviderTransport::OpenAiChat => {
             let diagnostics = openai_request_diagnostics(
@@ -3846,6 +3866,60 @@ async fn forward_anthropic_profile(
     client_headers: &HeaderMap,
     mut request: Value,
 ) -> Response {
+    match profile.openai_capabilities.chat_dialect {
+        OpenAiChatDialect::DeepSeek => {
+            let policy = match apply_deepseek_anthropic_reasoning_policy(
+                &mut request,
+                &profile.openai_capabilities,
+            ) {
+                Ok(policy) => policy,
+                Err(message) => {
+                    return anthropic_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        &message,
+                    )
+                }
+            };
+            let (replay_messages, replay_tokens) = deepseek_anthropic_reasoning_stats(&request);
+            info!(
+                provider = %profile.file_name,
+                thinking_enabled = policy.thinking_enabled,
+                reasoning_effort = policy.effort.unwrap_or("omitted"),
+                policy_source = policy.source,
+                reasoning_replay_messages = replay_messages,
+                reasoning_replay_estimated_tokens = replay_tokens,
+                "DeepSeek Anthropic reasoning policy"
+            );
+        }
+        OpenAiChatDialect::Qwen => {
+            let policy = match apply_qwen_anthropic_reasoning_policy(
+                &mut request,
+                &profile.openai_capabilities,
+            ) {
+                Ok(policy) => policy,
+                Err(message) => {
+                    return anthropic_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        &message,
+                    )
+                }
+            };
+            info!(
+                provider = %profile.file_name,
+                thinking_enabled = policy.thinking_enabled,
+                reasoning_effort = policy.effort.unwrap_or("omitted"),
+                thinking_budget_tokens = policy.budget_tokens.unwrap_or(0),
+                max_tokens = request.get("max_tokens").and_then(|value| value.as_u64()).unwrap_or(0),
+                policy_source = policy.source,
+                estimated_input_tokens = estimate_anthropic_input_tokens(&request),
+                message_count = request.get("messages").and_then(|value| value.as_array()).map(Vec::len).unwrap_or(0),
+                "Qwen Anthropic reasoning policy"
+            );
+        }
+        _ => {}
+    }
     let Some(request_object) = request.as_object_mut() else {
         return anthropic_error(
             StatusCode::BAD_REQUEST,
@@ -3859,6 +3933,7 @@ async fn forward_anthropic_profile(
     let upstream_request =
         apply_anthropic_forward_headers(upstream_request, &profile, client_headers);
 
+    let upstream_started = Instant::now();
     let upstream = match upstream_request.send().await {
         Ok(response) => response,
         Err(err) => {
@@ -3869,6 +3944,14 @@ async fn forward_anthropic_profile(
             return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", &err.to_string());
         }
     };
+    if profile.openai_capabilities.chat_dialect == OpenAiChatDialect::Qwen {
+        info!(
+            provider = %profile.file_name,
+            status = upstream.status().as_u16(),
+            upstream_response_headers_ms = upstream_started.elapsed().as_millis(),
+            "Qwen Anthropic upstream response"
+        );
+    }
     let status = upstream.status().as_u16();
     let content_type = upstream
         .headers()
@@ -4558,6 +4641,101 @@ fn attach_bridge_diagnostics(
     response
 }
 
+fn deepseek_effort_mapping_diagnostic(request: &Value) -> Option<String> {
+    let effort = request
+        .pointer("/output_config/effort")
+        .and_then(Value::as_str)?;
+    match effort {
+        "none" | "minimal" | "low" => Some(format!(
+            "Mapped Anthropic output_config.effort '{effort}' to DeepSeek thinking.type=disabled because DeepSeek exposes only high/max reasoning effort"
+        )),
+        "medium" => Some(
+            "Mapped Anthropic output_config.effort 'medium' to DeepSeek reasoning_effort 'high'"
+                .to_string(),
+        ),
+        "xhigh" => Some(
+            "Mapped Anthropic output_config.effort 'xhigh' to DeepSeek reasoning_effort 'max'"
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+fn qwen_effort_mapping_diagnostic(request: &Value) -> Option<String> {
+    let effort = request
+        .pointer("/output_config/effort")
+        .and_then(Value::as_str)?;
+    let policy = qwen_reasoning_policy(request, &OpenAiCapabilities::default());
+    match (effort, policy.thinking_enabled, policy.effort) {
+        ("none", false, _) => Some(
+            "Mapped Anthropic output_config.effort 'none' to Qwen thinking.type=disabled"
+                .to_string(),
+        ),
+        ("minimal", true, Some("low")) => Some(
+            "Mapped Anthropic output_config.effort 'minimal' to Qwen reasoning effort 'low'"
+                .to_string(),
+        ),
+        ("high", true, Some("medium")) => Some(
+            "Mapped Anthropic output_config.effort 'high' to Qwen reasoning effort 'medium'; use xhigh/max only for maximum-intensity reasoning"
+                .to_string(),
+        ),
+        ("max", true, Some("xhigh")) => Some(
+            "Mapped Anthropic output_config.effort 'max' to Qwen reasoning effort 'xhigh'"
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+fn qwen_anthropic_reasoning_diagnostics(request: &Value) -> Vec<String> {
+    let mut diagnostics = Vec::new();
+    if request.pointer("/thinking/type").and_then(Value::as_str) == Some("adaptive") {
+        diagnostics.push(
+            "Normalized Anthropic thinking.type 'adaptive' to Qwen thinking.type 'enabled'"
+                .to_string(),
+        );
+    }
+    if let Some(diagnostic) = qwen_effort_mapping_diagnostic(request) {
+        diagnostics.push(diagnostic);
+    }
+    if request.pointer("/output_config/effort").is_none() {
+        if let Some(budget) = request
+            .pointer("/thinking/budget_tokens")
+            .and_then(Value::as_u64)
+        {
+            let policy = qwen_reasoning_policy(request, &OpenAiCapabilities::default());
+            diagnostics.push(format!(
+                "Mapped Anthropic thinking budget {budget} to Qwen reasoning effort '{}'",
+                policy.effort.unwrap_or("omitted")
+            ));
+        }
+    }
+    if let (Some(max_tokens), Some(budget)) = (
+        request.get("max_tokens").and_then(Value::as_u64),
+        request
+            .pointer("/thinking/budget_tokens")
+            .and_then(Value::as_u64),
+    ) {
+        if request.pointer("/thinking/type").and_then(Value::as_str) != Some("disabled")
+            && max_tokens <= budget
+        {
+            diagnostics.push(format!(
+                "Raised Qwen Anthropic max_tokens from {max_tokens} to {} because extended thinking requires max_tokens > thinking.budget_tokens; the extra headroom keeps visible output possible",
+                budget.saturating_add(QWEN_MAX_TOKENS_OUTPUT_HEADROOM)
+            ));
+        }
+    }
+    if request.pointer("/output_config/format").is_some()
+        && !qwen_prompt_contains_json_keyword(request)
+    {
+        diagnostics.push(
+            "Qwen structured output requires the system or messages content to contain the keyword 'JSON'; the upstream may reject this request"
+                .to_string(),
+        );
+    }
+    diagnostics
+}
+
 fn openai_request_diagnostics(
     request: &Value,
     capabilities: &OpenAiCapabilities,
@@ -4627,14 +4805,38 @@ fn openai_request_diagnostics(
         );
     }
     if transport == ProviderTransport::OpenAiChat {
-        if capabilities.chat_dialect == OpenAiChatDialect::DeepSeek
-            && request.pointer("/thinking/type").and_then(Value::as_str) != Some("disabled")
-            && request.get("tool_choice").is_some()
-        {
-            add(
-                "Suppressed Anthropic tool_choice because DeepSeek thinking mode rejects it"
-                    .to_string(),
-            );
+        if capabilities.chat_dialect == OpenAiChatDialect::DeepSeek {
+            let policy = deepseek_reasoning_policy(request, capabilities);
+            if policy.thinking_enabled && request.get("tool_choice").is_some() {
+                add(
+                    "Suppressed Anthropic tool_choice because DeepSeek thinking mode rejects it"
+                        .to_string(),
+                );
+            }
+            if let Some(diagnostic) = deepseek_effort_mapping_diagnostic(request) {
+                add(diagnostic);
+            }
+        }
+        if capabilities.chat_dialect == OpenAiChatDialect::Qwen {
+            if let Some(diagnostic) = qwen_effort_mapping_diagnostic(request) {
+                add(diagnostic);
+            }
+            let policy = qwen_reasoning_policy(request, capabilities);
+            let chat_budget = qwen_chat_thinking_budget(policy);
+            if policy.budget_tokens.is_some() && chat_budget != policy.budget_tokens {
+                add(format!(
+                    "Capped Qwen Chat thinking_budget from {} to {} for effective '{}' reasoning effort",
+                    policy.budget_tokens.unwrap_or(0),
+                    chat_budget.unwrap_or(0),
+                    policy.effort.unwrap_or("disabled")
+                ));
+            }
+            if request.pointer("/output_config/format").is_some()
+                && !qwen_prompt_contains_json_keyword(request)
+            {
+                add("Qwen structured output requires the system or messages content to contain the keyword 'JSON'; the upstream may reject this request"
+                    .to_string());
+            }
         }
         if request
             .pointer("/output_config/format/type")
@@ -4683,8 +4885,15 @@ fn openai_request_diagnostics(
         if request.pointer("/thinking/budget_tokens").is_some()
             && request.pointer("/output_config/effort").is_none()
         {
-            add("Anthropic thinking budget has no exact Responses equivalent; configure output_config.effort for deterministic reasoning control"
-                .to_string());
+            if capabilities.chat_dialect == OpenAiChatDialect::Qwen {
+                let (effort, _) = qwen_responses_reasoning_effort(request, capabilities);
+                add(format!(
+                    "Mapped Anthropic thinking budget to Qwen Responses reasoning.effort '{effort}'"
+                ));
+            } else {
+                add("Anthropic thinking budget has no exact Responses equivalent; configure output_config.effort for deterministic reasoning control"
+                    .to_string());
+            }
         }
         if !capabilities.responses_stateful
             && request
@@ -5341,6 +5550,37 @@ async fn forward_openai_profile(
             return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message);
         }
     };
+    if profile.openai_capabilities.chat_dialect == OpenAiChatDialect::DeepSeek {
+        let policy = deepseek_reasoning_policy(&request, &profile.openai_capabilities);
+        let (replay_messages, replay_tokens) = chat_replayed_reasoning_stats(&chat_request);
+        let effective_effort = chat_request
+            .get("reasoning_effort")
+            .and_then(Value::as_str)
+            .unwrap_or("omitted");
+        info!(
+            provider = %profile.file_name,
+            thinking_enabled = policy.thinking_enabled,
+            reasoning_effort = effective_effort,
+            policy_source = policy.source,
+            reasoning_replay_messages = replay_messages,
+            reasoning_replay_estimated_tokens = replay_tokens,
+            "DeepSeek Chat reasoning policy"
+        );
+    } else if profile.openai_capabilities.chat_dialect == OpenAiChatDialect::Qwen {
+        let policy = qwen_reasoning_policy(&request, &profile.openai_capabilities);
+        let (replay_messages, replay_tokens) = chat_replayed_reasoning_stats(&chat_request);
+        info!(
+            provider = %profile.file_name,
+            thinking_enabled = policy.thinking_enabled,
+            reasoning_effort = policy.effort.unwrap_or("omitted"),
+            thinking_budget_tokens = chat_request.get("thinking_budget").and_then(|value| value.as_u64()).unwrap_or(0),
+            policy_source = policy.source,
+            estimated_input_tokens = estimate_anthropic_input_tokens(&request),
+            reasoning_replay_messages = replay_messages,
+            reasoning_replay_estimated_tokens = replay_tokens,
+            "Qwen Chat reasoning policy"
+        );
+    }
     let stream_requested = request
         .get("stream")
         .and_then(Value::as_bool)
@@ -5355,6 +5595,7 @@ async fn forward_openai_profile(
             "The active OpenAI-compatible profile has no API credential",
         );
     };
+    let upstream_started = Instant::now();
     let upstream = match profile
         .client
         .post(&profile.upstream_url)
@@ -5372,6 +5613,14 @@ async fn forward_openai_profile(
             return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", &err.to_string());
         }
     };
+    if profile.openai_capabilities.chat_dialect == OpenAiChatDialect::Qwen {
+        info!(
+            provider = %profile.file_name,
+            status = upstream.status().as_u16(),
+            upstream_response_headers_ms = upstream_started.elapsed().as_millis(),
+            "Qwen Chat upstream response"
+        );
+    }
 
     let status = upstream.status();
     if !status.is_success() {
@@ -5432,6 +5681,9 @@ async fn forward_openai_profile(
             return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", &message);
         }
     };
+    if profile.openai_capabilities.chat_dialect == OpenAiChatDialect::Qwen {
+        log_qwen_usage(&profile.file_name, "openai-chat", &message["usage"]);
+    }
     Json(message).into_response()
 }
 
@@ -5718,7 +5970,10 @@ fn translate_anthropic_to_responses(
             body.insert("top_p".to_string(), json!(top_p));
         }
     }
-    if request.pointer("/thinking/type").and_then(Value::as_str) != Some("disabled") {
+    if profile.openai_capabilities.chat_dialect == OpenAiChatDialect::Qwen {
+        let (effort, _) = qwen_responses_reasoning_effort(request, &profile.openai_capabilities);
+        body.insert("reasoning".to_string(), json!({"effort": effort}));
+    } else if request.pointer("/thinking/type").and_then(Value::as_str) != Some("disabled") {
         let effort = request
             .pointer("/output_config/effort")
             .and_then(Value::as_str)
@@ -5802,6 +6057,47 @@ fn openai_usage_to_anthropic(usage: &Value, estimated_input_tokens: u64) -> Valu
         translated["reasoning_tokens"] = json!(value);
     }
     translated
+}
+
+fn log_qwen_usage(provider: &str, transport: &str, usage: &Value) {
+    let input_tokens = usage_token(
+        usage,
+        &["input_tokens", "prompt_tokens", "total_input_tokens"],
+    )
+    .unwrap_or(0);
+    let output_tokens = usage_token(
+        usage,
+        &["output_tokens", "completion_tokens", "total_output_tokens"],
+    )
+    .unwrap_or(0);
+    let cache_read_tokens = usage
+        .get("cache_read_input_tokens")
+        .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
+        .or_else(|| usage.pointer("/prompt_tokens_details/cached_tokens"))
+        .or_else(|| usage.get("prompt_cache_hit_tokens"))
+        .or_else(|| usage.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_creation_tokens = usage
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let reasoning_tokens = usage
+        .get("reasoning_tokens")
+        .or_else(|| usage.pointer("/output_tokens_details/reasoning_tokens"))
+        .or_else(|| usage.pointer("/completion_tokens_details/reasoning_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    info!(
+        provider,
+        transport,
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_creation_tokens,
+        reasoning_tokens,
+        "Qwen usage"
+    );
 }
 
 fn is_responses_server_tool_item(item_type: &str) -> bool {
@@ -6020,6 +6316,24 @@ async fn forward_openai_responses_profile(
         .unwrap_or(false);
     let estimated_input_tokens =
         u64::try_from(estimate_anthropic_input_tokens(&request)).unwrap_or(u64::MAX);
+    if profile.openai_capabilities.chat_dialect == OpenAiChatDialect::Qwen {
+        let effective_effort = responses_request
+            .pointer("/reasoning/effort")
+            .and_then(Value::as_str)
+            .unwrap_or("omitted");
+        let (_, policy_source) =
+            qwen_responses_reasoning_effort(&request, &profile.openai_capabilities);
+        info!(
+            provider = %profile.file_name,
+            reasoning_effort = effective_effort,
+            policy_source,
+            estimated_input_tokens,
+            stateful = profile.openai_capabilities.responses_stateful,
+            session_cache = profile.openai_capabilities.responses_session_cache,
+            continued = responses_request.get("previous_response_id").is_some(),
+            "Qwen Responses reasoning policy"
+        );
+    }
     let Some(credential) = profile.auth_token.as_ref().or(profile.api_key.as_ref()) else {
         return anthropic_error(
             StatusCode::UNAUTHORIZED,
@@ -6035,6 +6349,7 @@ async fn forward_openai_responses_profile(
     if profile.openai_capabilities.responses_session_cache {
         upstream_request = upstream_request.header("x-dashscope-session-cache", "enable");
     }
+    let upstream_started = Instant::now();
     let upstream = match upstream_request.send().await {
         Ok(response) => response,
         Err(err) => {
@@ -6045,6 +6360,14 @@ async fn forward_openai_responses_profile(
             return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", &err.to_string());
         }
     };
+    if profile.openai_capabilities.chat_dialect == OpenAiChatDialect::Qwen {
+        info!(
+            provider = %profile.file_name,
+            status = upstream.status().as_u16(),
+            upstream_response_headers_ms = upstream_started.elapsed().as_millis(),
+            "Qwen Responses upstream response"
+        );
+    }
     let status = upstream.status();
     if !status.is_success() {
         let response_text = match read_response_text_limited(upstream).await {
@@ -6086,6 +6409,13 @@ async fn forward_openai_responses_profile(
             Ok(value) => value,
             Err(message) => return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", &message),
         };
+    if profile.openai_capabilities.chat_dialect == OpenAiChatDialect::Qwen {
+        log_qwen_usage(
+            &profile.file_name,
+            "openai-responses",
+            &translated.message["usage"],
+        );
+    }
     if profile.openai_capabilities.responses_stateful {
         remember_interaction_continuation(
             &continuations,
@@ -6763,6 +7093,9 @@ fn apply_anthropic_forward_headers(
         .and_then(|value| value.to_str().ok())
     {
         upstream_request = upstream_request.header("anthropic-beta", value);
+    }
+    if profile.openai_capabilities.responses_session_cache {
+        upstream_request = upstream_request.header("x-dashscope-session-cache", "enable");
     }
     upstream_request
 }
@@ -9231,6 +9564,11 @@ fn translate_anthropic_request_with_capabilities(
     let mut runtime_identity_reminder = None;
     let mut pending_tool_call_ids = HashSet::new();
     let mut replayed_reasoning = false;
+    let deepseek_request_has_tools = capabilities.chat_dialect == OpenAiChatDialect::DeepSeek
+        && request
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty());
 
     if let Some(system) = request.get("system") {
         let text = value_to_text(system);
@@ -9262,6 +9600,7 @@ fn translate_anthropic_request_with_capabilities(
                     thought_signatures,
                     &mut pending_tool_call_ids,
                     capabilities.chat_dialect,
+                    deepseek_request_has_tools,
                 );
             }
             "user" => translate_anthropic_user_message(
@@ -9333,11 +9672,17 @@ fn translate_anthropic_request_with_capabilities(
         }
     }
 
-    let thinking_enabled = request
-        .pointer("/thinking/type")
-        .and_then(Value::as_str)
-        .map(|kind| kind != "disabled")
-        .unwrap_or(capabilities.chat_dialect == OpenAiChatDialect::DeepSeek);
+    let deepseek_policy = (capabilities.chat_dialect == OpenAiChatDialect::DeepSeek)
+        .then(|| deepseek_reasoning_policy(request, capabilities));
+    let thinking_enabled = deepseek_policy
+        .map(|policy| policy.thinking_enabled)
+        .unwrap_or_else(|| {
+            request
+                .pointer("/thinking/type")
+                .and_then(Value::as_str)
+                .map(|kind| kind != "disabled")
+                .unwrap_or(false)
+        });
 
     // DeepSeek V4 rejects tool_choice while thinking is enabled. Let the
     // model use the supplied tools automatically instead of forwarding an
@@ -9364,33 +9709,15 @@ fn translate_anthropic_request_with_capabilities(
 
     match capabilities.chat_dialect {
         OpenAiChatDialect::DeepSeek => {
-            if let Some(kind) = request.pointer("/thinking/type").and_then(Value::as_str) {
-                let kind = if kind == "disabled" {
-                    "disabled"
-                } else {
-                    "enabled"
-                };
-                body.insert("thinking".to_string(), json!({"type": kind}));
-            }
-
-            let effort = request
-                .pointer("/output_config/effort")
-                .and_then(Value::as_str)
-                .map(deepseek_reasoning_effort)
-                .or_else(|| {
-                    request
-                        .pointer("/thinking/budget_tokens")
-                        .and_then(Value::as_u64)
-                        .map(|budget| if budget >= 16_384 { "max" } else { "high" })
-                })
-                .or_else(|| {
-                    capabilities
-                        .default_reasoning_effort
-                        .as_deref()
-                        .map(deepseek_reasoning_effort)
-                });
-            if capabilities.reasoning_effort && thinking_enabled {
-                if let Some(effort) = effort {
+            let policy = deepseek_policy.expect("DeepSeek policy must be available");
+            let thinking_type = if policy.thinking_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            };
+            body.insert("thinking".to_string(), json!({"type": thinking_type}));
+            if capabilities.reasoning_effort && policy.thinking_enabled {
+                if let Some(effort) = policy.effort {
                     body.insert("reasoning_effort".to_string(), json!(effort));
                 }
             }
@@ -9399,16 +9726,15 @@ fn translate_anthropic_request_with_capabilities(
             }
         }
         OpenAiChatDialect::Qwen => {
-            if let Some(kind) = request.pointer("/thinking/type").and_then(Value::as_str) {
-                body.insert("enable_thinking".to_string(), json!(kind != "disabled"));
-            }
-            if let Some(budget) = request
-                .pointer("/thinking/budget_tokens")
-                .and_then(Value::as_u64)
-            {
+            let policy = qwen_reasoning_policy(request, capabilities);
+            body.insert(
+                "enable_thinking".to_string(),
+                Value::Bool(policy.thinking_enabled),
+            );
+            if let Some(budget) = qwen_chat_thinking_budget(policy) {
                 body.insert("thinking_budget".to_string(), json!(budget));
             }
-            if replayed_reasoning {
+            if policy.thinking_enabled && replayed_reasoning {
                 body.insert("preserve_thinking".to_string(), Value::Bool(true));
             }
             if let Some(format) = openai_chat_response_format(request, false)? {
@@ -9498,6 +9824,7 @@ fn translate_anthropic_assistant_message(
     thought_signatures: &ThoughtSignatureCache,
     pending_tool_call_ids: &mut HashSet<String>,
     chat_dialect: OpenAiChatDialect,
+    deepseek_request_has_tools: bool,
 ) -> bool {
     pending_tool_call_ids.clear();
     if let Some(text) = content.as_str() {
@@ -9580,18 +9907,25 @@ fn translate_anthropic_assistant_message(
                 Value::String(text_parts.join("\n"))
             }
         });
-        if !tool_calls.is_empty() {
+        let has_tool_calls = !tool_calls.is_empty();
+        if has_tool_calls {
             translated["tool_calls"] = Value::Array(tool_calls);
         } else if let Some(signature) = assistant_signature {
             translated["extra_content"] = json!({"google": {"thought_signature": signature}});
         }
-        if chat_dialect != OpenAiChatDialect::Generic && !reasoning_parts.is_empty() {
+        let replay_reasoning = !reasoning_parts.is_empty()
+            && chat_dialect != OpenAiChatDialect::Generic
+            && (chat_dialect != OpenAiChatDialect::DeepSeek
+                || deepseek_request_has_tools
+                || has_tool_calls);
+        if replay_reasoning {
             translated["reasoning_content"] = Value::String(reasoning_parts.join("\n"));
         }
         messages.push(translated);
+        return replay_reasoning;
     }
 
-    !reasoning_parts.is_empty()
+    false
 }
 
 fn deepseek_reasoning_effort(effort: &str) -> &'static str {
@@ -9600,6 +9934,436 @@ fn deepseek_reasoning_effort(effort: &str) -> &'static str {
     } else {
         "high"
     }
+}
+
+const DEEPSEEK_MAX_EFFORT_BUDGET_TOKENS: u64 = 32_768;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DeepSeekReasoningPolicy {
+    thinking_enabled: bool,
+    effort: Option<&'static str>,
+    source: &'static str,
+}
+
+fn deepseek_reasoning_policy(
+    request: &Value,
+    capabilities: &OpenAiCapabilities,
+) -> DeepSeekReasoningPolicy {
+    if request.pointer("/thinking/type").and_then(Value::as_str) == Some("disabled") {
+        return DeepSeekReasoningPolicy {
+            thinking_enabled: false,
+            effort: None,
+            source: "thinking.type=disabled",
+        };
+    }
+
+    let effort_policy = |effort: &str, source| match effort {
+        "none" | "minimal" | "low" => DeepSeekReasoningPolicy {
+            thinking_enabled: false,
+            effort: None,
+            source,
+        },
+        "xhigh" | "max" => DeepSeekReasoningPolicy {
+            thinking_enabled: true,
+            effort: Some("max"),
+            source,
+        },
+        _ => DeepSeekReasoningPolicy {
+            thinking_enabled: true,
+            effort: Some("high"),
+            source,
+        },
+    };
+
+    if let Some(effort) = request
+        .pointer("/output_config/effort")
+        .and_then(Value::as_str)
+    {
+        return effort_policy(effort, "output_config.effort");
+    }
+    if let Some(budget) = request
+        .pointer("/thinking/budget_tokens")
+        .and_then(Value::as_u64)
+    {
+        return DeepSeekReasoningPolicy {
+            thinking_enabled: true,
+            effort: Some(if budget >= DEEPSEEK_MAX_EFFORT_BUDGET_TOKENS {
+                "max"
+            } else {
+                "high"
+            }),
+            source: "thinking.budget_tokens",
+        };
+    }
+    if let Some(effort) = capabilities.default_reasoning_effort.as_deref() {
+        return effort_policy(effort, "profile default_reasoning_effort");
+    }
+    DeepSeekReasoningPolicy {
+        thinking_enabled: true,
+        effort: Some("high"),
+        source: "DeepSeek default",
+    }
+}
+
+fn apply_deepseek_anthropic_reasoning_policy(
+    request: &mut Value,
+    capabilities: &OpenAiCapabilities,
+) -> Result<DeepSeekReasoningPolicy, String> {
+    let policy = deepseek_reasoning_policy(request, capabilities);
+    let request = request
+        .as_object_mut()
+        .ok_or_else(|| "Anthropic request body must be a JSON object".to_string())?;
+
+    let thinking = request
+        .entry("thinking".to_string())
+        .or_insert_with(|| json!({}));
+    let Some(thinking) = thinking.as_object_mut() else {
+        return Err("Anthropic field 'thinking' must be an object".to_string());
+    };
+    thinking.insert(
+        "type".to_string(),
+        json!(if policy.thinking_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }),
+    );
+    if !policy.thinking_enabled {
+        thinking.remove("budget_tokens");
+    }
+
+    if capabilities.reasoning_effort && policy.thinking_enabled {
+        let output_config = request
+            .entry("output_config".to_string())
+            .or_insert_with(|| json!({}));
+        let Some(output_config) = output_config.as_object_mut() else {
+            return Err("Anthropic field 'output_config' must be an object".to_string());
+        };
+        if let Some(effort) = policy.effort {
+            output_config.insert("effort".to_string(), json!(effort));
+        }
+    } else if let Some(output_config) = request.get_mut("output_config") {
+        let Some(output_config) = output_config.as_object_mut() else {
+            return Err("Anthropic field 'output_config' must be an object".to_string());
+        };
+        output_config.remove("effort");
+        if output_config.is_empty() {
+            request.remove("output_config");
+        }
+    }
+
+    Ok(policy)
+}
+
+const QWEN_LOW_CHAT_BUDGET_TOKENS: u64 = 4_096;
+const QWEN_MEDIUM_CHAT_BUDGET_TOKENS: u64 = 16_384;
+const QWEN_LOW_EFFORT_BUDGET_THRESHOLD: u64 = 8_192;
+// Claude Code's strongest thinking trigger uses a 31,999-token budget (it must
+// stay below max_tokens), so the xhigh threshold sits at exactly that value;
+// otherwise the strongest Claude turn could never reach Qwen's maximum effort.
+const QWEN_XHIGH_EFFORT_BUDGET_THRESHOLD: u64 = 31_999;
+const QWEN_MAX_TOKENS_OUTPUT_HEADROOM: u64 = 8_192;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct QwenReasoningPolicy {
+    thinking_enabled: bool,
+    effort: Option<&'static str>,
+    budget_tokens: Option<u64>,
+    source: &'static str,
+}
+
+fn qwen_reasoning_policy(
+    request: &Value,
+    capabilities: &OpenAiCapabilities,
+) -> QwenReasoningPolicy {
+    if request.pointer("/thinking/type").and_then(Value::as_str) == Some("disabled") {
+        return QwenReasoningPolicy {
+            thinking_enabled: false,
+            effort: None,
+            budget_tokens: None,
+            source: "thinking.type=disabled",
+        };
+    }
+
+    let budget_tokens = request
+        .pointer("/thinking/budget_tokens")
+        .and_then(Value::as_u64);
+    let effort_policy = |effort: &str, source| match effort {
+        "none" => QwenReasoningPolicy {
+            thinking_enabled: false,
+            effort: None,
+            budget_tokens: None,
+            source,
+        },
+        "minimal" | "low" => QwenReasoningPolicy {
+            thinking_enabled: true,
+            effort: Some("low"),
+            budget_tokens,
+            source,
+        },
+        "xhigh" | "max" => QwenReasoningPolicy {
+            thinking_enabled: true,
+            effort: Some("xhigh"),
+            budget_tokens,
+            source,
+        },
+        _ => QwenReasoningPolicy {
+            thinking_enabled: true,
+            effort: Some("medium"),
+            budget_tokens,
+            source,
+        },
+    };
+
+    if let Some(effort) = request
+        .pointer("/output_config/effort")
+        .and_then(Value::as_str)
+    {
+        return effort_policy(effort, "output_config.effort");
+    }
+    if let Some(budget) = budget_tokens {
+        return QwenReasoningPolicy {
+            thinking_enabled: true,
+            effort: Some(if budget < QWEN_LOW_EFFORT_BUDGET_THRESHOLD {
+                "low"
+            } else if budget < QWEN_XHIGH_EFFORT_BUDGET_THRESHOLD {
+                "medium"
+            } else {
+                "xhigh"
+            }),
+            budget_tokens: Some(budget),
+            source: "thinking.budget_tokens",
+        };
+    }
+    if let Some(effort) = capabilities.default_reasoning_effort.as_deref() {
+        return effort_policy(effort, "profile default_reasoning_effort");
+    }
+    QwenReasoningPolicy {
+        thinking_enabled: true,
+        effort: Some("medium"),
+        budget_tokens: None,
+        source: "bridge default",
+    }
+}
+
+fn qwen_chat_thinking_budget(policy: QwenReasoningPolicy) -> Option<u64> {
+    match policy.effort {
+        Some("low") => Some(
+            policy
+                .budget_tokens
+                .unwrap_or(QWEN_LOW_CHAT_BUDGET_TOKENS)
+                .min(QWEN_LOW_CHAT_BUDGET_TOKENS),
+        ),
+        Some("medium") => Some(
+            policy
+                .budget_tokens
+                .unwrap_or(QWEN_MEDIUM_CHAT_BUDGET_TOKENS)
+                .min(QWEN_MEDIUM_CHAT_BUDGET_TOKENS),
+        ),
+        Some("xhigh") => policy.budget_tokens,
+        _ => None,
+    }
+}
+
+fn apply_qwen_anthropic_reasoning_policy(
+    request: &mut Value,
+    capabilities: &OpenAiCapabilities,
+) -> Result<QwenReasoningPolicy, String> {
+    let policy = qwen_reasoning_policy(request, capabilities);
+    let request = request
+        .as_object_mut()
+        .ok_or_else(|| "Anthropic request body must be a JSON object".to_string())?;
+
+    let thinking = request
+        .entry("thinking".to_string())
+        .or_insert_with(|| json!({}));
+    let Some(thinking) = thinking.as_object_mut() else {
+        return Err("Anthropic field 'thinking' must be an object".to_string());
+    };
+    thinking.insert(
+        "type".to_string(),
+        json!(if policy.thinking_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }),
+    );
+    if !policy.thinking_enabled {
+        thinking.remove("budget_tokens");
+    }
+
+    if capabilities.reasoning_effort && policy.thinking_enabled {
+        let output_config = request
+            .entry("output_config".to_string())
+            .or_insert_with(|| json!({}));
+        let Some(output_config) = output_config.as_object_mut() else {
+            return Err("Anthropic field 'output_config' must be an object".to_string());
+        };
+        if let Some(effort) = policy.effort {
+            output_config.insert("effort".to_string(), json!(effort));
+        }
+    } else if let Some(output_config) = request.get_mut("output_config") {
+        let Some(output_config) = output_config.as_object_mut() else {
+            return Err("Anthropic field 'output_config' must be an object".to_string());
+        };
+        output_config.remove("effort");
+        if output_config.is_empty() {
+            request.remove("output_config");
+        }
+    }
+
+    if policy.thinking_enabled {
+        if let (Some(budget), Some(max_tokens)) = (
+            policy.budget_tokens,
+            request.get("max_tokens").and_then(Value::as_u64),
+        ) {
+            if max_tokens <= budget {
+                // Anthropic counts thinking and visible output against the same
+                // max_tokens. Raising it to budget + 1 would leave a single
+                // token for the answer, so keep real output headroom instead.
+                let required_max_tokens = budget
+                    .checked_add(QWEN_MAX_TOKENS_OUTPUT_HEADROOM)
+                    .ok_or_else(|| {
+                        "Qwen thinking.budget_tokens is too large to keep max_tokens above the budget with output headroom"
+                            .to_string()
+                    })?;
+                request.insert("max_tokens".to_string(), json!(required_max_tokens));
+            }
+        }
+    }
+
+    Ok(policy)
+}
+
+fn qwen_responses_reasoning_effort(
+    request: &Value,
+    capabilities: &OpenAiCapabilities,
+) -> (&'static str, &'static str) {
+    if request.pointer("/thinking/type").and_then(Value::as_str) == Some("disabled") {
+        return ("none", "thinking.type=disabled");
+    }
+    if let Some(effort) = request
+        .pointer("/output_config/effort")
+        .and_then(Value::as_str)
+    {
+        let effort = match effort {
+            "none" => "none",
+            "minimal" => "minimal",
+            "low" => "low",
+            "medium" => "medium",
+            "high" => "high",
+            "xhigh" => "xhigh",
+            "max" => "max",
+            _ => "medium",
+        };
+        return (effort, "output_config.effort");
+    }
+    if let Some(budget) = request
+        .pointer("/thinking/budget_tokens")
+        .and_then(Value::as_u64)
+    {
+        let effort = if budget < 2_048 {
+            "low"
+        } else if budget < 8_192 {
+            "medium"
+        } else if budget < QWEN_XHIGH_EFFORT_BUDGET_THRESHOLD {
+            "high"
+        } else {
+            "xhigh"
+        };
+        return (effort, "thinking.budget_tokens");
+    }
+    if let Some(effort) = capabilities.default_reasoning_effort.as_deref() {
+        let effort = match effort {
+            "none" => "none",
+            "minimal" => "minimal",
+            "low" => "low",
+            "medium" => "medium",
+            "high" => "high",
+            "xhigh" => "xhigh",
+            "max" => "max",
+            _ => "medium",
+        };
+        return (effort, "profile default_reasoning_effort");
+    }
+    ("medium", "bridge default")
+}
+
+fn qwen_prompt_contains_json_keyword(request: &Value) -> bool {
+    let contains_json = |value: &Value| value_to_text(value).to_ascii_lowercase().contains("json");
+    if request.get("system").is_some_and(contains_json) {
+        return true;
+    }
+    request
+        .get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| {
+            messages
+                .iter()
+                .any(|message| message.get("content").is_some_and(contains_json))
+        })
+}
+
+fn estimated_reasoning_text_tokens(reasoning: &str) -> usize {
+    let mut ascii_bytes = 0usize;
+    let mut non_ascii_bytes = 0usize;
+    for character in reasoning.chars() {
+        if character.is_ascii() {
+            ascii_bytes = ascii_bytes.saturating_add(character.len_utf8());
+        } else {
+            non_ascii_bytes = non_ascii_bytes.saturating_add(character.len_utf8());
+        }
+    }
+    ascii_bytes.div_ceil(4) + non_ascii_bytes.div_ceil(2)
+}
+
+fn chat_replayed_reasoning_stats(chat_request: &Value) -> (usize, usize) {
+    let mut message_count = 0usize;
+    let mut estimated_tokens = 0usize;
+    if let Some(messages) = chat_request.get("messages").and_then(Value::as_array) {
+        for message in messages {
+            let Some(reasoning) = message.get("reasoning_content").and_then(Value::as_str) else {
+                continue;
+            };
+            message_count = message_count.saturating_add(1);
+            estimated_tokens =
+                estimated_tokens.saturating_add(estimated_reasoning_text_tokens(reasoning));
+        }
+    }
+    (message_count, estimated_tokens)
+}
+
+fn deepseek_anthropic_reasoning_stats(request: &Value) -> (usize, usize) {
+    let mut message_count = 0usize;
+    let mut estimated_tokens = 0usize;
+    if let Some(messages) = request.get("messages").and_then(Value::as_array) {
+        for message in messages {
+            if message.get("role").and_then(Value::as_str) != Some("assistant") {
+                continue;
+            }
+            let mut message_has_reasoning = false;
+            if let Some(parts) = message.get("content").and_then(Value::as_array) {
+                for part in parts {
+                    if part.get("type").and_then(Value::as_str) != Some("thinking") {
+                        continue;
+                    }
+                    let Some(reasoning) = part.get("thinking").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if reasoning.is_empty() {
+                        continue;
+                    }
+                    message_has_reasoning = true;
+                    estimated_tokens =
+                        estimated_tokens.saturating_add(estimated_reasoning_text_tokens(reasoning));
+                }
+            }
+            if message_has_reasoning {
+                message_count = message_count.saturating_add(1);
+            }
+        }
+    }
+    (message_count, estimated_tokens)
 }
 
 fn kimi_reasoning_effort(effort: &str) -> &'static str {
@@ -12073,6 +12837,212 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_chat_preserves_fast_high_and_max_reasoning_modes() {
+        let capabilities = OpenAiCapabilities {
+            chat_dialect: OpenAiChatDialect::DeepSeek,
+            ..OpenAiCapabilities::default()
+        };
+        let signatures = RwLock::new(IndexMap::new());
+        for (effort, thinking_type, expected_effort, keeps_tool_choice) in [
+            ("low", "disabled", None, true),
+            ("medium", "enabled", Some("high"), false),
+            ("high", "enabled", Some("high"), false),
+            ("xhigh", "enabled", Some("max"), false),
+            ("max", "enabled", Some("max"), false),
+        ] {
+            let request = json!({
+                "messages": [{"role": "user", "content": "Inspect one file"}],
+                "thinking": {"type": "enabled"},
+                "output_config": {"effort": effort},
+                "tool_choice": {"type": "auto"}
+            });
+            let translated = translate_anthropic_request_with_capabilities(
+                &request,
+                "deepseek-v4-flash",
+                &signatures,
+                &capabilities,
+            )
+            .unwrap();
+
+            assert_eq!(translated["thinking"]["type"], thinking_type);
+            assert_eq!(
+                translated.get("reasoning_effort").and_then(Value::as_str),
+                expected_effort
+            );
+            assert_eq!(translated.get("tool_choice").is_some(), keeps_tool_choice);
+        }
+    }
+
+    #[test]
+    fn deepseek_chat_requires_32k_budget_before_max_effort() {
+        let capabilities = OpenAiCapabilities {
+            chat_dialect: OpenAiChatDialect::DeepSeek,
+            ..OpenAiCapabilities::default()
+        };
+        let signatures = RwLock::new(IndexMap::new());
+        let default_request =
+            json!({"messages": [{"role": "user", "content": "Inspect the repository"}]});
+        let default_translated = translate_anthropic_request_with_capabilities(
+            &default_request,
+            "deepseek-v4-flash",
+            &signatures,
+            &capabilities,
+        )
+        .unwrap();
+        assert_eq!(default_translated["thinking"]["type"], "enabled");
+        assert_eq!(default_translated["reasoning_effort"], "high");
+
+        for (budget, expected_effort) in [(16_384, "high"), (32_767, "high"), (32_768, "max")] {
+            let request = json!({
+                "messages": [{"role": "user", "content": "Inspect the repository"}],
+                "thinking": {"type": "enabled", "budget_tokens": budget}
+            });
+            let translated = translate_anthropic_request_with_capabilities(
+                &request,
+                "deepseek-v4-flash",
+                &signatures,
+                &capabilities,
+            )
+            .unwrap();
+
+            assert_eq!(translated["reasoning_effort"], expected_effort);
+        }
+    }
+
+    #[test]
+    fn deepseek_chat_replay_respects_complete_tools_contract() {
+        let request = json!({
+            "messages": [
+                {"role": "user", "content": "Start"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "Do not replay ordinary-turn reasoning."},
+                    {"type": "text", "text": "Ready."}
+                ]},
+                {"role": "user", "content": "Inspect files"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "First complete tool reasoning."},
+                    {"type": "tool_use", "id": "toolu_ds_a", "name": "read_file", "input": {"path": "Cargo.toml"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_ds_a", "content": "[package]"}
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "Second complete tool reasoning."},
+                    {"type": "tool_use", "id": "toolu_ds_b", "name": "read_file", "input": {"path": "README.md"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_ds_b", "content": "# Bridge"}
+                ]}
+            ],
+            "output_config": {"effort": "high"}
+        });
+        let capabilities = OpenAiCapabilities {
+            chat_dialect: OpenAiChatDialect::DeepSeek,
+            ..OpenAiCapabilities::default()
+        };
+        let signatures = RwLock::new(IndexMap::new());
+        let translated = translate_anthropic_request_with_capabilities(
+            &request,
+            "deepseek-v4-flash",
+            &signatures,
+            &capabilities,
+        )
+        .unwrap();
+        let replayed: Vec<&str> = translated["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message.get("reasoning_content").and_then(Value::as_str))
+            .collect();
+
+        assert_eq!(
+            replayed,
+            vec![
+                "First complete tool reasoning.",
+                "Second complete tool reasoning."
+            ]
+        );
+        let (messages, tokens) = chat_replayed_reasoning_stats(&translated);
+        assert_eq!(messages, 2);
+        assert!(tokens > 0);
+
+        let mut request_with_tools = request.clone();
+        request_with_tools["tools"] = json!([{
+            "name": "read_file",
+            "description": "Read a file",
+            "input_schema": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }
+        }]);
+        let translated_with_tools = translate_anthropic_request_with_capabilities(
+            &request_with_tools,
+            "deepseek-v4-flash",
+            &signatures,
+            &capabilities,
+        )
+        .unwrap();
+        let replayed_with_tools: Vec<&str> = translated_with_tools["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message.get("reasoning_content").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            replayed_with_tools,
+            vec![
+                "Do not replay ordinary-turn reasoning.",
+                "First complete tool reasoning.",
+                "Second complete tool reasoning."
+            ]
+        );
+    }
+
+    #[test]
+    fn deepseek_anthropic_route_applies_fast_and_default_reasoning_policy() {
+        let capabilities = OpenAiCapabilities {
+            chat_dialect: OpenAiChatDialect::DeepSeek,
+            ..OpenAiCapabilities::default()
+        };
+        let mut fast_request = json!({
+            "messages": [
+                {"role": "user", "content": "Inspect one file"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "Historical reasoning."},
+                    {"type": "text", "text": "Done."}
+                ]}
+            ],
+            "thinking": {"type": "enabled", "budget_tokens": 16_384},
+            "output_config": {
+                "effort": "low",
+                "format": {"type": "json_schema", "schema": {"type": "object"}}
+            }
+        });
+        let policy =
+            apply_deepseek_anthropic_reasoning_policy(&mut fast_request, &capabilities).unwrap();
+        assert!(!policy.thinking_enabled);
+        assert_eq!(fast_request["thinking"]["type"], "disabled");
+        assert!(fast_request["thinking"].get("budget_tokens").is_none());
+        assert!(fast_request["output_config"].get("effort").is_none());
+        assert_eq!(
+            fast_request["output_config"]["format"]["type"],
+            "json_schema"
+        );
+        let (messages, tokens) = deepseek_anthropic_reasoning_stats(&fast_request);
+        assert_eq!(messages, 1);
+        assert!(tokens > 0);
+
+        let mut default_request =
+            json!({"messages": [{"role": "user", "content": "Inspect the repository"}]});
+        let policy =
+            apply_deepseek_anthropic_reasoning_policy(&mut default_request, &capabilities).unwrap();
+        assert!(policy.thinking_enabled);
+        assert_eq!(default_request["thinking"]["type"], "enabled");
+        assert_eq!(default_request["output_config"]["effort"], "high");
+    }
+
+    #[test]
     fn qwen_chat_maps_thinking_history_budget_and_structured_output() {
         let request = json!({
             "messages": [
@@ -12124,6 +13094,142 @@ mod tests {
             translated["response_format"]["json_schema"]["schema"]["type"],
             "object"
         );
+    }
+
+    #[test]
+    fn qwen_anthropic_normalizes_effort_budget_and_max_tokens() {
+        let capabilities = OpenAiCapabilities {
+            chat_dialect: OpenAiChatDialect::Qwen,
+            ..OpenAiCapabilities::default()
+        };
+        let mut request = json!({
+            "system": "Return the result as JSON.",
+            "messages": [{"role": "user", "content": "Inspect the repository"}],
+            "thinking": {"type": "adaptive", "budget_tokens": 31_999},
+            "output_config": {
+                "effort": "high",
+                "format": {"type": "json_schema", "schema": {"type": "object"}}
+            },
+            "max_tokens": 31_999
+        });
+        let diagnostics = qwen_anthropic_reasoning_diagnostics(&request);
+        assert!(diagnostics
+            .iter()
+            .any(|message| message.contains("adaptive")));
+        assert!(diagnostics
+            .iter()
+            .any(|message| message.contains("'high' to Qwen reasoning effort 'medium'")));
+        assert!(diagnostics
+            .iter()
+            .any(|message| message.contains("Raised Qwen Anthropic max_tokens")));
+        assert!(!diagnostics
+            .iter()
+            .any(|message| message.contains("keyword 'JSON'")));
+
+        let policy = apply_qwen_anthropic_reasoning_policy(&mut request, &capabilities).unwrap();
+        assert_eq!(policy.effort, Some("medium"));
+        assert_eq!(request["thinking"]["type"], "enabled");
+        assert_eq!(request["thinking"]["budget_tokens"], 31_999);
+        assert_eq!(request["output_config"]["effort"], "medium");
+        assert_eq!(request["output_config"]["format"]["type"], "json_schema");
+        assert_eq!(
+            request["max_tokens"],
+            31_999 + QWEN_MAX_TOKENS_OUTPUT_HEADROOM
+        );
+
+        let mut default_request =
+            json!({"messages": [{"role": "user", "content": "Inspect one file"}]});
+        let default_policy =
+            apply_qwen_anthropic_reasoning_policy(&mut default_request, &capabilities).unwrap();
+        assert_eq!(default_policy.effort, Some("medium"));
+        assert_eq!(default_request["output_config"]["effort"], "medium");
+
+        // Claude Code's strongest thinking trigger budgets 31,999 tokens. That
+        // ceiling must reach Qwen's maximum xhigh effort instead of stopping
+        // at medium, and a healthy max_tokens must stay untouched.
+        let mut ultrathink_request = json!({
+            "messages": [{"role": "user", "content": "Think it through"}],
+            "thinking": {"type": "enabled", "budget_tokens": 31_999},
+            "max_tokens": 32_000
+        });
+        let ultrathink_policy =
+            apply_qwen_anthropic_reasoning_policy(&mut ultrathink_request, &capabilities).unwrap();
+        assert_eq!(ultrathink_policy.effort, Some("xhigh"));
+        assert_eq!(ultrathink_request["max_tokens"], 32_000);
+
+        let mut ordinary_request = json!({
+            "messages": [{"role": "user", "content": "Think it through"}],
+            "thinking": {"type": "enabled", "budget_tokens": 8_192},
+            "max_tokens": 16_000
+        });
+        let ordinary_policy =
+            apply_qwen_anthropic_reasoning_policy(&mut ordinary_request, &capabilities).unwrap();
+        assert_eq!(ordinary_policy.effort, Some("medium"));
+        assert_eq!(ordinary_request["max_tokens"], 16_000);
+    }
+
+    #[test]
+    fn qwen_chat_caps_normal_effort_but_preserves_explicit_maximum() {
+        let capabilities = OpenAiCapabilities {
+            chat_dialect: OpenAiChatDialect::Qwen,
+            ..OpenAiCapabilities::default()
+        };
+        let signatures = RwLock::new(IndexMap::new());
+        let translate = |effort: &str| {
+            let request = json!({
+                "messages": [{"role": "user", "content": "Inspect the repository"}],
+                "thinking": {"type": "enabled", "budget_tokens": 31_999},
+                "output_config": {"effort": effort}
+            });
+            translate_anthropic_request_with_capabilities(
+                &request,
+                "qwen3.8-max",
+                &signatures,
+                &capabilities,
+            )
+            .unwrap()
+        };
+
+        let high = translate("high");
+        assert_eq!(high["enable_thinking"], true);
+        assert_eq!(high["thinking_budget"], QWEN_MEDIUM_CHAT_BUDGET_TOKENS);
+
+        let default_request =
+            json!({"messages": [{"role": "user", "content": "Inspect one file"}]});
+        let default = translate_anthropic_request_with_capabilities(
+            &default_request,
+            "qwen3.8-max",
+            &signatures,
+            &capabilities,
+        )
+        .unwrap();
+        assert_eq!(default["enable_thinking"], true);
+        assert_eq!(default["thinking_budget"], QWEN_MEDIUM_CHAT_BUDGET_TOKENS);
+
+        let maximum = translate("max");
+        assert_eq!(maximum["enable_thinking"], true);
+        assert_eq!(maximum["thinking_budget"], 31_999);
+
+        let disabled = translate("none");
+        assert_eq!(disabled["enable_thinking"], false);
+        assert!(disabled.get("thinking_budget").is_none());
+        assert!(disabled.get("preserve_thinking").is_none());
+    }
+
+    #[test]
+    fn qwen_structured_output_diagnostic_checks_prompt_text_only() {
+        let mut request = json!({
+            "messages": [{"role": "user", "content": "Return a typed object."}],
+            "output_config": {"format": {"type": "json_schema", "schema": {"type": "object"}}}
+        });
+        assert!(qwen_anthropic_reasoning_diagnostics(&request)
+            .iter()
+            .any(|message| message.contains("keyword 'JSON'")));
+
+        request["messages"][0]["content"] = json!("Return a JSON object.");
+        assert!(!qwen_anthropic_reasoning_diagnostics(&request)
+            .iter()
+            .any(|message| message.contains("keyword 'JSON'")));
     }
 
     #[test]
@@ -13539,6 +14645,52 @@ mod tests {
             Some(DEFAULT_ANTHROPIC_VERSION)
         );
         assert!(!request.headers().contains_key("anthropic-beta"));
+        assert!(!request.headers().contains_key("x-dashscope-session-cache"));
+    }
+
+    #[test]
+    fn qwen_anthropic_forwards_session_cache_header_for_official_domains() {
+        let base_url = "https://workspace.cn-beijing.maas.aliyuncs.com/apps/anthropic";
+        let capabilities = OpenAiCapabilities::for_anthropic_base_url(base_url);
+        assert!(capabilities.responses_session_cache);
+
+        let client = Client::builder().build().unwrap();
+        let profile = ProviderProfile {
+            file_name: "qwen.json".to_string(),
+            display_name: "Qwen3.8 Max".to_string(),
+            source: ProviderProfileSource::Native,
+            model: "qwen3.8-max".to_string(),
+            context_window: None,
+            upstream_identity: None,
+            identity_override: true,
+            base_url: base_url.to_string(),
+            auth_token: None,
+            api_key: Some("secret".to_string()),
+            proxy_url: None,
+            local_gemini: false,
+            transport: ProviderTransport::Anthropic,
+            openai_capabilities: capabilities,
+            vision: VisionConfig::default(),
+            upstream_url: format!("{base_url}/v1/messages"),
+            client: client.clone(),
+        };
+        let request = apply_anthropic_forward_headers(
+            client.post(&profile.upstream_url),
+            &profile,
+            &HeaderMap::new(),
+        )
+        .build()
+        .unwrap();
+        assert_eq!(
+            request
+                .headers()
+                .get("x-dashscope-session-cache")
+                .and_then(|value| value.to_str().ok()),
+            Some("enable")
+        );
+
+        let generic = OpenAiCapabilities::for_anthropic_base_url("https://openrouter.ai/api");
+        assert!(!generic.responses_session_cache);
     }
 
     #[tokio::test]
@@ -14870,6 +16022,51 @@ mod tests {
     }
 
     #[test]
+    fn qwen_responses_preserves_native_effort_levels_and_uses_safe_default() {
+        let profile = responses_test_profile(
+            "qwen-responses.json",
+            "https://workspace.cn-beijing.maas.aliyuncs.com/v1",
+            "qwen3.8-max",
+        );
+        let continuations = RwLock::new(InteractionContinuationCache::default());
+        let translate = |request: Value| {
+            translate_anthropic_to_responses(&request, &profile, &continuations).unwrap()
+        };
+
+        let explicit_high = translate(json!({
+            "messages": [{"role": "user", "content": "Inspect the repository"}],
+            "output_config": {"effort": "high"}
+        }));
+        assert_eq!(explicit_high["reasoning"]["effort"], "high");
+
+        // 31,999 is Claude Code's strongest thinking budget and must reach
+        // Qwen's xhigh tier on every transport, not stop one level below.
+        let budget_only = translate(json!({
+            "messages": [{"role": "user", "content": "Inspect the repository"}],
+            "thinking": {"type": "enabled", "budget_tokens": 31_999}
+        }));
+        assert_eq!(budget_only["reasoning"]["effort"], "xhigh");
+
+        let large_but_not_maximum = translate(json!({
+            "messages": [{"role": "user", "content": "Inspect the repository"}],
+            "thinking": {"type": "enabled", "budget_tokens": 16_000}
+        }));
+        assert_eq!(large_but_not_maximum["reasoning"]["effort"], "high");
+
+        let default = translate(json!({
+            "messages": [{"role": "user", "content": "Inspect one file"}]
+        }));
+        assert_eq!(default["reasoning"]["effort"], "medium");
+
+        let disabled = translate(json!({
+            "messages": [{"role": "user", "content": "Answer directly"}],
+            "thinking": {"type": "disabled"},
+            "output_config": {"effort": "max"}
+        }));
+        assert_eq!(disabled["reasoning"]["effort"], "none");
+    }
+
+    #[test]
     fn responses_fixture_maps_semantic_output_server_tools_and_detailed_usage() {
         let upstream = json!({
             "id": "resp_ds_2",
@@ -15010,6 +16207,17 @@ mod tests {
         assert!(chat.contains("cache_control"));
         assert!(chat.contains("Suppressed Anthropic tool_choice"));
         assert!(chat.contains("Downgraded Anthropic json_schema"));
+
+        let mut deepseek_fast_request = request.clone();
+        deepseek_fast_request["output_config"]["effort"] = json!("low");
+        let deepseek_fast = openai_request_diagnostics(
+            &deepseek_fast_request,
+            &deepseek,
+            ProviderTransport::OpenAiChat,
+        )
+        .join("\n");
+        assert!(deepseek_fast.contains("thinking.type=disabled"));
+        assert!(!deepseek_fast.contains("Suppressed Anthropic tool_choice"));
 
         let mut kimi_request = request.clone();
         kimi_request["thinking"]["type"] = json!("disabled");

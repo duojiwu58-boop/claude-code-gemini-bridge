@@ -62,14 +62,21 @@ Anthropic Messages · agent · MCP · tools · thinking · media
 | Model | Recommended transport | Key adaptations | Optional paths |
 | --- | --- | --- | --- |
 | **Gemini 3.6 Flash** | `gemini-interactions` | Native `step.*` stream, exact stateful continuation, thinking/signatures, images and PDFs, native token count, structured output, and Google server-side tools | OpenAI Chat fallback |
-| **DeepSeek V4 Flash** | `anthropic` | Minimal translation of the Claude Code contract; Chat fallback replays `reasoning_content` across tool turns and maps effort/thinking while enforcing `tool_choice` constraints | Stateless `openai-responses`, OpenAI Chat, Vision Proxy |
-| **Qwen3.8 Max** | `anthropic` | Minimal translation of the Claude Code contract; exact Responses continuation and session cache; Chat fallback maps `enable_thinking`, `thinking_budget`, `preserve_thinking`, and `response_format` | Stateful `openai-responses`, OpenAI Chat |
+| **DeepSeek V4 Flash** | `anthropic` | Minimal translation of the Claude Code contract; Anthropic and Chat routes provide disabled/high/max reasoning modes and keep 16K budgets at high; Chat omits ordinary reasoning only in tool-free requests and fully replays it whenever `tools` are present, as required by the API | Stateless `openai-responses`, OpenAI Chat, Vision Proxy |
+| **Qwen3.8 Max** | `anthropic` | Three effective Anthropic/Chat reasoning modes (`low/medium/xhigh`) with bounded normal-turn budgets instead of permanent maximum reasoning; exact Responses continuation, seven-level native effort, session cache, usage and latency observability | Stateful `openai-responses`, OpenAI Chat |
 | **Kimi K3** | `anthropic` | Bearer authentication, verified `kimi-k3` model ID, 1M context metadata, native token estimate, and cache usage; Chat fallback maps Kimi effort, reasoning replay, and structured output | OpenAI Chat and explicitly enabled Kimi Formula MCP tools |
 | **Other compatible models** | Provider-dependent | Anthropic pass-through or the generic OpenAI Chat/Responses semantic core, with differences declared through `capabilities` | Depth depends on the upstream API |
 
 “Callable” is not the same as “deeply adapted.” Priority models are reviewed against their provider API contracts and covered by request/response fixtures for reasoning, tools, streaming, usage, and continuation. Generic providers receive only the capabilities proven by their actual fields and explicit configuration.
 
 Providers may change model IDs, regional domains, and API behavior. Repository templates record configurations verified by this project; check the [Provider configuration guide](PROVIDER_CONFIG.md) and [changelog](CHANGELOG.md) before upgrading.
+
+### Qwen3.8 Max reasoning notes
+
+- Budget-only Anthropic and Chat requests use `low` below 8,192 tokens, `medium` below 31,999, and `xhigh` at 31,999 or above. Responses keeps its finer mapping: `<2K / <8K / <31,999 / >=31,999` becomes `low / medium / high / xhigh`. This lets Claude Code's 31,999-token ultrathink ceiling reach Qwen's highest tier while keeping ordinary turns cheaper.
+- Chat caps effective `low` and `medium` thinking budgets at 4,096 and 16,384 tokens. Anthropic preserves the requested thinking budget; when `max_tokens <= budget_tokens`, the bridge raises `max_tokens` to `budget_tokens + 8,192` so visible output still has room.
+- Official DashScope and Bailian Qwen domains automatically receive `x-dashscope-session-cache: enable` on Responses and Anthropic transports. Responses caching is verified; the Anthropic header's live cache effect and the endpoint's acceptance of injected `output_config.effort` still require live validation. Set `capabilities.responses_session_cache` or `capabilities.reasoning_effort` to `false` to disable either behavior.
+- Anthropic profiles use `x-api-key` by default. If a Bailian workspace returns HTTP 401, set `auth_scheme` to `bearer`. See the [Qwen provider notes](PROVIDER_CONFIG.md#deepseek--qwen-推荐配置与-responses) for complete examples and diagnostics.
 
 ## Four first-class transport paths
 
