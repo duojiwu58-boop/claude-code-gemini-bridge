@@ -8,7 +8,7 @@
     "ANTHROPIC_DEFAULT_OPUS_MODEL": "bridge-router",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "bridge-router",
     "CLAUDE_CODE_SUBAGENT_MODEL": "bridge-router",
-    "CLAUDE_CODE_EFFORT_LEVEL": "high",
+    "CLAUDE_CODE_EFFORT_LEVEL": "max",
     "CLAUDE_CODE_SKIP_FAST_MODE_ORG_CHECK": "1",
     "NO_PROXY": "127.0.0.1,localhost"
   }

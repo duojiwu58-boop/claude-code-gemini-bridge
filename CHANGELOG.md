@@ -12,10 +12,12 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 ### Qwen3.8-Max Capability Maximization
 
 - Changed Qwen's budget-to-effort mapping so a 31,999-token `thinking.budget_tokens` — Claude Code's strongest ultrathink budget — now selects `xhigh` instead of stopping at `medium` on the Anthropic, Chat, and Responses transports. Smaller budgets stay in the low/medium tiers so routine tool turns remain cheap.
-- When `max_tokens <= budget_tokens`, the Anthropic route now raises `max_tokens` to `budget_tokens + 8,192` instead of `budget_tokens + 1`, preserving visible-output headroom instead of squeezing the answer into a single token.
+- When `max_tokens <= budget_tokens`, the Qwen and DeepSeek Anthropic routes now raise `max_tokens` to `budget_tokens + 8,192`, preventing strict endpoint validation failures and preserving visible-output headroom instead of squeezing the answer into a single token.
 - The Anthropic transport now sends `x-dashscope-session-cache: enable` for official Qwen domains, matching the Responses path. The flag stays toggleable through `capabilities.responses_session_cache`; live effectiveness on the Anthropic endpoint is pending confirmation, and upstreams that do not support the header ignore it.
 - Documented the `reasoning_effort: false` escape hatch in case a Bailian Anthropic endpoint rejects the injected `output_config.effort`, and the `auth_scheme: bearer` fallback for workspaces that return 401 against `x-api-key`.
-- 121 Rust tests pass, adding coverage for the ultrathink-to-xhigh mapping, the output-headroom raise, and the Anthropic session-cache header; rustfmt and strict Clippy remain clean.
+- Set the bridge Claude Code settings template to `CLAUDE_CODE_EFFORT_LEVEL=max` for maximum-effort DeepSeek operation; this is a Claude Code process-wide environment setting rather than a Provider-profile field.
+- Split the former 16,394-line `src/main.rs` into responsibility-focused Rust source slices and a separate test module. The crate root is now roughly 100 lines while preserving existing private item paths and behavior through a deliberately mechanical `include!` decomposition.
+- 121 Rust tests pass, adding coverage for the ultrathink-to-xhigh mapping, both providers' output-headroom protection, and the Anthropic session-cache header; rustfmt and strict Clippy remain clean.
 
 ## [v0.5.0] - 2026-08-08
 
@@ -264,10 +266,12 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 ### Qwen3.8-Max 能力最大化
 
 - 调整 Qwen 的 budget→effort 映射：31,999 token 的 `thinking.budget_tokens`（Claude Code ultrathink 最强思考触发的预算上限）现在进入 `xhigh`，不再被压在 `medium`；Anthropic、Chat、Responses 三条路径一致。中小预算继续停留在 low/medium 档，控制常规工具轮次的费用。
-- `max_tokens <= budget_tokens` 时，Anthropic 路径把 `max_tokens` 提高到 `budget_tokens + 8,192` 而不是 `budget_tokens + 1`，为可见输出保留余量，避免答案被挤压成 1 个 token。
+- `max_tokens <= budget_tokens` 时，Qwen 与 DeepSeek 的 Anthropic 路径都会把 `max_tokens` 提高到 `budget_tokens + 8,192`，既避免严格端点校验失败，也为可见输出保留余量，防止答案被挤压成 1 个 token。
 - Anthropic transport 现在对官方 Qwen 域名发送 `x-dashscope-session-cache: enable`，与 Responses 路径一致，可用 `capabilities.responses_session_cache` 关闭；该请求头在 Anthropic 端点的实际缓存效果尚待线上确认，不支持的上游会忽略该头。
 - 文档补充：百炼 Anthropic 端点若拒绝注入的 `output_config.effort`，可用 `reasoning_effort: false` 回退；工作区端点对 `x-api-key` 返回 401 时可改用 `auth_scheme: bearer`。
-- 121 个 Rust 测试全部通过，新增 ultrathink→xhigh、输出余量提升与 Anthropic 会话缓存头的覆盖；rustfmt 与严格 Clippy 保持零告警。
+- 桥接器的 Claude Code 配置模板改为 `CLAUDE_CODE_EFFORT_LEVEL=max`，用于 DeepSeek 最高 effort；该值属于 Claude Code 进程级环境设置，不是 Provider profile 字段。
+- 将原先 16,394 行的 `src/main.rs` 按职责拆为多个 Rust 源码切片，并把测试独立成文件；crate root 现在约 100 行，通过机械式 `include!` 拆分保持原有私有路径和运行行为不变。
+- 121 个 Rust 测试全部通过，新增 ultrathink→xhigh、两家供应商输出余量保护与 Anthropic 会话缓存头的覆盖；rustfmt 与严格 Clippy 保持零告警。
 
 ## [v0.5.0] - 2026-08-08
 

@@ -236,6 +236,7 @@ For development, use `scripts\start-bridge.ps1` and `scripts\stop-bridge.ps1`. F
 
 - [Provider configuration guide](PROVIDER_CONFIG.md)
 - [Provider templates](examples/providers)
+- [Rust source layout](src/README.md)
 - [Changelog](CHANGELOG.md)
 - [Windows package guide (English and Chinese)](packaging/windows-x64/使用说明.txt)
 

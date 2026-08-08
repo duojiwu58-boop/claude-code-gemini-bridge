@@ -55,6 +55,7 @@ DeepSeek V4 Flash 与 Qwen3.8-Max 的推荐默认配置是厂商原生 Anthropic
 {
   "name": "DeepSeek V4 Flash",
   "model": "deepseek-v4-flash",
+  "context_window": 1048576,
   "protocol": "anthropic",
   "base_url": "https://api.deepseek.com/anthropic",
   "api_key": "<DEEPSEEK_API_KEY>",
@@ -101,7 +102,15 @@ DeepSeek 推荐的 Anthropic 路径与 Chat fallback 共用三种实际运行态
 `thinking.budget_tokens` 时，32,768 以下保持 `high`，达到 32,768 才进入 `max`，避免
 Claude Code 常见的 16K budget 让简单轮次长期运行在最高推理档。DeepSeek 当前没有原生
 `low/medium` reasoning effort，因此降到快速模式时会返回明确的
-`x-claude-bridge-warning`，而不是把 `low` 静默抬成 `high`。
+`x-claude-bridge-warning`，而不是把 `low` 静默抬成 `high`。Anthropic 路径在
+`max_tokens <= budget_tokens` 时还会把 `max_tokens` 提高到 `budget_tokens + 8,192`，
+避免严格端点因输出上限不大于 thinking budget 而返回 400，并为可见输出保留空间。
+
+若希望 Claude Code 对 DeepSeek 默认请求最高 effort，应在 Claude Code 自己的
+`%USERPROFILE%\.claude\settings.json` 中设置 `env.CLAUDE_CODE_EFFORT_LEVEL` 为 `max`；
+安装器使用的 `claude-settings.bridge.json` 模板已采用该值。它是客户端进程级全局设置，
+不是 DeepSeek Provider JSON 字段，因此也会影响同一 Claude Code 进程切换到的其他模型；
+修改后需要重启正在运行的 Claude Code 会话。
 
 Chat fallback 的历史回放遵循 DeepSeek 工具契约：不携带 `tools` 且历史中没有工具调用时，普通
 assistant Thinking 不进入后续 Chat 上下文；只要当前请求携带 `tools`，全部历史

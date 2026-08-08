@@ -235,6 +235,7 @@ cargo build --locked --release --target x86_64-pc-windows-msvc
 
 - [Provider 配置指南](PROVIDER_CONFIG.md)
 - [Provider 模板](examples/providers)
+- [Rust 源码结构](src/README.md)
 - [变更记录](CHANGELOG.md)
 - [Windows 发布包使用说明](packaging/windows-x64/使用说明.txt)
 
