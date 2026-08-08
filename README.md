@@ -1,147 +1,148 @@
 # Claude Code Multi-Model Bridge
 
-> 让 Claude Code 调用 Gemini、DeepSeek、Qwen、Kimi 及其他 AI 大模型，并尽可能发挥每个模型的原生能力。
+**English** | [简体中文](README.zh-CN.md)
 
-*A capability-aware bridge that connects Claude Code to multiple AI model APIs while preserving native reasoning, tool use, streaming, caching, context, and structured output wherever the upstream API allows it.*
+> Connect Claude Code to Gemini, DeepSeek, Qwen, Kimi, and other AI models while preserving as much of each model's native capability as its API exposes.
 
-![Claude Code 模型中心：无需重启即可切换 Gemini、DeepSeek、Kimi、Qwen 与其他 Provider](gui/delphi11/ClaudeBridgeManager/assets/ClaudeBridgeManager-screenshot.png)
+![Claude Code Model Center switching between Gemini, DeepSeek, Kimi, Qwen, and other providers without a restart](gui/delphi11/ClaudeBridgeManager/assets/ClaudeBridgeManager-screenshot.png)
 
-Claude Code 不只是一个聊天客户端。它依赖 Thinking 生命周期、流式事件、并行工具调用、跨轮工具状态、结构化输出、Usage、上下文超限与重试语义。普通 API 转发器即使能返回文本，也可能在真实 Agent 任务中丢失这些能力。
+Claude Code is more than a chat client. Its agent loop depends on thinking lifecycles, streamed events, parallel tool calls, cross-turn tool state, structured output, usage accounting, context-limit signals, and retry semantics. A basic API proxy may return text successfully while losing the behaviors required by a real agent task.
 
-本项目的目标因此不是“让请求成功”，而是：
+This project therefore aims beyond “make the request work”:
 
-- 保留 Claude Code 的 Agent、MCP、工具调用和任务编排体验；
-- 优先使用供应商最接近原生能力的 API，而不是把所有模型压到最低公分母；
-- 将 Claude Code 的请求语义映射为模型真正支持的推理、工具、缓存和输出控制；
-- 把下游响应重新组装为 Claude Code 能继续执行的 Anthropic 生命周期；
-- 对无法等价映射的字段明确诊断，不静默丢弃，也不虚构上游没有的能力。
+- Preserve Claude Code's agent, MCP, tool-use, and task-orchestration experience.
+- Prefer the provider API that retains the most native capability instead of flattening every model to the lowest common denominator.
+- Map Claude Code request semantics into the reasoning, tool, cache, and output controls the selected model actually supports.
+- Reconstruct downstream responses as the Anthropic lifecycle Claude Code needs to keep running.
+- Diagnose fields that cannot be mapped faithfully instead of silently dropping them or inventing capabilities the upstream does not have.
 
-最终答案始终由所选下游模型生成。桥接器负责传输、语义转换和状态衔接，不按关键词代答，也不改写模型的最终输出。
+The selected downstream model always generates the final answer. The bridge handles transport, semantic translation, and state continuity; it does not answer by keyword or rewrite the model's final output.
 
-## 一张图理解
+## The architecture at a glance
 
 ```text
 Claude Code
-Anthropic Messages · Agent · MCP · tools · thinking · media
+Anthropic Messages · agent · MCP · tools · thinking · media
                               │
                               ▼
              Claude Code Multi-Model Bridge
-       语义解码 · 能力映射 · 状态续接 · 流式重建 · 诊断
+ semantic decode · capability mapping · state · streaming · diagnostics
              ┌────────────────┼────────────────┐
              ▼                ▼                ▼
    Anthropic Messages   Gemini Interactions   OpenAI Responses
-       直接转发           原生有状态协议         语义事件/服务端工具
+      direct route        native stateful       semantic events /
+                             protocol             server tools
              └────────────────┬────────────────┘
                               ▼
                     OpenAI Chat Completions
-                         通用兼容回退
+                    broad compatibility path
                               │
                               ▼
-          Gemini · DeepSeek · Qwen · Kimi · 其他模型
+          Gemini · DeepSeek · Qwen · Kimi · other models
 ```
 
-## “发挥模型能力”具体指什么
+## What “maximizing model capability” means
 
-| 能力面 | 桥接器的处理原则 |
+| Capability surface | Bridge policy |
 | --- | --- |
-| 推理与 Thinking | 映射 effort、thinking budget 和供应商推理字段；流式恢复 Anthropic Thinking 块生命周期 |
-| 工具调用 | 聚合流式参数、校验并保守修复 JSON、维持并行顺序、跨“思考 → 工具 → 结果 → 继续思考”轮次回放状态 |
-| 原生状态 | 只在精确命中会话分支时使用 `previous_interaction_id` 或 `previous_response_id`；不确定时安全重放完整历史 |
-| 结构化输出 | 转换 JSON Schema，并按供应商约束选择保留或清洗；无法满足契约时明确报错 |
-| Streaming | 增量解析真实 SSE，跨网络帧与 UTF-8 边界恢复 Claude Code 需要的事件顺序 |
-| Usage 与缓存 | 映射输入、输出、推理、缓存读写和服务端工具计数；原生 Token Count 可用时优先调用 |
-| 多模态 | 原生支持时传递图片和 PDF；纯文本模型可选择 Vision Proxy 获取有界视觉证据 |
-| 错误语义 | 保留认证、限流、过载、拒绝、上下文超限、截断和异常断流语义，帮助 Claude Code 正确重试或压缩 |
-| 能力降级 | 记录日志，并通过 `x-claude-bridge-warning` 返回可重复诊断；不把有损回退伪装成完整支持 |
+| Reasoning and thinking | Map effort, thinking budgets, and provider reasoning fields; reconstruct the Anthropic thinking-block lifecycle while streaming |
+| Tool use | Accumulate streamed arguments, validate and conservatively repair JSON, preserve parallel order, and replay state across “think → call tool → receive result → continue thinking” turns |
+| Native state | Use `previous_interaction_id` or `previous_response_id` only after an exact conversation-branch match; safely replay full history when uncertain |
+| Structured output | Translate JSON Schema and either preserve or sanitize it for the provider; fail explicitly when the requested contract cannot be satisfied |
+| Streaming | Incrementally decode real SSE across network-frame and UTF-8 boundaries, then emit events in the order Claude Code expects |
+| Usage and caching | Map input, output, reasoning, cache read/write, and server-tool usage; prefer native token-count endpoints when available |
+| Multimodality | Pass images and PDFs to natively capable transports; optionally give text-only models bounded visual evidence through Vision Proxy |
+| Error semantics | Preserve authentication, rate-limit, overload, refusal, context-limit, truncation, and abnormal-stream termination semantics so Claude Code can retry or compact correctly |
+| Capability downgrades | Log the downgrade and return repeatable `x-claude-bridge-warning` diagnostics instead of presenting a lossy fallback as full support |
 
-这里的“近乎无损”不是字节原样转发，而是在两套不同协议之间保留所有能够安全表达的意图、事件和状态。模型或 API 本身没有的能力，桥接器不会假装存在。
+“Near-lossless” does not mean byte-for-byte forwarding. It means preserving every intent, event, and state transition that can be represented safely across two different protocols. The bridge does not pretend that a model or API has a capability it does not expose.
 
-## 重点模型适配
+## Deeply adapted models
 
-| 模型 | 推荐 transport | 已适配的关键能力 | 可选路径 |
+| Model | Recommended transport | Key adaptations | Optional paths |
 | --- | --- | --- | --- |
-| **Gemini 3.6 Flash** | `gemini-interactions` | 原生 `step.*` 流、有状态精确续接、Thinking/签名、图片与 PDF、原生 Token Count、结构化输出、Google 服务端工具 | OpenAI Chat fallback |
-| **DeepSeek V4 Flash** | `anthropic` | 最少转换保留 Claude Code 协议；Chat 路径支持 `reasoning_content` 工具轮次回放、effort/thinking 映射与 `tool_choice` 约束 | 无状态 `openai-responses`、OpenAI Chat、Vision Proxy |
-| **Qwen3.8 Max** | `anthropic` | 最少转换保留 Claude Code 协议；Responses 精确续接与会话缓存；Chat 路径支持 `enable_thinking`、`thinking_budget`、`preserve_thinking` 和 `response_format` | 有状态 `openai-responses`、OpenAI Chat |
-| **Kimi K3** | `anthropic` | Bearer 鉴权、`kimi-k3`、1M 上下文元数据、原生 Token Estimate、缓存 Usage；Chat 路径支持 Kimi effort、推理回放和结构化输出 | OpenAI Chat、显式启用的 Kimi Formula MCP 工具 |
-| **其他兼容模型** | 视供应商而定 | Anthropic 直通或通用 OpenAI Chat/Responses 语义核心；可通过 `capabilities` 声明差异 | 能力完整度取决于上游 API |
+| **Gemini 3.6 Flash** | `gemini-interactions` | Native `step.*` stream, exact stateful continuation, thinking/signatures, images and PDFs, native token count, structured output, and Google server-side tools | OpenAI Chat fallback |
+| **DeepSeek V4 Flash** | `anthropic` | Minimal translation of the Claude Code contract; Chat fallback replays `reasoning_content` across tool turns and maps effort/thinking while enforcing `tool_choice` constraints | Stateless `openai-responses`, OpenAI Chat, Vision Proxy |
+| **Qwen3.8 Max** | `anthropic` | Minimal translation of the Claude Code contract; exact Responses continuation and session cache; Chat fallback maps `enable_thinking`, `thinking_budget`, `preserve_thinking`, and `response_format` | Stateful `openai-responses`, OpenAI Chat |
+| **Kimi K3** | `anthropic` | Bearer authentication, verified `kimi-k3` model ID, 1M context metadata, native token estimate, and cache usage; Chat fallback maps Kimi effort, reasoning replay, and structured output | OpenAI Chat and explicitly enabled Kimi Formula MCP tools |
+| **Other compatible models** | Provider-dependent | Anthropic pass-through or the generic OpenAI Chat/Responses semantic core, with differences declared through `capabilities` | Depth depends on the upstream API |
 
-“可调用”不等于“深度适配”。重点模型会按供应商 API 契约审核，并用请求/响应 fixture 覆盖推理、工具、流式、Usage 和续接行为；其他兼容 Provider 则以它真实提供的字段和显式能力配置为准。
+“Callable” is not the same as “deeply adapted.” Priority models are reviewed against their provider API contracts and covered by request/response fixtures for reasoning, tools, streaming, usage, and continuation. Generic providers receive only the capabilities proven by their actual fields and explicit configuration.
 
-供应商可能调整模型 ID、区域域名和 API 行为。仓库模板保存本项目实际验证过的配置；更新前请同时查看 [Provider 配置指南](PROVIDER_CONFIG.md) 与 [CHANGELOG](CHANGELOG.md)。
+Providers may change model IDs, regional domains, and API behavior. Repository templates record configurations verified by this project; check the [Provider configuration guide](PROVIDER_CONFIG.md) and [changelog](CHANGELOG.md) before upgrading.
 
-## 四条一级传输路径
+## Four first-class transport paths
 
-| `protocol` | 适用场景 | 取舍 |
+| `protocol` | Use it when | Trade-off |
 | --- | --- | --- |
-| `anthropic` | 供应商提供 Anthropic Messages endpoint | 转换最少，通常是 DeepSeek、Qwen、Kimi 面向 Claude Code 的首选 |
-| `gemini-interactions` | Google Gemini 原生 Interactions API | 保留 Google 原生状态、事件和服务端工具；使用 `store: true`，需接受服务端状态保留 |
-| `openai-responses` | 供应商正式提供 Responses API | 支持 Responses item/event、服务端工具和经过验证的有状态续接 |
-| `openai` | OpenAI Chat Completions 兼容端点 | 覆盖面最广；桥接器按 DeepSeek、Qwen、Kimi、Gemini 或通用方言恢复扩展能力 |
+| `anthropic` | The provider exposes an Anthropic Messages endpoint | Minimal translation and usually the preferred Claude Code route for DeepSeek, Qwen, and Kimi |
+| `gemini-interactions` | Calling Google's native Gemini Interactions API | Preserves Google-native state, events, and server tools; uses `store: true`, so provider-side state retention must be acceptable |
+| `openai-responses` | The provider officially exposes a Responses API | Supports semantic Responses items/events, server tools, and validated stateful continuation |
+| `openai` | Calling an OpenAI Chat Completions-compatible endpoint | Broadest coverage; provider dialects restore DeepSeek, Qwen, Kimi, Gemini, or generic extensions where available |
 
-推荐顺序不是固定的“某协议最好”，而是选择对当前供应商损失最少的路径：官方 Anthropic endpoint、供应商原生协议或 Responses 可用时优先；Chat Completions 作为广泛兼容的可靠回退。
+There is no universally best protocol. Choose the least lossy route for the current provider: prefer an official Anthropic endpoint, provider-native protocol, or Responses API when it preserves more semantics; use Chat Completions as the broad compatibility fallback.
 
-## 快速开始
+## Quick start
 
-### 1. 安装 Windows 服务
+### 1. Install the Windows service
 
-大多数用户无需安装 Rust、Delphi 或 Inno Setup。直接从 [GitHub Releases](https://github.com/duojiwu58-boop/claude-code-gemini-bridge/releases/latest) 下载：
+Most users do not need Rust, Delphi, or Inno Setup. Download a package from [GitHub Releases](https://github.com/duojiwu58-boop/claude-code-gemini-bridge/releases/latest):
 
-- `ClaudeCodeBridge-<version>-Setup.exe`：推荐；安装 Windows 服务、模型中心、开始菜单入口和卸载程序；
-- `ClaudeCodeBridge-<version>-windows-x64.zip`：完整解压后运行 `Install.cmd`。
+- `ClaudeCodeBridge-<version>-Setup.exe`: recommended; installs the Windows service, Model Center, Start Menu entries, and uninstaller.
+- `ClaudeCodeBridge-<version>-windows-x64.zip`: extract the complete archive, then run `Install.cmd`.
 
-安装器默认监听：
+The installer listens on:
 
 ```text
 http://127.0.0.1:18787
 ```
 
-Windows 服务名为 `ClaudeCodeBridge`。安装器会备份并更新 Claude Code 的 `settings.json`，让 Claude Code 始终连接这个稳定的本地地址。首次安装后请重新启动正在运行的 Claude Code 会话。
+The Windows service is named `ClaudeCodeBridge`. The installer backs up and updates Claude Code's `settings.json` so Claude Code always connects to this stable local endpoint. Restart any running Claude Code session after the first installation.
 
-### 2. 添加 Provider
+### 2. Add a provider
 
-Provider 默认目录：
+The default provider directory is:
 
 ```text
 %USERPROFILE%\.claude\bridge-providers\
 ```
 
-每个 `.json` 文件代表一个可热切换的模型。对于普通 OpenAI-compatible 服务，最小配置只有三个字段：
+Each `.json` file represents one hot-switchable model. A generic OpenAI-compatible service needs only three fields:
 
 ```json
 {
-  "model": "供应商实际模型 ID",
-  "base_url": "供应商 SDK 示例中的 base_url",
-  "api_key": "你的 API Key"
+  "model": "the provider's actual model ID",
+  "base_url": "the base_url from the provider SDK example",
+  "api_key": "your API key"
 }
 ```
 
-重点模型请直接复制经过适配的模板，而不是从最小配置猜参数：
+For a priority model, copy its adapted template instead of guessing from the minimal configuration:
 
-- [Gemini 原生 Interactions](examples/providers/gemini.example.json)
+- [Gemini native Interactions](examples/providers/gemini.example.json)
 - [DeepSeek V4 Flash](examples/providers/deepseek.example.json)
 - [Qwen3.8 Max](examples/providers/qwen.example.json)
 - [Kimi K3](examples/providers/kimi.example.json)
-- [通用 OpenAI-compatible](examples/providers/custom-openai.example.json)
-- [能力覆盖示例](examples/providers/capability-overrides.example.json)
+- [Generic OpenAI-compatible provider](examples/providers/custom-openai.example.json)
+- [Capability overrides](examples/providers/capability-overrides.example.json)
 
-保存后打开“Claude Code 模型中心”，点击“刷新配置”并选择模型。下一个请求立即使用新路由，无需重启 VS Code、Claude Code 或桥接服务。
+Save the file, open **Claude Code Model Center**, select **Reload profiles**, and choose the model. The next request uses the new route without restarting VS Code, Claude Code, or the bridge service.
 
-完整字段、区域域名、鉴权方式、代理、Responses、Vision Proxy 和旧配置迁移见 [Provider 配置指南](PROVIDER_CONFIG.md)。
+See the [Provider configuration guide](PROVIDER_CONFIG.md) for the complete field reference, regional endpoints, authentication, proxies, Responses, Vision Proxy, and legacy migration.
 
-### 3. 验证运行状态
+### 3. Verify the service
 
 ```powershell
 Invoke-RestMethod -Uri 'http://127.0.0.1:18787/health'
 ```
 
-健康响应会显示当前 profile、实际模型、transport 和上游地址，但不会返回 Provider API Key。
+The health response reports the active profile, actual model, transport, and upstream URL without returning provider API keys.
 
-## 跨模型增强
+## Cross-model enhancements
 
 ### Vision Proxy
 
-没有原生视觉能力的文本模型可以把图片或 PDF 先交给指定视觉 Provider 分析，再让当前目标模型继续推理和调用工具：
+A text-only model can send an image or PDF to a designated vision provider first, then continue reasoning and tool use with the current target model:
 
 ```json
 {
@@ -151,31 +152,31 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:18787/health'
 }
 ```
 
-原始媒体会发送给视觉 Provider，提取后的有界视觉证据会发送给目标 Provider，因此可能产生两次模型调用与两份费用，也需要同时评估双方的数据政策。Vision Proxy 适合代码截图、终端、GUI、网页和单页 OCR，不是批量扫描件 OCR 或像素级定位引擎。详细限制见 [Vision Proxy 配置](PROVIDER_CONFIG.md#通用-vision-proxy)。
+The original media is sent to the vision provider, and bounded extracted evidence is sent to the target provider. This can incur two model calls and two sets of charges, and both providers' data policies must be considered. Vision Proxy is intended for code screenshots, terminals, GUIs, web pages, and single-page OCR; it is not a bulk scanned-document OCR or pixel-precise localization engine. See [Vision Proxy configuration](PROVIDER_CONFIG.md#通用-vision-proxy) for detailed limits.
 
-### MCP 扩展
+### MCP extensions
 
-- `gemini-image`：Windows 安装器可为 Claude Code 注册 `generate_image`，使用 Gemini 图像模型生成预览并保存到系统“图片”目录下的 `ClaudeCodeBridge` 文件夹；
-- Kimi Formula：只暴露 Provider 中 `kimi_formula_tools` 明确列出的官方 Formula，默认关闭；
-- Google 服务端工具：`google_search`、`url_context`、`code_execution`、`google_maps` 和 File Search 均需在 Gemini profile 中显式启用。
+- `gemini-image`: the Windows installer can register a `generate_image` tool for Claude Code, returning a preview and saving the generated file under the `ClaudeCodeBridge` folder in the Windows known Pictures directory.
+- Kimi Formula: only official Formula tools explicitly listed in `kimi_formula_tools` are exposed; the feature is off by default.
+- Google server-side tools: `google_search`, `url_context`, `code_execution`, `google_maps`, and File Search must be explicitly enabled in the Gemini profile.
 
-服务端搜索、执行和生图可能产生额外费用。桥接器不会默认开启这些能力。
+Server-side search, execution, and image generation may incur extra charges. The bridge does not enable them by default.
 
-## 配置与运维
+## Configuration and operations
 
-| 项目 | 默认位置或值 |
+| Item | Default location or value |
 | --- | --- |
-| 本地端点 | `http://127.0.0.1:18787` |
-| Windows 服务 | `ClaudeCodeBridge` |
-| 正式程序目录 | `C:\Program Files\ClaudeCodeBridge` |
-| 状态与日志 | `C:\ProgramData\ClaudeCodeBridge` |
-| Claude Code 配置 | `%USERPROFILE%\.claude\settings.json` |
-| Provider 配置 | `%USERPROFILE%\.claude\bridge-providers\*.json` |
-| 健康检查 | `GET /health` |
-| 模型列表 | `GET /admin/profiles` |
-| 刷新 Provider | `POST /admin/reload-profiles` |
+| Local endpoint | `http://127.0.0.1:18787` |
+| Windows service | `ClaudeCodeBridge` |
+| Production binaries | `C:\Program Files\ClaudeCodeBridge` |
+| State and logs | `C:\ProgramData\ClaudeCodeBridge` |
+| Claude Code settings | `%USERPROFILE%\.claude\settings.json` |
+| Provider profiles | `%USERPROFILE%\.claude\bridge-providers\*.json` |
+| Health check | `GET /health` |
+| Provider list | `GET /admin/profiles` |
+| Reload providers | `POST /admin/reload-profiles` |
 
-每个原生 Provider 使用独立 HTTP 客户端，不会自动继承 Windows 系统代理或 Gemini 的旧代理配置。需要代理时，在对应 profile 中设置：
+Each native provider owns an independent HTTP client and does not automatically inherit the Windows system proxy or a legacy Gemini proxy setting. Configure a proxy in the relevant profile when needed:
 
 ```json
 {
@@ -183,37 +184,37 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:18787/health'
 }
 ```
 
-API Key 可以直接写入 Provider 文件，也可以通过 `api_key_env` 引用服务进程可见的环境变量。不要提交、截图或分发包含真实密钥的文件。
+An API key can be stored directly in a provider profile or referenced through `api_key_env`, provided the variable is visible to the Windows service process. Never commit, screenshot, or distribute a configuration file containing a real credential.
 
-Kimi K3 的 `context_window: 1048576` 会进入管理 API 和 `/v1/models` 元数据；若要让 Claude Code 客户端按完整 1M 窗口自动压缩，还需在启动 Claude Code 前设置 `CLAUDE_CODE_AUTO_COMPACT_WINDOW=1048576`。不同上下文规格之间切换后进行超长任务时，建议重启 Claude Code 会话。
+Kimi K3's `context_window: 1048576` is exposed through the management API and `/v1/models` metadata. To make the Claude Code client auto-compact against the full 1M window, set `CLAUDE_CODE_AUTO_COMPACT_WINDOW=1048576` before starting Claude Code. Restart the Claude Code session before a very long task after switching between models with different context sizes.
 
-## 设计边界
+## Design boundaries
 
-- 桥接器只能保留上游 API 暴露的能力，不能为普通聊天端点创造可靠工具调用、视觉或推理状态；
-- Chat Completions fallback 通常比官方 Anthropic、Interactions 或 Responses 路径更容易发生语义降级；
-- 有状态 API 会把部分会话状态保存在供应商服务端；选择前应评估隐私和数据保留政策；
-- Provider 的模型 ID、上下文、配额、价格和可用区可能变化，应以实际调用结果为准；
-- 通用兼容不代表模型一定适合 Coding Agent；可靠体验仍依赖足够的代码能力、上下文、流式输出和工具支持；
-- 对无法安全映射的字段，项目倾向于明确警告或失败，而不是静默返回看似成功但违反契约的结果。
+- The bridge can preserve only capabilities exposed by the upstream API; it cannot manufacture reliable tool use, vision, or reasoning state for a basic chat endpoint.
+- A Chat Completions fallback is generally more likely to lose semantics than an official Anthropic, Interactions, or Responses route.
+- Stateful APIs retain part of the conversation on the provider's servers; evaluate the provider's privacy and retention policy before enabling them.
+- Provider model IDs, context limits, quotas, prices, and regions can change; actual API results are authoritative.
+- Generic API compatibility does not guarantee that a model is suitable for a coding agent. Reliable operation still depends on model quality, context, streaming, and tool support.
+- When a field cannot be mapped safely, this project prefers an explicit warning or failure over a response that appears successful while violating the caller's contract.
 
-## 新模型的深度适配标准
+## Acceptance criteria for deep model adaptation
 
-本项目以后不以“返回了一段文本”作为适配完成。一个模型进入重点支持范围，至少应审核并测试：
+This project does not consider a model adapted merely because it returned text. A model entering the priority support tier should be reviewed and tested for:
 
-1. 官方推荐 transport、鉴权、模型 ID、区域域名与上下文规格；
-2. Thinking/effort/budget 的请求映射及流式推理输出；
-3. “思考 → 工具调用 → 工具结果 → 继续思考”的完整回放；
-4. 并行工具、结构化参数、截断调用与多模态工具结果；
-5. 缓存、推理 Token、服务端工具和总 Usage；
-6. 有状态续接的精确命中、历史编辑、缓存淘汰和安全回退；
-7. 限流、过载、上下文超限、拒绝与异常流结束；
-8. 官方请求/响应 fixture、流式 fixture 与回归测试。
+1. The recommended official transport, authentication, model ID, regional endpoints, and context specification.
+2. Request mapping for thinking, effort, and budget, plus streamed reasoning output.
+3. The complete “think → call tool → receive result → continue thinking” replay cycle.
+4. Parallel tools, structured arguments, truncated calls, and multimodal tool results.
+5. Cache, reasoning-token, server-tool, and total usage accounting.
+6. Exact stateful continuation, edited history, cache eviction, and safe fallback.
+7. Rate limits, overload, context limits, refusal, and abnormal stream termination.
+8. Official request/response fixtures, streaming fixtures, and regression tests.
 
-这套标准也是“最大化发挥模型能力”的可验证定义。
+These criteria are the project's verifiable definition of “maximizing model capability.”
 
-## 从源码构建
+## Build from source
 
-项目主体使用 Rust，Windows 模型中心使用 Delphi VCL。仅构建桥接服务时不需要 Delphi：
+The bridge runtime is written in Rust, while the Windows Model Center uses Delphi VCL. Delphi is not required to build only the bridge service:
 
 ```powershell
 cargo fmt --all -- --check
@@ -222,19 +223,15 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo build --locked --release --target x86_64-pc-windows-msvc
 ```
 
-开发环境可使用仓库中的 `scripts\start-bridge.ps1` 与 `scripts\stop-bridge.ps1`；正式 Windows 安装和升级应使用发布包中的安装程序，不要把开发目录当作生产安装目录。
+For development, use `scripts\start-bridge.ps1` and `scripts\stop-bridge.ps1`. For a production Windows installation or upgrade, use the released installer rather than registering a binary from the development tree as the production service.
 
-## 文档
+## Documentation
 
-- [Provider 配置指南](PROVIDER_CONFIG.md)
-- [Provider 模板](examples/providers)
-- [变更记录](CHANGELOG.md)
-- [Windows 发布包使用说明](packaging/windows-x64/使用说明.txt)
-
-## English summary
-
-Claude Code Multi-Model Bridge is a Windows-oriented, capability-aware Rust runtime that keeps Claude Code on one local Anthropic-compatible endpoint and routes each request to the selected downstream model. It provides first-class Anthropic Messages, Gemini Interactions, OpenAI Responses, and OpenAI Chat Completions transports; preserves reasoning, tools, streaming, state, structured output, usage, and multimodal semantics where the provider API supports them; and reports unavoidable downgrades explicitly. See the [Provider guide](PROVIDER_CONFIG.md) and ready-to-copy [examples](examples/providers) to get started.
+- [Provider configuration guide](PROVIDER_CONFIG.md)
+- [Provider templates](examples/providers)
+- [Changelog](CHANGELOG.md)
+- [Windows package guide (English and Chinese)](packaging/windows-x64/使用说明.txt)
 
 ## License
 
-本项目采用 [GNU GPL v3.0](LICENSE) 开源。您可以使用、修改和再分发，但衍生作品也必须按 GPL-3.0 提供源代码。
+This project is licensed under the [GNU General Public License v3.0](LICENSE). You may use, modify, and redistribute it, provided derivative works are also released under GPL-3.0 with source available.
