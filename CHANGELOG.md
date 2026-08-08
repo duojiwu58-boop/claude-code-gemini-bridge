@@ -9,6 +9,20 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 
 ## [v0.5.0] - 2026-08-08
 
+### DeepSeek V4 Flash and Qwen3.8-Max Deep Adaptation
+- Switched the recommended DeepSeek/Qwen profiles to their native Anthropic Messages endpoints and current `deepseek-v4-flash` / `qwen3.8-max` model IDs.
+- Added provider-aware Chat fallbacks: DeepSeek reasoning replay, thinking type, high/max effort, and incompatible tool-choice suppression; Qwen thinking enablement/budget preservation and structured-output mapping.
+- Added the first-class `openai-responses` transport with semantic unary/SSE translation, function and server-side tools, DeepSeek custom `apply_patch`, DeepSeek stateless history replay, and branch-safe Qwen `previous_response_id` continuation with session caching.
+- Mapped cache-read, cache-creation, and reasoning token details for Chat and Responses usage. Provider compatibility downgrades are logged and returned through repeatable `x-claude-bridge-warning` headers.
+- Added official-contract fixtures for both providers, including the complete thinking → tool call → tool result → continued reasoning state path. The Rust suite now contains 107 tests.
+
+### Kimi K3 1M Deep Adaptation
+- Switched the recommended Kimi profile to the Anthropic-compatible endpoint with the verified working model ID `kimi-k3`, explicit Bearer authentication, and 1,048,576-token context metadata. Provider profiles now support `auth_scheme` and `context_window`.
+- Added the Kimi Chat fallback dialect with complete `reasoning_content` replay across tool turns, K3 `low/high/max` effort mapping, `max_completion_tokens`, fixed-sampling suppression, JSON Schema output, stable hashed `prompt_cache_key`/`safety_identifier`, and direct `usage.cached_tokens` accounting.
+- Routed Claude Code token counting through Kimi's native `/v1/tokenizers/estimate-token-count` endpoint with a bounded local-estimate fallback.
+- Added opt-in Kimi Formula tools through the bridge MCP server. Only explicitly listed official Formula URIs are exposed and executed; the default empty list has no tool cost or behavior change.
+- Added official-contract tests for Anthropic Bearer profiles, the reasoning → tool → result replay path, stable cache identity, native token estimation, and Formula discovery/execution.
+
 ### Gemini Interactions Compatibility and Native Tools
 - Replaced local estimation on `/v1/messages/count_tokens` with Google's native `models.countTokens` for `gemini-interactions` profiles. The request includes the translated prompt, system instruction, custom function declarations, structured-output schema, and supported media; bounded upstream failures fall back to the local estimate and expose the count source through `x-claude-bridge-token-count`.
 - Mapped Anthropic `output_config.format` to native Interactions `response_format`, `output_config.effort` to `thinking_level` with conservative `xhigh`/`max` → `high` clamping, document URL/text/content sources to native document input, and `service_tier: standard_only` to Gemini `standard` while leaving `auto` at Google's standard default.
@@ -202,6 +216,13 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 ## 中文
 
 ## [v0.5.0] - 2026-08-08
+
+### Kimi K3 1M 深度适配
+- Kimi 推荐配置切换为 Anthropic-compatible endpoint、经实际验证可用的模型 ID `kimi-k3`、显式 Bearer 鉴权与 1,048,576 Token 上下文元数据；Provider 新增 `auth_scheme` 与 `context_window`。
+- 新增 Kimi Chat fallback 方言：工具轮次完整回放 `reasoning_content`，映射 K3 `low/high/max` effort、`max_completion_tokens`、固定采样约束、JSON Schema、稳定散列的 `prompt_cache_key`/`safety_identifier`，并读取顶层 `usage.cached_tokens`。
+- Claude Code Token 计数改为调用 Kimi 原生 `/v1/tokenizers/estimate-token-count`，受限失败时回退本地估算。
+- 通过桥接器 MCP 新增显式启用的 Kimi Formula 官方工具；只暴露配置列出的 URI，默认空数组不会产生工具费用或行为变化。
+- 新增 Anthropic Bearer profile、思考→工具→结果回放、稳定缓存标识、原生 Token Estimate 与 Formula 发现/执行测试。
 
 ### Gemini Interactions 兼容性与原生工具
 - `gemini-interactions` profile 的 `/v1/messages/count_tokens` 已由本地估算改为调用 Google 原生 `models.countTokens`，请求包含转换后的提示、系统指令、自定义函数声明、结构化输出 schema 和受支持媒体；受限的上游失败会回退到本地估算，并通过 `x-claude-bridge-token-count` 标明计数来源。

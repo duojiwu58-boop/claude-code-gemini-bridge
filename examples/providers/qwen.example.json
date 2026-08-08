@@ -1,6 +1,7 @@
 {
-  "name": "Qwen",
-  "model": "qwen-plus",
-  "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  "name": "Qwen3.8 Max",
+  "model": "qwen3.8-max",
+  "protocol": "anthropic",
+  "base_url": "https://{WORKSPACE_ID}.cn-beijing.maas.aliyuncs.com/apps/anthropic",
   "api_key": "<DASHSCOPE_API_KEY>"
 }

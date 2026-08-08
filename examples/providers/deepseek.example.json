@@ -1,7 +1,8 @@
 {
-  "name": "DeepSeek",
-  "model": "deepseek-chat",
-  "base_url": "https://api.deepseek.com",
+  "name": "DeepSeek V4 Flash",
+  "model": "deepseek-v4-flash",
+  "protocol": "anthropic",
+  "base_url": "https://api.deepseek.com/anthropic",
   "api_key": "<DEEPSEEK_API_KEY>",
   "vision": {
     "mode": "proxy"

@@ -47,6 +47,105 @@
 `/chat/completions`。如果供应商给出的不是 SDK 基地址，或网关路径比较特殊，
 请用 `endpoint` 填写完整的 Chat Completions 请求地址。
 
+## DeepSeek / Qwen 推荐配置与 Responses
+
+DeepSeek V4 Flash 与 Qwen3.8-Max 的推荐默认配置是厂商原生 Anthropic Messages transport：
+
+```json
+{
+  "name": "DeepSeek V4 Flash",
+  "model": "deepseek-v4-flash",
+  "protocol": "anthropic",
+  "base_url": "https://api.deepseek.com/anthropic",
+  "api_key": "<DEEPSEEK_API_KEY>",
+  "vision": {"mode": "proxy"}
+}
+```
+
+```json
+{
+  "name": "Qwen3.8 Max",
+  "model": "qwen3.8-max",
+  "protocol": "anthropic",
+  "base_url": "https://{WORKSPACE_ID}.cn-beijing.maas.aliyuncs.com/apps/anthropic",
+  "api_key": "<DASHSCOPE_API_KEY>"
+}
+```
+
+需要 Responses 服务端工具或语义 SSE 时，将 `protocol` 设为 `openai-responses`，并使用官网
+Responses SDK 的 `base_url`。DeepSeek Responses 是无状态接口，桥接器不会发送
+`previous_response_id`，而会完整回放经过验证的历史；Qwen 默认只在精确 transcript 或 opaque
+tool call ID 命中时发送 `previous_response_id`，同时启用 `x-dashscope-session-cache: enable`。
+
+```json
+{
+  "name": "DeepSeek V4 Flash (Responses)",
+  "model": "deepseek-v4-flash",
+  "protocol": "openai-responses",
+  "base_url": "https://api.deepseek.com/v1",
+  "api_key": "<DEEPSEEK_API_KEY>",
+  "capabilities": {
+    "responses_builtin_tools": ["web_search"],
+    "responses_apply_patch_custom": true
+  }
+}
+```
+
+服务端工具默认不自动开启，避免意外产生搜索/执行费用；在 `responses_builtin_tools` 中填写
+供应商和当前模型明确支持的工具类型后，桥接器才会把它们加入请求。DeepSeek/Qwen Chat
+Completions 仍可作为 fallback：桥接器会从官方域名推断方言，也可用
+`capabilities.chat_dialect` 显式指定 `deepseek` 或 `qwen`。
+
+## Kimi K3 1M 推荐配置
+
+Kimi K3 面向 Claude Code 的首选路径是 Moonshot 官方 Anthropic-compatible endpoint。全球站
+配置如下；API Key 必须与创建它的平台和区域匹配，国内站 Key 应将域名保持为
+`api.moonshot.cn`，不要与全球站 `.ai` Key 混用。
+
+```json
+{
+  "name": "Kimi K3 1M",
+  "model": "kimi-k3",
+  "protocol": "anthropic",
+  "base_url": "https://api.moonshot.ai/anthropic",
+  "api_key": "<MOONSHOT_API_KEY>",
+  "auth_scheme": "bearer",
+  "context_window": 1048576,
+  "identity": "Kimi K3"
+}
+```
+
+`auth_scheme: bearer` 对应官方 `ANTHROPIC_AUTH_TOKEN` 鉴权。`context_window` 会出现在管理 API
+和 `/v1/models` 元数据中；Claude Code 已运行进程的环境变量不能被热更新，如需让客户端按
+完整 1M 窗口触发自动压缩，还需在启动 Claude Code 前设置
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW=1048576`。在不同上下文规格的模型之间热切换时，建议重启
+Claude Code 会话后再进行超长任务。
+
+官方 Anthropic endpoint 不可用时可回退到 `protocol: openai` 与
+`https://api.moonshot.ai/v1`。桥接器会自动启用 Kimi Chat 方言：使用
+`max_completion_tokens`，禁止不兼容的采样参数，回放 `reasoning_content`，映射
+`low/high/max` effort、JSON Schema、稳定散列的 `prompt_cache_key`/`safety_identifier`，并把
+顶层 `usage.cached_tokens` 还原为 Claude cache usage。`/v1/messages/count_tokens` 会调用 Kimi
+原生 `/v1/tokenizers/estimate-token-count`，失败时才回退到本地估算。
+
+Kimi Formula 官方工具通过本地 MCP 显式启用；空数组表示完全关闭，不会产生工具调用费用：
+
+```json
+{
+  "capabilities": {
+    "kimi_formula_tools": [
+      "moonshot/web-search:latest",
+      "moonshot/fetch:latest",
+      "moonshot/code-runner:latest"
+    ]
+  }
+}
+```
+
+启用后，桥接器从 Formula API 获取标准函数 schema，并只把配置中的工具暴露给 Claude Code；
+实际调用由 Formula `fibers` endpoint 执行。工具发现和按需选择继续由 Claude Code/MCP 负责，
+桥接器不会把全部可用 Formula 自动塞入每个模型请求。
+
 ## Gemini 原生 Interactions（推荐）
 
 Gemini 3.6 Flash 建议使用 Google 原生 Interactions API，而不是 OpenAI 兼容层：
@@ -121,6 +220,8 @@ Claude Code 请求在此 transport 上按下表映射：
   "model": "provider-model-id",
   "base_url": "https://provider.example/v1",
   "api_key": "sk-...",
+  "auth_scheme": "bearer",
+  "context_window": 1048576,
   "protocol": "openai",
   "endpoint": "https://provider.example/v1/chat/completions",
   "identity": "模型对外说明的真实身份",
@@ -142,6 +243,12 @@ Claude Code 请求在此 transport 上按下表映射：
     "tool_result_media": "separate_user",
     "tool_schema": "sanitize",
     "max_tokens_field": "max_tokens",
+    "chat_dialect": "generic",
+    "responses_stateful": false,
+    "responses_session_cache": false,
+    "responses_builtin_tools": [],
+    "responses_apply_patch_custom": false,
+    "kimi_formula_tools": [],
     "gemini_builtin_tools": [],
     "gemini_file_search_store_names": []
   }
@@ -156,11 +263,14 @@ Claude Code 请求在此 transport 上按下表映射：
 - `api_key_env`：从服务进程环境变量读取密钥，例如 `DEEPSEEK_API_KEY`。
 - `name`：可选，默认使用 `model`。
 - `protocol`：可选，默认 `openai`；原生 Anthropic Messages 服务可填
-  `anthropic`；Google 原生有状态接口使用 `gemini-interactions`。安装器生成的
-  本地 Gemini 深度转换路由使用保留值 `gemini`。
+  `anthropic`；OpenAI Responses 使用 `openai-responses`；Google 原生有状态接口使用
+  `gemini-interactions`。安装器生成的本地 Gemini 深度转换路由使用保留值 `gemini`。
 - `endpoint`：可选，完整请求地址；设置后不会根据 `base_url`推导。
 - `identity`：可选，告诉下游模型它在此路由中的真实身份；默认使用模型 ID。
 - `identity_override`：可选，默认 `true`。设为 `false` 可关闭身份提示适配。
+- `auth_scheme`：可选，`bearer` 或 `x-api-key`。OpenAI transport 默认 `bearer`，Anthropic
+  transport 默认 `x-api-key`；Kimi 官方 Anthropic endpoint 应显式使用 `bearer`。
+- `context_window`：可选正整数，记录上游上下文窗口并通过管理 API 与 `/v1/models` 暴露。
 - `proxy`：可选，仅用于这个 Provider；省略表示直连。
 - `enabled`：可选，默认 `true`。设为 `false` 后保留文件但不显示该配置。
 - `vision`：可选，默认 `{"mode":"native"}`，即图片仍由当前 Provider 原生处理。
@@ -179,7 +289,8 @@ Claude Code 请求在此 transport 上按下表映射：
 {
   "name": "DeepSeek V4 Flash",
   "model": "deepseek-v4-flash",
-  "base_url": "https://api.deepseek.com",
+  "protocol": "anthropic",
+  "base_url": "https://api.deepseek.com/anthropic",
   "api_key": "<DEEPSEEK_API_KEY>",
   "vision": {
     "mode": "proxy"
@@ -199,7 +310,7 @@ Gemini profile；若没有，则选择 `base_url` 指向 Google 官方
 }
 ```
 
-显式视觉 Provider 可以使用 `gemini`、`openai` 或 `anthropic` transport，但它
+显式视觉 Provider 可以使用 `gemini`、`openai`、`openai-responses` 或 `anthropic` transport，但它
 自己的 `vision.mode` 必须是 `native`。桥接器拒绝自引用和多级代理链，并在刷新
 profile 时检查引用是否存在。
 
@@ -233,7 +344,7 @@ profile 时检查引用是否存在。
 | `stream_options` | `true` | 流式请求发送 `stream_options.include_usage`；不支持该参数的端点设为 `false` |
 | `parallel_tool_calls` | `true` | 允许发送 `parallel_tool_calls` 控制；端点不认识该字段时设为 `false` |
 | `reasoning_effort` | `true` | 将 Claude Thinking 预算映射为 `reasoning_effort`；端点拒绝该参数时设为 `false` |
-| `default_reasoning_effort` | 未设置 | Claude 请求没有 Thinking 配置时使用的默认推理等级；可选 `minimal`、`low`、`medium` 或 `high` |
+| `default_reasoning_effort` | 未设置 | Claude 请求没有 Thinking 配置时使用的默认推理等级；可选 `none`、`minimal`、`low`、`medium`、`high`、`xhigh` 或 `max` |
 | `reasoning_fields` | `["reasoning_content", "thinking"]` | 响应中按顺序识别的推理文本字段；可以填写一个字符串或字符串数组，空数组表示不提取推理文本 |
 | `thinking_tags` | `true` | 将正文开头的 `<think>...</think>` 提取为 Thinking 块，并支持标签跨流式 Chunk；若模型需要原样输出该标签则设为 `false` |
 | `include_thoughts` | `false` | 为 Google OpenAI 兼容端点请求思考摘要；启用时桥接器会把推理等级写入同一个 `thinking_config`，避免与 `reasoning_effort` 同时发送导致 HTTP 400 |
@@ -241,6 +352,12 @@ profile 时检查引用是否存在。
 | `tool_result_media` | `separate_user` | 保持 `role: tool` 的 `content` 为字符串，并将图片/PDF 移至后一条 `user` 消息；仅对明确支持工具消息内联媒体的端点使用 `inline` |
 | `tool_schema` | `sanitize` | `sanitize` 清理常见不兼容元数据；确认端点支持完整 JSON Schema 时使用 `preserve` |
 | `max_tokens_field` | `max_tokens` | 可选值为 `max_tokens`、`max_completion_tokens` 或 `omit` |
+| `chat_dialect` | 按官方域名推断，否则 `generic` | Chat fallback 可选 `generic`、`deepseek`、`qwen` 或 `kimi`；控制官方专属 thinking、推理回放与结构化输出参数 |
+| `responses_stateful` | Qwen 官方域名为 `true`，其他为 `false` | 仅精确命中历史分支后发送 `previous_response_id` |
+| `responses_session_cache` | Qwen 官方域名为 `true`，其他为 `false` | 发送 `x-dashscope-session-cache: enable`；仅在供应商支持该请求头时开启 |
+| `responses_builtin_tools` | `[]` | 为 Responses 请求显式增加供应商支持的服务端工具类型；空数组不会产生额外费用 |
+| `responses_apply_patch_custom` | DeepSeek 官方域名为 `true`，其他为 `false` | 将名为 `apply_patch` 的函数工具映射为 Responses custom tool，并保持 raw patch 输入/输出轮次 |
+| `kimi_formula_tools` | `[]` | 显式启用的 Kimi 官方 Formula URI；通过本地 MCP 获取 schema 并执行，默认不启用、不产生额外费用 |
 | `gemini_builtin_tools` | `[]` | 仅 `gemini-interactions` 使用；可启用 `google_search`、`url_context`、`code_execution`、`google_maps` 服务端工具 |
 | `gemini_file_search_store_names` | `[]` | 仅 `gemini-interactions` 使用；非空时启用 Google 原生 File Search，并传入指定 `fileSearchStores/...` 资源名 |
 
@@ -297,9 +414,13 @@ profile 时检查引用是否存在。
 供应商可能调整模型 ID、地区域名或版本路径，应以各自官网当前的 OpenAI 兼容
 示例为准：
 
-- [阿里云百炼 OpenAI 兼容说明](https://help.aliyun.com/en/model-studio/more-tools)
-- [DeepSeek Chat Completions](https://api-docs.deepseek.com/api/create-chat-completion)
-- [Kimi API 文档](https://platform.kimi.com/docs/api/overview)
+- [阿里云百炼 Anthropic Messages](https://help.aliyun.com/en/model-studio/anthropic-api-messages)
+- [阿里云百炼 Qwen Responses](https://help.aliyun.com/zh/model-studio/qwen-api-via-openai-responses)
+- [DeepSeek Claude Code / Anthropic 配置](https://api-docs.deepseek.com/quick_start/agent_integrations/claude_code/)
+- [DeepSeek Chat Thinking](https://api-docs.deepseek.com/guides/thinking_mode)
+- [DeepSeek Responses](https://api-docs.deepseek.com/guides/responses_api/)
+- [Kimi API 文档](https://platform.kimi.ai/docs/api/overview)
+- [Kimi Claude Code 配置](https://platform.kimi.ai/docs/guide/claude-code-kimi)
 - [Gemini Interactions API](https://ai.google.dev/api/interactions-api-v1)
 - [Gemini streaming interactions](https://ai.google.dev/gemini-api/docs/streaming)
 

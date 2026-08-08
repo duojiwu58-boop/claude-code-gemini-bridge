@@ -53,6 +53,7 @@ const INTERACTION_SERVER_TOOL_TRACE_CAPACITY: usize = 32;
 const INTERACTION_SERVER_TOOL_TRACE_VALUE_CHARS: usize = 4096;
 const BRIDGE_WARNING_HEADER: &str = "x-claude-bridge-warning";
 const GEMINI_COUNT_TOKENS_TIMEOUT: Duration = Duration::from_secs(20);
+const KIMI_COUNT_TOKENS_TIMEOUT: Duration = Duration::from_secs(20);
 const VISION_CACHE_CAPACITY: usize = 128;
 const VISION_PROXY_TIMEOUT: Duration = Duration::from_secs(90);
 const VISION_MAX_OUTPUT_TOKENS: u64 = 4096;
@@ -107,6 +108,7 @@ enum ProviderTransport {
     LocalGemini,
     Anthropic,
     OpenAiChat,
+    OpenAiResponses,
     GeminiInteractions,
 }
 
@@ -116,6 +118,7 @@ impl ProviderTransport {
             Self::LocalGemini => "gemini",
             Self::Anthropic => "anthropic",
             Self::OpenAiChat => "openai-chat",
+            Self::OpenAiResponses => "openai-responses",
             Self::GeminiInteractions => "gemini-interactions",
         }
     }
@@ -158,6 +161,26 @@ enum MaxTokensField {
     Omit,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum OpenAiChatDialect {
+    #[default]
+    Generic,
+    DeepSeek,
+    Qwen,
+    Kimi,
+}
+
+impl OpenAiChatDialect {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Generic => "generic",
+            Self::DeepSeek => "deepseek",
+            Self::Qwen => "qwen",
+            Self::Kimi => "kimi",
+        }
+    }
+}
+
 impl MaxTokensField {
     fn as_str(self) -> &'static str {
         match self {
@@ -170,6 +193,7 @@ impl MaxTokensField {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct OpenAiCapabilities {
+    chat_dialect: OpenAiChatDialect,
     stream_options: bool,
     parallel_tool_calls: bool,
     reasoning_effort: bool,
@@ -181,6 +205,11 @@ struct OpenAiCapabilities {
     tool_result_media: ToolResultMediaMode,
     tool_schema: ToolSchemaMode,
     max_tokens_field: MaxTokensField,
+    responses_stateful: bool,
+    responses_session_cache: bool,
+    responses_builtin_tools: Vec<String>,
+    responses_apply_patch_custom: bool,
+    kimi_formula_tools: Vec<String>,
     gemini_builtin_tools: Vec<String>,
     gemini_file_search_store_names: Vec<String>,
 }
@@ -188,6 +217,7 @@ struct OpenAiCapabilities {
 impl Default for OpenAiCapabilities {
     fn default() -> Self {
         Self {
+            chat_dialect: OpenAiChatDialect::Generic,
             stream_options: true,
             parallel_tool_calls: true,
             reasoning_effort: true,
@@ -204,6 +234,11 @@ impl Default for OpenAiCapabilities {
             // accept the complete Anthropic schema can opt into preservation.
             tool_schema: ToolSchemaMode::Sanitize,
             max_tokens_field: MaxTokensField::MaxTokens,
+            responses_stateful: false,
+            responses_session_cache: false,
+            responses_builtin_tools: Vec::new(),
+            responses_apply_patch_custom: false,
+            kimi_formula_tools: Vec::new(),
             gemini_builtin_tools: Vec::new(),
             gemini_file_search_store_names: Vec::new(),
         }
@@ -227,6 +262,71 @@ impl OpenAiCapabilities {
             ..Self::default()
         }
     }
+
+    fn for_openai_base_url(base_url: &str) -> Self {
+        let mut capabilities = Self {
+            chat_dialect: inferred_openai_chat_dialect(base_url),
+            ..Self::default()
+        };
+        if capabilities.chat_dialect == OpenAiChatDialect::Kimi {
+            capabilities.default_reasoning_effort = Some("max".to_string());
+            capabilities.sampling_parameters = false;
+            capabilities.tool_schema = ToolSchemaMode::Preserve;
+            capabilities.max_tokens_field = MaxTokensField::MaxCompletionTokens;
+        }
+        capabilities
+    }
+
+    fn for_responses_base_url(base_url: &str) -> Self {
+        let mut capabilities = Self::for_openai_base_url(base_url);
+        match capabilities.chat_dialect {
+            OpenAiChatDialect::DeepSeek => {
+                capabilities.responses_apply_patch_custom = true;
+            }
+            OpenAiChatDialect::Qwen => {
+                capabilities.responses_stateful = true;
+                capabilities.responses_session_cache = true;
+            }
+            OpenAiChatDialect::Generic | OpenAiChatDialect::Kimi => {}
+        }
+        capabilities
+    }
+}
+
+fn inferred_openai_chat_dialect(base_url: &str) -> OpenAiChatDialect {
+    let host = url::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
+    match host.as_deref() {
+        Some("api.deepseek.com") => OpenAiChatDialect::DeepSeek,
+        Some("api.moonshot.ai" | "api.moonshot.cn") => OpenAiChatDialect::Kimi,
+        Some(host)
+            if host == "dashscope.aliyuncs.com"
+                || host == "dashscope-intl.aliyuncs.com"
+                || host.ends_with(".maas.aliyuncs.com") =>
+        {
+            OpenAiChatDialect::Qwen
+        }
+        _ => OpenAiChatDialect::Generic,
+    }
+}
+
+fn is_supported_kimi_formula(formula: &str) -> bool {
+    matches!(
+        formula,
+        "moonshot/convert:latest"
+            | "moonshot/web-search:latest"
+            | "moonshot/rethink:latest"
+            | "moonshot/random-choice:latest"
+            | "moonshot/mew:latest"
+            | "moonshot/memory:latest"
+            | "moonshot/excel:latest"
+            | "moonshot/date:latest"
+            | "moonshot/base64:latest"
+            | "moonshot/fetch:latest"
+            | "moonshot/quickjs:latest"
+            | "moonshot/code-runner:latest"
+    )
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -257,6 +357,7 @@ struct ProviderProfile {
     display_name: String,
     source: ProviderProfileSource,
     model: String,
+    context_window: Option<u64>,
     upstream_identity: Option<String>,
     identity_override: bool,
     base_url: String,
@@ -678,6 +779,27 @@ fn profile_string(object: &Map<String, Value>, names: &[&str]) -> Option<String>
     })
 }
 
+fn profile_u64(
+    object: &Map<String, Value>,
+    names: &[&str],
+    file_name: &str,
+) -> Result<Option<u64>, String> {
+    for name in names {
+        if let Some(value) = object.get(*name) {
+            return value
+                .as_u64()
+                .filter(|value| *value > 0)
+                .map(Some)
+                .ok_or_else(|| {
+                    format!(
+                        "Provider profile '{file_name}' field '{name}' must be a positive integer"
+                    )
+                });
+        }
+    }
+    Ok(None)
+}
+
 fn parse_vision_config(
     profile: &Map<String, Value>,
     file_name: &str,
@@ -919,28 +1041,57 @@ fn parse_openai_capabilities_with_defaults(
         }
     };
 
-    let default_reasoning_effort = capability_string(
+    let mut default_reasoning_effort = capability_string(
         object,
         &["default_reasoning_effort", "defaultReasoningEffort"],
         file_name,
     )?
     .or_else(|| defaults.default_reasoning_effort.clone());
-    if default_reasoning_effort
-        .as_deref()
-        .is_some_and(|effort| !matches!(effort, "minimal" | "low" | "medium" | "high"))
-    {
+    if default_reasoning_effort.as_deref().is_some_and(|effort| {
+        !matches!(
+            effort,
+            "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+        )
+    }) {
         return Err(format!(
-            "Provider profile '{file_name}' capability 'default_reasoning_effort' must be minimal, low, medium, or high"
+            "Provider profile '{file_name}' capability 'default_reasoning_effort' must be none, minimal, low, medium, high, xhigh, or max"
         ));
     }
 
+    let chat_dialect = match capability_string(
+        object,
+        &["chat_dialect", "chatDialect"],
+        file_name,
+    )?
+    .as_deref()
+    .unwrap_or(defaults.chat_dialect.as_str())
+    {
+        "generic" => OpenAiChatDialect::Generic,
+        "deepseek" => OpenAiChatDialect::DeepSeek,
+        "qwen" => OpenAiChatDialect::Qwen,
+        "kimi" => OpenAiChatDialect::Kimi,
+        other => {
+            return Err(format!(
+                "Provider profile '{file_name}' capability 'chat_dialect' has unsupported value '{other}' (expected generic, deepseek, qwen, or kimi)"
+            ))
+        }
+    };
+    if chat_dialect == OpenAiChatDialect::Kimi && default_reasoning_effort.is_none() {
+        default_reasoning_effort = Some("max".to_string());
+    }
+
+    let default_tool_schema = if chat_dialect == OpenAiChatDialect::Kimi {
+        "preserve"
+    } else {
+        defaults.tool_schema.as_str()
+    };
     let tool_schema = match capability_string(
         object,
         &["tool_schema", "toolSchema"],
         file_name,
     )?
         .as_deref()
-        .unwrap_or(defaults.tool_schema.as_str())
+        .unwrap_or(default_tool_schema)
     {
         "sanitize" => ToolSchemaMode::Sanitize,
         "preserve" => ToolSchemaMode::Preserve,
@@ -950,13 +1101,18 @@ fn parse_openai_capabilities_with_defaults(
             ))
         }
     };
+    let default_max_tokens_field = if chat_dialect == OpenAiChatDialect::Kimi {
+        "max_completion_tokens"
+    } else {
+        defaults.max_tokens_field.as_str()
+    };
     let max_tokens_field = match capability_string(
         object,
         &["max_tokens_field", "maxTokensField"],
         file_name,
     )?
     .as_deref()
-    .unwrap_or(defaults.max_tokens_field.as_str())
+    .unwrap_or(default_max_tokens_field)
     {
         "max_tokens" => MaxTokensField::MaxTokens,
         "max_completion_tokens" => MaxTokensField::MaxCompletionTokens,
@@ -1008,8 +1164,33 @@ fn parse_openai_capabilities_with_defaults(
         defaults.gemini_file_search_store_names.clone(),
         file_name,
     )?;
+    let responses_builtin_tools = capability_string_array(
+        object,
+        &["responses_builtin_tools", "responsesBuiltinTools"],
+        defaults.responses_builtin_tools.clone(),
+        file_name,
+    )?;
+    let kimi_formula_tools = capability_string_array(
+        object,
+        &["kimi_formula_tools", "kimiFormulaTools"],
+        defaults.kimi_formula_tools.clone(),
+        file_name,
+    )?;
+    for formula in &kimi_formula_tools {
+        if !is_supported_kimi_formula(formula) {
+            return Err(format!(
+                "Provider profile '{file_name}' capability 'kimi_formula_tools' contains unsupported formula '{formula}'"
+            ));
+        }
+    }
+    if !kimi_formula_tools.is_empty() && chat_dialect != OpenAiChatDialect::Kimi {
+        return Err(format!(
+            "Provider profile '{file_name}' configures kimi_formula_tools but is not a Kimi profile"
+        ));
+    }
 
     Ok(OpenAiCapabilities {
+        chat_dialect,
         stream_options: capability_bool(
             object,
             &["stream_options", "streamOptions"],
@@ -1045,12 +1226,36 @@ fn parse_openai_capabilities_with_defaults(
         sampling_parameters: capability_bool(
             object,
             &["sampling_parameters", "samplingParameters"],
-            defaults.sampling_parameters,
+            if chat_dialect == OpenAiChatDialect::Kimi {
+                false
+            } else {
+                defaults.sampling_parameters
+            },
             file_name,
         )?,
         tool_result_media,
         tool_schema,
         max_tokens_field,
+        responses_stateful: capability_bool(
+            object,
+            &["responses_stateful", "responsesStateful"],
+            defaults.responses_stateful,
+            file_name,
+        )?,
+        responses_session_cache: capability_bool(
+            object,
+            &["responses_session_cache", "responsesSessionCache"],
+            defaults.responses_session_cache,
+            file_name,
+        )?,
+        responses_builtin_tools,
+        responses_apply_patch_custom: capability_bool(
+            object,
+            &["responses_apply_patch_custom", "responsesApplyPatchCustom"],
+            defaults.responses_apply_patch_custom,
+            file_name,
+        )?,
+        kimi_formula_tools,
         gemini_builtin_tools,
         gemini_file_search_store_names,
     })
@@ -1058,6 +1263,7 @@ fn parse_openai_capabilities_with_defaults(
 
 fn openai_capabilities_json(capabilities: &OpenAiCapabilities) -> Value {
     json!({
+        "chat_dialect": capabilities.chat_dialect.as_str(),
         "stream_options": capabilities.stream_options,
         "parallel_tool_calls": capabilities.parallel_tool_calls,
         "reasoning_effort": capabilities.reasoning_effort,
@@ -1069,6 +1275,11 @@ fn openai_capabilities_json(capabilities: &OpenAiCapabilities) -> Value {
         "tool_result_media": capabilities.tool_result_media.as_str(),
         "tool_schema": capabilities.tool_schema.as_str(),
         "max_tokens_field": capabilities.max_tokens_field.as_str(),
+        "responses_stateful": capabilities.responses_stateful,
+        "responses_session_cache": capabilities.responses_session_cache,
+        "responses_builtin_tools": capabilities.responses_builtin_tools,
+        "responses_apply_patch_custom": capabilities.responses_apply_patch_custom,
+        "kimi_formula_tools": capabilities.kimi_formula_tools,
         "gemini_builtin_tools": capabilities.gemini_builtin_tools,
         "gemini_file_search_store_names": capabilities.gemini_file_search_store_names
     })
@@ -1116,6 +1327,7 @@ fn load_native_provider_profiles(
 
         let model = profile_string(object, &["model"])
             .ok_or_else(|| format!("Provider profile '{file_name}' has no model"))?;
+        let context_window = profile_u64(object, &["context_window", "contextWindow"], &file_name)?;
         let display_name = profile_string(object, &["name"]).unwrap_or_else(|| model.clone());
         let base_url = profile_string(object, &["base_url", "baseURL"])
             .ok_or_else(|| format!("Provider profile '{file_name}' has no base_url"))?;
@@ -1124,21 +1336,24 @@ fn load_native_provider_profiles(
             .to_ascii_lowercase();
         let transport = match protocol.as_str() {
             "openai" | "openai-chat" | "chat-completions" => ProviderTransport::OpenAiChat,
+            "openai-responses" | "responses" => ProviderTransport::OpenAiResponses,
             "anthropic" | "messages" => ProviderTransport::Anthropic,
             "gemini" | "local-gemini" => ProviderTransport::LocalGemini,
             "gemini-interactions" | "interactions" => ProviderTransport::GeminiInteractions,
             other => {
                 return Err(format!(
-                    "Provider profile '{file_name}' has unsupported protocol '{other}' (expected openai, anthropic, gemini-interactions, or gemini)"
+                    "Provider profile '{file_name}' has unsupported protocol '{other}' (expected openai, openai-responses, anthropic, gemini-interactions, or gemini)"
                 ))
             }
         };
         let capability_defaults = match transport {
             ProviderTransport::LocalGemini => OpenAiCapabilities::local_gemini(),
             ProviderTransport::GeminiInteractions => OpenAiCapabilities::gemini_interactions(),
-            ProviderTransport::Anthropic | ProviderTransport::OpenAiChat => {
-                OpenAiCapabilities::default()
+            ProviderTransport::OpenAiChat => OpenAiCapabilities::for_openai_base_url(&base_url),
+            ProviderTransport::OpenAiResponses => {
+                OpenAiCapabilities::for_responses_base_url(&base_url)
             }
+            ProviderTransport::Anthropic => OpenAiCapabilities::for_openai_base_url(&base_url),
         };
         let openai_capabilities =
             parse_openai_capabilities_with_defaults(object, &file_name, capability_defaults)?;
@@ -1153,6 +1368,7 @@ fn load_native_provider_profiles(
         let upstream_url =
             profile_string(object, &["endpoint"]).unwrap_or_else(|| match transport {
                 ProviderTransport::OpenAiChat => openai_compatible_chat_endpoint(&base_url),
+                ProviderTransport::OpenAiResponses => openai_responses_endpoint(&base_url),
                 ProviderTransport::Anthropic => anthropic_messages_endpoint(&base_url),
                 ProviderTransport::GeminiInteractions => gemini_interactions_endpoint(&base_url),
                 ProviderTransport::LocalGemini => base_url.clone(),
@@ -1178,6 +1394,27 @@ fn load_native_provider_profiles(
         let proxy_url = profile_string(object, &["proxy", "proxy_url"]);
         let client = build_provider_client(&file_name, proxy_url.as_deref())?;
         let upstream_identity = profile_string(object, &["identity"]);
+        let auth_scheme =
+            profile_string(object, &["auth_scheme", "authScheme"]).unwrap_or_else(|| {
+                if matches!(
+                    transport,
+                    ProviderTransport::OpenAiChat | ProviderTransport::OpenAiResponses
+                ) {
+                    "bearer".to_string()
+                } else {
+                    "x-api-key".to_string()
+                }
+            });
+        if !matches!(auth_scheme.as_str(), "bearer" | "x-api-key") {
+            return Err(format!(
+                "Provider profile '{file_name}' field 'auth_scheme' must be bearer or x-api-key"
+            ));
+        }
+        if transport == ProviderTransport::GeminiInteractions && auth_scheme != "x-api-key" {
+            return Err(format!(
+                "Provider profile '{file_name}' uses Gemini Interactions and cannot override auth_scheme"
+            ));
+        }
         let identity_override = object
             .get("identity_override")
             .and_then(Value::as_bool)
@@ -1187,18 +1424,16 @@ fn load_native_provider_profiles(
             display_name,
             source: ProviderProfileSource::Native,
             model,
+            context_window,
             upstream_identity,
             identity_override,
             base_url,
-            auth_token: if transport == ProviderTransport::OpenAiChat {
+            auth_token: if auth_scheme == "bearer" {
                 api_key.clone()
             } else {
                 None
             },
-            api_key: if matches!(
-                transport,
-                ProviderTransport::Anthropic | ProviderTransport::GeminiInteractions
-            ) {
+            api_key: if auth_scheme == "x-api-key" {
                 api_key
             } else {
                 None
@@ -1285,11 +1520,20 @@ fn load_legacy_provider_profile(
     )
     .map_err(|err| format!("Invalid transport in profile '{file_name}': {err}"))?;
 
+    let openai_capabilities = if local_gemini {
+        OpenAiCapabilities::local_gemini()
+    } else if transport == ProviderTransport::OpenAiChat {
+        OpenAiCapabilities::for_openai_base_url(&base_url)
+    } else {
+        OpenAiCapabilities::default()
+    };
+
     Ok(ProviderProfile {
         display_name: file_name.trim_end_matches(".json").to_string(),
         source: ProviderProfileSource::Legacy,
         file_name,
         model,
+        context_window: None,
         upstream_identity,
         identity_override,
         base_url,
@@ -1298,11 +1542,7 @@ fn load_legacy_provider_profile(
         proxy_url,
         local_gemini,
         transport,
-        openai_capabilities: if local_gemini {
-            OpenAiCapabilities::local_gemini()
-        } else {
-            OpenAiCapabilities::default()
-        },
+        openai_capabilities,
         vision: VisionConfig::default(),
         upstream_url,
         client,
@@ -1353,6 +1593,12 @@ fn resolve_provider_transport(
                 .map(str::to_owned)
                 .unwrap_or_else(|| openai_chat_endpoint(base_url)),
         )),
+        "openai-responses" | "responses" => Ok((
+            ProviderTransport::OpenAiResponses,
+            configured_upstream_url
+                .map(str::to_owned)
+                .unwrap_or_else(|| openai_responses_endpoint(base_url)),
+        )),
         "gemini-interactions" | "interactions" => Ok((
             ProviderTransport::GeminiInteractions,
             configured_upstream_url
@@ -1360,7 +1606,7 @@ fn resolve_provider_transport(
                 .unwrap_or_else(|| gemini_interactions_endpoint(base_url)),
         )),
         other => Err(format!(
-            "unsupported CLAUDE_BRIDGE_TRANSPORT '{other}' (expected auto, anthropic, gemini-interactions, or openai-chat)"
+            "unsupported CLAUDE_BRIDGE_TRANSPORT '{other}' (expected auto, anthropic, gemini-interactions, openai-chat, or openai-responses)"
         )),
     }
 }
@@ -1391,6 +1637,17 @@ fn openai_chat_endpoint(base_url: &str) -> String {
         format!("{base_url}/chat/completions")
     } else {
         format!("{base_url}/v1/chat/completions")
+    }
+}
+
+fn openai_responses_endpoint(base_url: &str) -> String {
+    let base_url = base_url.trim().trim_end_matches('/');
+    if base_url.ends_with("/responses") {
+        base_url.to_string()
+    } else if base_url.ends_with("/v1") || base_url.ends_with("/compatible-mode/v1") {
+        format!("{base_url}/responses")
+    } else {
+        format!("{base_url}/v1/responses")
     }
 }
 
@@ -1767,6 +2024,160 @@ fn mcp_tool_result(text: impl Into<String>, is_error: bool) -> Value {
     })
 }
 
+#[derive(Clone)]
+struct KimiFormulaTool {
+    formula: String,
+    name: String,
+    mcp_definition: Value,
+}
+
+fn kimi_formula_url(
+    profile: &ProviderProfile,
+    formula: &str,
+    operation: &str,
+) -> Result<String, String> {
+    if !is_supported_kimi_formula(formula) {
+        return Err(format!("Unsupported Kimi formula '{formula}'"));
+    }
+    let mut url = url::Url::parse(&profile.base_url)
+        .map_err(|error| format!("Invalid Kimi base_url '{}': {error}", profile.base_url))?;
+    url.set_path(&format!("/v1/formulas/{formula}/{operation}"));
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string())
+}
+
+fn kimi_profile_credential(profile: &ProviderProfile) -> Result<&str, String> {
+    profile
+        .auth_token
+        .as_deref()
+        .or(profile.api_key.as_deref())
+        .ok_or_else(|| format!("Kimi profile '{}' has no credential", profile.file_name))
+}
+
+async fn configured_kimi_formula_tools(state: &AppState) -> Result<Vec<KimiFormulaTool>, String> {
+    let profile = active_provider_profile(state)
+        .filter(is_kimi_profile)
+        .ok_or_else(|| "The active provider is not Kimi".to_string())?;
+    if profile.openai_capabilities.kimi_formula_tools.is_empty() {
+        return Ok(Vec::new());
+    }
+    let credential = kimi_profile_credential(&profile)?;
+    let mut configured = Vec::new();
+    let mut names = HashSet::new();
+    for formula in &profile.openai_capabilities.kimi_formula_tools {
+        let url = kimi_formula_url(&profile, formula, "tools")?;
+        let response = profile
+            .client
+            .get(url)
+            .bearer_auth(credential)
+            .send()
+            .await
+            .map_err(|error| format!("Cannot load Kimi formula '{formula}': {error}"))?;
+        let status = response.status();
+        let body = read_response_json_limited(response)
+            .await
+            .map_err(|error| format!("Cannot read Kimi formula '{formula}': {error}"))?;
+        if !status.is_success() {
+            return Err(format!(
+                "Kimi formula '{formula}' returned HTTP {status}: {}",
+                safe_error_message(&body)
+            ));
+        }
+        let tools = body
+            .get("tools")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("Kimi formula '{formula}' returned no tools array"))?;
+        for tool in tools {
+            if tool.get("type").and_then(Value::as_str) != Some("function") {
+                continue;
+            }
+            let function = tool
+                .get("function")
+                .and_then(Value::as_object)
+                .ok_or_else(|| format!("Kimi formula '{formula}' returned an invalid function"))?;
+            let name = function
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| format!("Kimi formula '{formula}' returned an unnamed function"))?;
+            if name == "generate_image" || !names.insert(name.to_string()) {
+                return Err(format!(
+                    "Kimi formula tool name '{name}' conflicts with another MCP tool"
+                ));
+            }
+            configured.push(KimiFormulaTool {
+                formula: formula.clone(),
+                name: name.to_string(),
+                mcp_definition: json!({
+                    "name": name,
+                    "title": format!("Kimi Formula: {name}"),
+                    "description": function.get("description").cloned().unwrap_or_else(|| json!(format!("Kimi official formula tool {name}"))),
+                    "inputSchema": function.get("parameters").cloned().unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+                    "annotations": {
+                        "readOnlyHint": false,
+                        "destructiveHint": false,
+                        "idempotentHint": false,
+                        "openWorldHint": true
+                    }
+                }),
+            });
+        }
+    }
+    Ok(configured)
+}
+
+async fn execute_kimi_formula(
+    state: &AppState,
+    name: &str,
+    arguments: Option<&Value>,
+) -> Result<Value, String> {
+    let profile = active_provider_profile(state)
+        .filter(is_kimi_profile)
+        .ok_or_else(|| "The active provider is not Kimi".to_string())?;
+    let tools = configured_kimi_formula_tools(state).await?;
+    let tool = tools
+        .iter()
+        .find(|tool| tool.name == name)
+        .ok_or_else(|| format!("Unknown or disabled Kimi formula tool '{name}'"))?;
+    let credential = kimi_profile_credential(&profile)?;
+    let url = kimi_formula_url(&profile, &tool.formula, "fibers")?;
+    let arguments = serde_json::to_string(arguments.unwrap_or(&Value::Object(Map::new())))
+        .map_err(|error| format!("Cannot serialize Kimi formula arguments: {error}"))?;
+    let response = profile
+        .client
+        .post(url)
+        .bearer_auth(credential)
+        .json(&json!({"name": name, "arguments": arguments}))
+        .send()
+        .await
+        .map_err(|error| format!("Kimi formula '{name}' failed: {error}"))?;
+    let status = response.status();
+    let body = read_response_json_limited(response)
+        .await
+        .map_err(|error| format!("Cannot read Kimi formula '{name}' response: {error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "Kimi formula '{name}' returned HTTP {status}: {}",
+            safe_error_message(&body)
+        ));
+    }
+    Ok(body)
+}
+
+fn kimi_formula_result_text(body: &Value) -> String {
+    body.pointer("/context/output")
+        .or_else(|| body.pointer("/context/encrypted_output"))
+        .or_else(|| body.get("output"))
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string())
+        })
+        .unwrap_or_else(|| body.to_string())
+}
+
 async fn mcp(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1810,36 +2221,62 @@ async fn mcp(
             )
         }
         "ping" => mcp_json_response(id, json!({})),
-        "tools/list" => mcp_json_response(id, json!({"tools": [image_generation_tool()]})),
+        "tools/list" => {
+            let mut tools = vec![image_generation_tool()];
+            match configured_kimi_formula_tools(&state).await {
+                Ok(formula_tools) => {
+                    tools.extend(formula_tools.into_iter().map(|tool| tool.mcp_definition))
+                }
+                Err(message) if message == "The active provider is not Kimi" => {}
+                Err(message) => warn!(
+                    error = message,
+                    "Cannot expose configured Kimi formula tools"
+                ),
+            }
+            mcp_json_response(id, json!({"tools": tools}))
+        }
         "tools/call" => {
             let name = request.pointer("/params/name").and_then(Value::as_str);
-            if name != Some("generate_image") {
-                return mcp_protocol_error(id, -32602, "Unknown tool");
+            if name == Some("generate_image") {
+                return match generate_image(&state, request.pointer("/params/arguments")).await {
+                    Ok(image) => mcp_json_response(
+                        id,
+                        json!({
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": format!(
+                                        "Image generated with {} and saved to: {}",
+                                        state.image_model,
+                                        image.path.display()
+                                    )
+                                },
+                                {
+                                    "type": "image",
+                                    "data": image.base64_data,
+                                    "mimeType": image.mime_type
+                                }
+                            ],
+                            "structuredContent": {
+                                "path": image.path,
+                                "mime_type": image.mime_type,
+                                "model": state.image_model
+                            },
+                            "isError": false
+                        }),
+                    ),
+                    Err(message) => mcp_json_response(id, mcp_tool_result(message, true)),
+                };
             }
-            match generate_image(&state, request.pointer("/params/arguments")).await {
-                Ok(image) => mcp_json_response(
+            let Some(name) = name else {
+                return mcp_protocol_error(id, -32602, "Tool name is required");
+            };
+            match execute_kimi_formula(&state, name, request.pointer("/params/arguments")).await {
+                Ok(body) => mcp_json_response(
                     id,
                     json!({
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": format!(
-                                    "Image generated with {} and saved to: {}",
-                                    state.image_model,
-                                    image.path.display()
-                                )
-                            },
-                            {
-                                "type": "image",
-                                "data": image.base64_data,
-                                "mimeType": image.mime_type
-                            }
-                        ],
-                        "structuredContent": {
-                            "path": image.path,
-                            "mime_type": image.mime_type,
-                            "model": state.image_model
-                        },
+                        "content": [{"type": "text", "text": kimi_formula_result_text(&body)}],
+                        "structuredContent": body,
                         "isError": false
                     }),
                 ),
@@ -2320,6 +2757,40 @@ fn anthropic_vision_request(source: &ProviderProfile, job: &VisionJob) -> Value 
     })
 }
 
+fn responses_vision_request(source: &ProviderProfile, job: &VisionJob) -> Value {
+    let mut content = vec![json!({
+        "type": "input_text",
+        "text": if job.context.is_empty() {
+            "Extract all relevant visual evidence from the attached media.".to_string()
+        } else {
+            format!("Original user request/context:\n{}", job.context)
+        }
+    })];
+    for media in &job.media {
+        if let Some(translated) = translate_anthropic_media(media) {
+            match translated.get("type").and_then(Value::as_str) {
+                Some("image_url") => content.push(json!({
+                    "type": "input_image",
+                    "image_url": translated.pointer("/image_url/url").cloned().unwrap_or(Value::Null)
+                })),
+                Some("text") => content.push(json!({
+                    "type": "input_text",
+                    "text": translated.get("text").cloned().unwrap_or(Value::Null)
+                })),
+                _ => {}
+            }
+        }
+    }
+    json!({
+        "model": display_model_name(&source.model),
+        "instructions": vision_system_prompt(),
+        "input": [{"role": "user", "content": content}],
+        "max_output_tokens": VISION_MAX_OUTPUT_TOKENS,
+        "stream": false,
+        "store": false
+    })
+}
+
 fn gemini_interactions_vision_request(source: &ProviderProfile, job: &VisionJob) -> Value {
     let mut content = vec![json!({
         "type": "text",
@@ -2358,6 +2829,19 @@ fn parse_vision_observation(transport: ProviderTransport, body: &Value) -> Strin
                     .iter()
                     .filter(|step| step.get("type").and_then(Value::as_str) == Some("model_output"))
                     .map(|step| value_to_text(step.get("content").unwrap_or(&Value::Null)))
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default(),
+        ProviderTransport::OpenAiResponses => body
+            .get("output")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|item| item.get("type").and_then(Value::as_str) == Some("message"))
+                    .map(|item| value_to_text(item.get("content").unwrap_or(&Value::Null)))
                     .filter(|text| !text.is_empty())
                     .collect::<Vec<_>>()
                     .join("\n")
@@ -2470,6 +2954,27 @@ async fn analyze_vision_job(
             )
             .await?
         }
+        ProviderTransport::OpenAiResponses => {
+            let credential = source
+                .auth_token
+                .as_ref()
+                .or(source.api_key.as_ref())
+                .ok_or_else(|| {
+                    VisionProxyError::gateway(format!(
+                        "Vision provider '{}' has no API credential",
+                        source.file_name
+                    ))
+                })?;
+            let mut request = source
+                .client
+                .post(&source.upstream_url)
+                .bearer_auth(credential)
+                .json(&responses_vision_request(source, job));
+            if source.openai_capabilities.responses_session_cache {
+                request = request.header("x-dashscope-session-cache", "enable");
+            }
+            send_vision_request(request, source).await?
+        }
         ProviderTransport::Anthropic => {
             let request = apply_anthropic_forward_headers(
                 source
@@ -2581,6 +3086,7 @@ fn provider_profile_json(profile: &ProviderProfile, active_file: &str) -> Value 
         "name": profile.display_name,
         "source": profile.source.as_str(),
         "model": profile.model,
+        "context_window": profile.context_window,
         "upstream_identity": profile.upstream_identity,
         "identity_override": profile.identity_override,
         "base_url": profile.base_url,
@@ -3024,6 +3530,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
 }
 
 async fn models(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let active_profile = active_provider_profile(&state);
     Json(json!({
         "object": "list",
         "models": [],
@@ -3031,7 +3538,9 @@ async fn models(State(state): State<Arc<AppState>>) -> Json<Value> {
             "id": state.model,
             "object": "model",
             "created": 0,
-            "owned_by": "google"
+            "owned_by": "claude-bridge",
+            "upstream_model": active_profile.as_ref().map(|profile| profile.model.clone()),
+            "context_window": active_profile.as_ref().and_then(|profile| profile.context_window)
         }]
     }))
 }
@@ -3190,12 +3699,31 @@ async fn anthropic_messages(
             return forward_anthropic_profile(active_profile, &headers, request).await;
         }
         ProviderTransport::OpenAiChat => {
-            return forward_openai_profile(
+            let diagnostics = openai_request_diagnostics(
+                &request,
+                &active_profile.openai_capabilities,
+                ProviderTransport::OpenAiChat,
+            );
+            let provider_file = active_profile.file_name.clone();
+            let response =
+                forward_openai_profile(active_profile, request, state.thought_signatures.clone())
+                    .await;
+            return attach_bridge_diagnostics(response, &provider_file, &diagnostics);
+        }
+        ProviderTransport::OpenAiResponses => {
+            let diagnostics = openai_request_diagnostics(
+                &request,
+                &active_profile.openai_capabilities,
+                ProviderTransport::OpenAiResponses,
+            );
+            let provider_file = active_profile.file_name.clone();
+            let response = forward_openai_responses_profile(
                 active_profile,
                 request,
-                state.thought_signatures.clone(),
+                state.interaction_continuations.clone(),
             )
             .await;
+            return attach_bridge_diagnostics(response, &provider_file, &diagnostics);
         }
         ProviderTransport::GeminiInteractions => {
             let diagnostics = gemini_interaction_request_diagnostics(&request);
@@ -4021,13 +4549,154 @@ fn attach_bridge_diagnostics(
     for diagnostic in diagnostics {
         warn!(
             provider = provider_file,
-            diagnostic, "Gemini request compatibility downgrade"
+            diagnostic, "Provider request compatibility downgrade"
         );
         if let Ok(value) = HeaderValue::from_str(diagnostic) {
             response.headers_mut().append(BRIDGE_WARNING_HEADER, value);
         }
     }
     response
+}
+
+fn openai_request_diagnostics(
+    request: &Value,
+    capabilities: &OpenAiCapabilities,
+    transport: ProviderTransport,
+) -> Vec<String> {
+    let mut diagnostics = Vec::new();
+    let mut add = |message: String| {
+        if !diagnostics.iter().any(|existing| existing == &message) {
+            diagnostics.push(message);
+        }
+    };
+    for field in [
+        "metadata",
+        "container",
+        "context_management",
+        "inference_geo",
+        "mcp_servers",
+    ] {
+        if request.get(field).is_some_and(|value| !value.is_null()) {
+            add(format!(
+                "Ignored Anthropic field '{field}': this provider transport has no equivalent mapping"
+            ));
+        }
+    }
+    if json_contains_key(request, "cache_control") {
+        add("Ignored Anthropic cache_control blocks: provider caching is reported when available but cache placement is not controllable through this transport".to_string());
+    }
+    if json_contains_key(request, "citations") {
+        add("Ignored Anthropic citations controls: this transport cannot preserve the Anthropic citation contract".to_string());
+    }
+    for field in [
+        "defer_loading",
+        "input_examples",
+        "allowed_callers",
+        "eager_input_streaming",
+    ] {
+        if json_contains_key(request, field) {
+            add(format!(
+                "Ignored Anthropic extension '{field}' while translating to {}",
+                transport.as_str()
+            ));
+        }
+    }
+    if request.get("top_k").is_some() {
+        add("Ignored Anthropic sampling field 'top_k': this provider transport has no equivalent mapping"
+            .to_string());
+    }
+    if let Some(tier) = request.get("service_tier").and_then(Value::as_str) {
+        add(format!(
+            "Ignored Anthropic service_tier '{tier}': no safe provider-neutral tier mapping is configured"
+        ));
+    }
+    if !capabilities.sampling_parameters {
+        for field in ["temperature", "top_p"] {
+            if request.get(field).is_some() {
+                add(format!(
+                    "Ignored Anthropic sampling field '{field}' for this reasoning profile"
+                ));
+            }
+        }
+    }
+    if capabilities.max_tokens_field == MaxTokensField::Omit && request.get("max_tokens").is_some()
+    {
+        add(
+            "Ignored Anthropic max_tokens because this profile omits provider token limits"
+                .to_string(),
+        );
+    }
+    if transport == ProviderTransport::OpenAiChat {
+        if capabilities.chat_dialect == OpenAiChatDialect::DeepSeek
+            && request.pointer("/thinking/type").and_then(Value::as_str) != Some("disabled")
+            && request.get("tool_choice").is_some()
+        {
+            add(
+                "Suppressed Anthropic tool_choice because DeepSeek thinking mode rejects it"
+                    .to_string(),
+            );
+        }
+        if request
+            .pointer("/output_config/format/type")
+            .and_then(Value::as_str)
+            == Some("json_schema")
+            && capabilities.chat_dialect == OpenAiChatDialect::DeepSeek
+        {
+            add("Downgraded Anthropic json_schema output to DeepSeek Chat JSON object mode; schema enforcement is unavailable"
+                .to_string());
+        }
+        if capabilities.chat_dialect == OpenAiChatDialect::Kimi {
+            if request.pointer("/thinking/type").and_then(Value::as_str) == Some("disabled") {
+                add(
+                    "Kimi K3 always reasons; Anthropic thinking.type=disabled was ignored"
+                        .to_string(),
+                );
+            }
+            if let Some(effort) = request
+                .pointer("/output_config/effort")
+                .and_then(Value::as_str)
+                .filter(|effort| !matches!(*effort, "low" | "high" | "max"))
+            {
+                add(format!(
+                    "Mapped Anthropic output_config.effort '{effort}' to Kimi K3 reasoning_effort '{}'",
+                    kimi_reasoning_effort(effort)
+                ));
+            }
+        }
+        if request.get("output_config").is_some()
+            && capabilities.chat_dialect == OpenAiChatDialect::Generic
+        {
+            add(
+                "Ignored Anthropic output_config fields not supported by the generic Chat profile"
+                    .to_string(),
+            );
+        }
+    } else if transport == ProviderTransport::OpenAiResponses {
+        if request
+            .pointer("/tool_choice/disable_parallel_tool_use")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            add("Ignored Anthropic disable_parallel_tool_use: this Responses profile has no equivalent control"
+                .to_string());
+        }
+        if request.pointer("/thinking/budget_tokens").is_some()
+            && request.pointer("/output_config/effort").is_none()
+        {
+            add("Anthropic thinking budget has no exact Responses equivalent; configure output_config.effort for deterministic reasoning control"
+                .to_string());
+        }
+        if !capabilities.responses_stateful
+            && request
+                .get("messages")
+                .and_then(Value::as_array)
+                .is_some_and(|messages| messages.len() > 1)
+        {
+            add("Responses profile is stateless; full validated conversation history is replayed instead of previous_response_id"
+                .to_string());
+        }
+    }
+    diagnostics
 }
 
 fn interaction_continuation_for_request(
@@ -4368,6 +5037,7 @@ fn interaction_server_tool_summary(step: &Value) -> Value {
         "call_id",
         "name",
         "server_name",
+        "status",
         "is_error",
         "search_type",
     ] {
@@ -4375,7 +5045,7 @@ fn interaction_server_tool_summary(step: &Value) -> Value {
             summary.insert(field.to_string(), value.clone());
         }
     }
-    for field in ["arguments", "result"] {
+    for field in ["arguments", "action", "result", "results"] {
         if let Some(value) = step.get(field) {
             summary.insert(field.to_string(), bounded_interaction_trace_value(value));
         }
@@ -4763,6 +5433,1314 @@ async fn forward_openai_profile(
         }
     };
     Json(message).into_response()
+}
+
+fn responses_input_from_anthropic(
+    messages: &[Value],
+    custom_apply_patch: bool,
+    known_tool_names: &HashMap<String, String>,
+) -> Vec<Value> {
+    let mut input = Vec::new();
+    let mut tool_names = known_tool_names.clone();
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
+        let content = message.get("content").unwrap_or(&Value::Null);
+        if let Some(text) = content.as_str() {
+            if !text.is_empty() {
+                input.push(json!({"role": role, "content": text}));
+            }
+            continue;
+        }
+        let Some(parts) = content.as_array() else {
+            continue;
+        };
+        let mut message_parts = Vec::new();
+        for part in parts {
+            match part.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    if let Some(text) = part.get("text").and_then(Value::as_str) {
+                        let kind = if role == "assistant" {
+                            "output_text"
+                        } else {
+                            "input_text"
+                        };
+                        message_parts.push(json!({"type": kind, "text": text}));
+                    }
+                }
+                Some("thinking") => {
+                    flush_responses_message_parts(&mut input, role, &mut message_parts);
+                    let thinking = part
+                        .get("thinking")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if !thinking.is_empty() {
+                        input.push(json!({
+                            "type": "reasoning",
+                            "content": [{"type": "reasoning_text", "text": thinking}]
+                        }));
+                    }
+                }
+                Some("tool_use") => {
+                    flush_responses_message_parts(&mut input, role, &mut message_parts);
+                    let call_id = part
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("toolu_unknown");
+                    let name = part
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown_function");
+                    tool_names.insert(call_id.to_string(), name.to_string());
+                    let arguments = part
+                        .get("input")
+                        .map(Value::to_string)
+                        .unwrap_or_else(|| "{}".to_string());
+                    if custom_apply_patch && name == "apply_patch" {
+                        let custom_input = part
+                            .pointer("/input/patch")
+                            .or_else(|| part.pointer("/input/input"))
+                            .and_then(Value::as_str)
+                            .unwrap_or(&arguments);
+                        input.push(json!({
+                            "type": "custom_tool_call",
+                            "call_id": call_id,
+                            "name": name,
+                            "input": custom_input
+                        }));
+                    } else {
+                        input.push(json!({
+                            "type": "function_call",
+                            "call_id": call_id,
+                            "name": name,
+                            "arguments": arguments
+                        }));
+                    }
+                }
+                Some("tool_result") => {
+                    flush_responses_message_parts(&mut input, role, &mut message_parts);
+                    let call_id = part
+                        .get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("toolu_unknown");
+                    if !tool_names.contains_key(call_id) {
+                        warn!(
+                            tool_call_id = %call_id,
+                            "Skipping orphan Anthropic tool result while translating to Responses"
+                        );
+                        continue;
+                    }
+                    let output = value_to_text(part.get("content").unwrap_or(&Value::Null));
+                    let item_type = if custom_apply_patch
+                        && tool_names.get(call_id).map(String::as_str) == Some("apply_patch")
+                    {
+                        "custom_tool_call_output"
+                    } else {
+                        "function_call_output"
+                    };
+                    input.push(json!({"type": item_type, "call_id": call_id, "output": output}));
+                }
+                _ => {}
+            }
+        }
+        flush_responses_message_parts(&mut input, role, &mut message_parts);
+    }
+    input
+}
+
+fn flush_responses_message_parts(input: &mut Vec<Value>, role: &str, parts: &mut Vec<Value>) {
+    if !parts.is_empty() {
+        input.push(json!({
+            "role": role,
+            "content": Value::Array(std::mem::take(parts))
+        }));
+    }
+}
+
+fn responses_tools_from_anthropic(
+    request: &Value,
+    capabilities: &OpenAiCapabilities,
+) -> Vec<Value> {
+    let mut tools = Vec::new();
+    if let Some(source) = request.get("tools").and_then(Value::as_array) {
+        for tool in source {
+            let Some(name) = tool.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            if capabilities.responses_apply_patch_custom && name == "apply_patch" {
+                let mut translated = json!({"type": "custom", "name": name});
+                if let Some(description) = tool.get("description") {
+                    translated["description"] = description.clone();
+                }
+                tools.push(translated);
+                continue;
+            }
+            let mut schema = tool
+                .get("input_schema")
+                .cloned()
+                .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+            if capabilities.tool_schema == ToolSchemaMode::Sanitize {
+                sanitize_json_schema(&mut schema);
+            }
+            let mut translated = json!({
+                "type": "function",
+                "name": name,
+                "parameters": schema
+            });
+            if let Some(description) = tool.get("description") {
+                translated["description"] = description.clone();
+            }
+            tools.push(translated);
+        }
+    }
+    tools.extend(
+        capabilities
+            .responses_builtin_tools
+            .iter()
+            .map(|kind| json!({"type": kind})),
+    );
+    tools
+}
+
+fn responses_output_format(request: &Value) -> Result<Option<Value>, String> {
+    let Some(format) = request
+        .pointer("/output_config/format")
+        .or_else(|| request.get("output_format"))
+        .filter(|format| !format.is_null())
+    else {
+        return Ok(None);
+    };
+    match format.get("type").and_then(Value::as_str) {
+        Some("text") => Ok(None),
+        Some("json_object") => Ok(Some(json!({"type": "json_object"}))),
+        Some("json_schema") => {
+            let schema = format.get("schema").cloned().ok_or_else(|| {
+                "Anthropic json_schema output format is missing 'schema'".to_string()
+            })?;
+            let mut translated = json!({
+                "type": "json_schema",
+                "name": format.get("name").and_then(Value::as_str).unwrap_or("response"),
+                "schema": schema
+            });
+            if let Some(strict) = format.get("strict").and_then(Value::as_bool) {
+                translated["strict"] = Value::Bool(strict);
+            }
+            Ok(Some(translated))
+        }
+        Some(other) => Err(format!("Unsupported Responses output format '{other}'")),
+        None => Err("Anthropic output format must have a string 'type'".to_string()),
+    }
+}
+
+fn translate_anthropic_to_responses(
+    request: &Value,
+    profile: &ProviderProfile,
+    continuations: &InteractionContinuationState,
+) -> Result<Value, String> {
+    let messages = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Missing required array field 'messages'".to_string())?;
+    if messages.is_empty() {
+        return Err("Responses requires at least one message".to_string());
+    }
+    let continuation = profile
+        .openai_capabilities
+        .responses_stateful
+        .then(|| {
+            interaction_continuation_for_request(
+                &profile.file_name,
+                request,
+                messages,
+                continuations,
+            )
+        })
+        .flatten();
+    let (source_messages, names) = if let Some((_, names, _)) = &continuation {
+        (&messages[messages.len() - 1..], names.clone())
+    } else {
+        (&messages[..], HashMap::new())
+    };
+    let input = responses_input_from_anthropic(
+        source_messages,
+        profile.openai_capabilities.responses_apply_patch_custom,
+        &names,
+    );
+    if input.is_empty() {
+        return Err("Responses request produced no supported input items".to_string());
+    }
+
+    let mut body = Map::new();
+    body.insert(
+        "model".to_string(),
+        json!(display_model_name(&profile.model)),
+    );
+    body.insert("input".to_string(), Value::Array(input));
+    body.insert(
+        "stream".to_string(),
+        json!(request
+            .get("stream")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)),
+    );
+    body.insert(
+        "store".to_string(),
+        Value::Bool(profile.openai_capabilities.responses_stateful),
+    );
+    if let Some((id, _, continuation_kind)) = continuation {
+        info!(
+            provider = %profile.file_name,
+            continuation = continuation_kind,
+            "Continuing stored Responses request"
+        );
+        body.insert("previous_response_id".to_string(), json!(id));
+    } else {
+        let instructions = value_to_text(request.get("system").unwrap_or(&Value::Null));
+        if !instructions.is_empty() {
+            body.insert("instructions".to_string(), json!(instructions));
+        }
+    }
+    if let Some(max_tokens) = request.get("max_tokens").and_then(Value::as_u64) {
+        body.insert("max_output_tokens".to_string(), json!(max_tokens));
+    }
+    if let Some(stop) = request.get("stop_sequences").and_then(Value::as_array) {
+        if !stop.is_empty() {
+            body.insert("stop".to_string(), Value::Array(stop.clone()));
+        }
+    }
+    if profile.openai_capabilities.sampling_parameters {
+        if let Some(temperature) = request.get("temperature").and_then(Value::as_f64) {
+            body.insert("temperature".to_string(), json!(temperature));
+        }
+        if let Some(top_p) = request.get("top_p").and_then(Value::as_f64) {
+            body.insert("top_p".to_string(), json!(top_p));
+        }
+    }
+    if request.pointer("/thinking/type").and_then(Value::as_str) != Some("disabled") {
+        let effort = request
+            .pointer("/output_config/effort")
+            .and_then(Value::as_str)
+            .map(|effort| match profile.openai_capabilities.chat_dialect {
+                OpenAiChatDialect::DeepSeek => deepseek_reasoning_effort(effort),
+                _ => effort,
+            })
+            .or({
+                profile
+                    .openai_capabilities
+                    .default_reasoning_effort
+                    .as_deref()
+            });
+        if let Some(effort) = effort {
+            body.insert("reasoning".to_string(), json!({"effort": effort}));
+        }
+    }
+    let tools = responses_tools_from_anthropic(request, &profile.openai_capabilities);
+    if !tools.is_empty() {
+        body.insert("tools".to_string(), Value::Array(tools));
+    }
+    if let Some(choice) = request.get("tool_choice") {
+        if let Some(choice) = translate_responses_tool_choice(choice) {
+            body.insert("tool_choice".to_string(), choice);
+        }
+    }
+    if let Some(format) = responses_output_format(request)? {
+        body.insert("text".to_string(), json!({"format": format}));
+    }
+    Ok(Value::Object(body))
+}
+
+fn translate_responses_tool_choice(choice: &Value) -> Option<Value> {
+    match choice.get("type").and_then(Value::as_str)? {
+        "auto" => Some(json!("auto")),
+        "any" => Some(json!("required")),
+        "none" => Some(json!("none")),
+        "tool" => choice
+            .get("name")
+            .and_then(Value::as_str)
+            .map(|name| json!({"type": "function", "name": name})),
+        _ => None,
+    }
+}
+
+fn openai_usage_to_anthropic(usage: &Value, estimated_input_tokens: u64) -> Value {
+    let input_tokens = usage_token(
+        usage,
+        &["input_tokens", "prompt_tokens", "total_input_tokens"],
+    )
+    .unwrap_or(estimated_input_tokens);
+    let output_tokens = usage_token(
+        usage,
+        &["output_tokens", "completion_tokens", "total_output_tokens"],
+    )
+    .unwrap_or(0);
+    let cache_read = usage
+        .pointer("/input_tokens_details/cached_tokens")
+        .or_else(|| usage.pointer("/prompt_tokens_details/cached_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(Value::as_u64))
+        .or_else(|| usage.get("cached_tokens").and_then(Value::as_u64));
+    let cache_creation = usage
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64);
+    let reasoning_tokens = usage
+        .pointer("/output_tokens_details/reasoning_tokens")
+        .or_else(|| usage.pointer("/completion_tokens_details/reasoning_tokens"))
+        .and_then(Value::as_u64);
+    let mut translated = json!({
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens
+    });
+    if let Some(value) = cache_read {
+        translated["cache_read_input_tokens"] = json!(value);
+    }
+    if let Some(value) = cache_creation {
+        translated["cache_creation_input_tokens"] = json!(value);
+    }
+    if let Some(value) = reasoning_tokens {
+        translated["reasoning_tokens"] = json!(value);
+    }
+    translated
+}
+
+fn is_responses_server_tool_item(item_type: &str) -> bool {
+    item_type.ends_with("_call") && !matches!(item_type, "function_call" | "custom_tool_call")
+}
+
+fn responses_server_tool_metadata(items: &[Value]) -> Option<Value> {
+    let captured: Vec<Value> = items
+        .iter()
+        .filter(|item| {
+            item.get("type")
+                .and_then(Value::as_str)
+                .is_some_and(is_responses_server_tool_item)
+        })
+        .map(interaction_server_tool_summary)
+        .collect();
+    (!captured.is_empty()).then(|| json!({"openai": {"responses_server_tools": captured}}))
+}
+
+fn responses_server_tool_usage(items: &[Value]) -> Option<Value> {
+    let mut web_search_requests = 0_u64;
+    let mut web_fetch_requests = 0_u64;
+    for item_type in items
+        .iter()
+        .filter_map(|item| item.get("type").and_then(Value::as_str))
+    {
+        if item_type.starts_with("web_search") {
+            web_search_requests = web_search_requests.saturating_add(1);
+        } else if item_type.starts_with("web_fetch") || item_type.starts_with("url_context") {
+            web_fetch_requests = web_fetch_requests.saturating_add(1);
+        }
+    }
+    (web_search_requests > 0 || web_fetch_requests > 0).then(|| {
+        json!({
+            "web_search_requests": web_search_requests,
+            "web_fetch_requests": web_fetch_requests
+        })
+    })
+}
+
+fn translate_openai_responses_response(
+    upstream: &Value,
+    model: &str,
+    estimated_input_tokens: u64,
+) -> Result<InteractionResponseTranslation, String> {
+    let response_id = upstream
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "Responses payload has no id: {}",
+                safe_error_message(upstream)
+            )
+        })?
+        .to_string();
+    let status = upstream
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
+    if matches!(status, "failed" | "cancelled") {
+        return Err(safe_error_message(upstream));
+    }
+    let output = upstream
+        .get("output")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Responses payload has no output array".to_string())?;
+    let mut content = Vec::new();
+    let mut calls = Vec::new();
+    for item in output {
+        match item.get("type").and_then(Value::as_str) {
+            Some("reasoning") => {
+                let reasoning = item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .chain(
+                        item.get("summary")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten(),
+                    )
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !reasoning.is_empty() {
+                    content.push(json!({"type": "thinking", "thinking": reasoning}));
+                }
+            }
+            Some("message") => {
+                if let Some(parts) = item.get("content").and_then(Value::as_array) {
+                    for part in parts {
+                        match part.get("type").and_then(Value::as_str) {
+                            Some("output_text") => {
+                                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                                    if !text.is_empty() {
+                                        content.push(json!({"type": "text", "text": text}));
+                                    }
+                                }
+                            }
+                            Some("refusal") => {
+                                if let Some(text) = part
+                                    .get("refusal")
+                                    .or_else(|| part.get("text"))
+                                    .and_then(Value::as_str)
+                                {
+                                    content.push(json!({"type": "text", "text": text}));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Some("function_call") => {
+                let id = item
+                    .get("call_id")
+                    .or_else(|| item.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("toolu_unknown")
+                    .to_string();
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown_function")
+                    .to_string();
+                let arguments = item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or("{}");
+                let parsed = parse_tool_arguments(arguments)?;
+                calls.push((id.clone(), name.clone()));
+                content.push(json!({"type": "tool_use", "id": id, "name": name, "input": parsed}));
+            }
+            Some("custom_tool_call") => {
+                let id = item
+                    .get("call_id")
+                    .or_else(|| item.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("toolu_unknown")
+                    .to_string();
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("apply_patch")
+                    .to_string();
+                let custom_input = item
+                    .get("input")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                calls.push((id.clone(), name.clone()));
+                content.push(json!({
+                    "type": "tool_use",
+                    "id": id,
+                    "name": name,
+                    "input": {"patch": custom_input}
+                }));
+            }
+            Some(item_type) if is_responses_server_tool_item(item_type) => {
+                info!(item_type, "Responses server-side tool item completed");
+            }
+            _ => {}
+        }
+    }
+    let stop_reason = if !calls.is_empty() {
+        "tool_use"
+    } else if status == "incomplete" {
+        "max_tokens"
+    } else {
+        "end_turn"
+    };
+    let mut message = json!({
+        "id": format!("msg_{}", Uuid::new_v4().simple()),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content,
+        "stop_reason": stop_reason,
+        "stop_sequence": Value::Null,
+        "usage": openai_usage_to_anthropic(
+            upstream.get("usage").unwrap_or(&Value::Null),
+            estimated_input_tokens
+        )
+    });
+    if let Some(metadata) = responses_server_tool_metadata(output) {
+        message["provider_metadata"] = metadata;
+    }
+    if let Some(server_tool_use) = responses_server_tool_usage(output) {
+        message["usage"]["server_tool_use"] = server_tool_use;
+    }
+    Ok(InteractionResponseTranslation {
+        message,
+        interaction_id: response_id,
+        assistant_content: content,
+        calls,
+    })
+}
+
+async fn forward_openai_responses_profile(
+    profile: ProviderProfile,
+    request: Value,
+    continuations: Arc<InteractionContinuationState>,
+) -> Response {
+    let responses_request =
+        match translate_anthropic_to_responses(&request, &profile, &continuations) {
+            Ok(value) => value,
+            Err(message) => {
+                return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message)
+            }
+        };
+    let stream_requested = request
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let estimated_input_tokens =
+        u64::try_from(estimate_anthropic_input_tokens(&request)).unwrap_or(u64::MAX);
+    let Some(credential) = profile.auth_token.as_ref().or(profile.api_key.as_ref()) else {
+        return anthropic_error(
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "The active Responses profile has no API credential",
+        );
+    };
+    let mut upstream_request = profile
+        .client
+        .post(&profile.upstream_url)
+        .bearer_auth(credential)
+        .json(&responses_request);
+    if profile.openai_capabilities.responses_session_cache {
+        upstream_request = upstream_request.header("x-dashscope-session-cache", "enable");
+    }
+    let upstream = match upstream_request.send().await {
+        Ok(response) => response,
+        Err(err) => {
+            error!(
+                "Provider '{}' Responses request to '{}' failed: {err}",
+                profile.file_name, profile.upstream_url
+            );
+            return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", &err.to_string());
+        }
+    };
+    let status = upstream.status();
+    if !status.is_success() {
+        let response_text = match read_response_text_limited(upstream).await {
+            Ok(text) => text,
+            Err(err) => format!("Cannot read provider error response: {err}"),
+        };
+        let message = serde_json::from_str::<Value>(&response_text)
+            .ok()
+            .map(|value| safe_error_message(&value))
+            .unwrap_or(response_text);
+        let response_status =
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let (response_status, error_type) = openai_error_contract(response_status, &message);
+        return anthropic_error(response_status, error_type, &message);
+    }
+    let model = display_model_name(&profile.model);
+    if stream_requested {
+        return openai_responses_stream_response(
+            upstream,
+            model,
+            profile.file_name,
+            request,
+            continuations,
+            estimated_input_tokens,
+        );
+    }
+    let upstream_body = match read_response_json_limited(upstream).await {
+        Ok(value) => value,
+        Err(err) => {
+            return anthropic_error(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                &format!("Responses provider returned invalid JSON: {err}"),
+            )
+        }
+    };
+    let translated =
+        match translate_openai_responses_response(&upstream_body, &model, estimated_input_tokens) {
+            Ok(value) => value,
+            Err(message) => return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", &message),
+        };
+    if profile.openai_capabilities.responses_stateful {
+        remember_interaction_continuation(
+            &continuations,
+            &profile.file_name,
+            &request,
+            &translated.interaction_id,
+            &translated.assistant_content,
+            &translated.calls,
+        );
+    }
+    Json(translated.message).into_response()
+}
+
+enum ResponsesStreamingBlock {
+    Thinking(String),
+    Text(String),
+    Tool {
+        id: String,
+        name: String,
+        arguments: String,
+        custom: bool,
+    },
+}
+
+struct ActiveResponsesStreamingBlock {
+    anthropic_index: usize,
+    block: ResponsesStreamingBlock,
+}
+
+struct OpenAiResponsesStreamTranslator {
+    message_id: String,
+    model: String,
+    profile_file: String,
+    request: Value,
+    continuations: Arc<InteractionContinuationState>,
+    response_id: Option<String>,
+    status: Option<String>,
+    usage: Value,
+    estimated_input_tokens: u64,
+    next_content_index: usize,
+    active_blocks: IndexMap<usize, ActiveResponsesStreamingBlock>,
+    assistant_content: Vec<Value>,
+    calls: Vec<(String, String)>,
+    server_tool_items: Vec<Value>,
+    completed: bool,
+    finished: bool,
+}
+
+impl OpenAiResponsesStreamTranslator {
+    fn new(
+        model: String,
+        profile_file: String,
+        request: Value,
+        continuations: Arc<InteractionContinuationState>,
+        estimated_input_tokens: u64,
+    ) -> Self {
+        Self {
+            message_id: format!("msg_{}", Uuid::new_v4().simple()),
+            model,
+            profile_file,
+            request,
+            continuations,
+            response_id: None,
+            status: None,
+            usage: json!({}),
+            estimated_input_tokens,
+            next_content_index: 0,
+            active_blocks: IndexMap::new(),
+            assistant_content: Vec::new(),
+            calls: Vec::new(),
+            server_tool_items: Vec::new(),
+            completed: false,
+            finished: false,
+        }
+    }
+
+    fn start_events(&self) -> Result<Vec<Event>, String> {
+        let mut events = Vec::new();
+        push_anthropic_event(
+            &mut events,
+            "message_start",
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": self.message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": self.model,
+                    "content": [],
+                    "stop_reason": Value::Null,
+                    "stop_sequence": Value::Null,
+                    "usage": {
+                        "input_tokens": self.estimated_input_tokens,
+                        "output_tokens": 0
+                    }
+                }
+            }),
+        )?;
+        Ok(events)
+    }
+
+    fn capture_response(&mut self, response: &Value) {
+        if let Some(id) = response.get("id").and_then(Value::as_str) {
+            self.response_id = Some(id.to_string());
+        }
+        if let Some(status) = response.get("status").and_then(Value::as_str) {
+            self.status = Some(status.to_string());
+        }
+        if let Some(usage) = response.get("usage") {
+            self.usage = usage.clone();
+        }
+        if let Some(output) = response.get("output").and_then(Value::as_array) {
+            for item in output {
+                if item
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_responses_server_tool_item)
+                {
+                    self.capture_server_tool(item);
+                }
+            }
+        }
+    }
+
+    fn capture_server_tool(&mut self, item: &Value) {
+        let key = interaction_server_tool_trace_key(item);
+        if let Some(index) = key.as_ref().and_then(|key| {
+            self.server_tool_items.iter().position(|existing| {
+                interaction_server_tool_trace_key(existing).as_ref() == Some(key)
+            })
+        }) {
+            self.server_tool_items[index] = item.clone();
+        } else if self.server_tool_items.len() < INTERACTION_SERVER_TOOL_TRACE_CAPACITY {
+            self.server_tool_items.push(item.clone());
+        }
+    }
+
+    fn process_payload(&mut self, payload: &str) -> Result<Vec<Event>, String> {
+        if payload.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let event: Value = serde_json::from_str(payload)
+            .map_err(|err| format!("Invalid JSON in Responses SSE stream: {err}"))?;
+        if event.get("error").is_some()
+            && event.get("type").and_then(Value::as_str) != Some("error")
+        {
+            return Err(safe_error_message(&event));
+        }
+        match event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+        {
+            "response.created" | "response.in_progress" | "response.queued" => {
+                if let Some(response) = event.get("response") {
+                    self.capture_response(response);
+                }
+                Ok(Vec::new())
+            }
+            "response.completed" | "response.incomplete" => {
+                if let Some(response) = event.get("response") {
+                    self.capture_response(response);
+                }
+                self.completed = true;
+                Ok(Vec::new())
+            }
+            "response.failed" | "error" => Err(safe_error_message(&event)),
+            "response.output_item.added" => self.start_item(&event),
+            "response.output_item.done" => self.stop_item(&event),
+            "response.reasoning_text.delta"
+            | "response.reasoning_content.delta"
+            | "response.reasoning.delta"
+            | "response.reasoning_summary_text.delta" => self.delta_text(&event, true),
+            "response.output_text.delta" | "response.refusal.delta" => {
+                self.delta_text(&event, false)
+            }
+            "response.function_call_arguments.delta" => self.delta_arguments(&event, false),
+            "response.custom_tool_call_input.delta" => self.delta_arguments(&event, true),
+            kind if kind.ends_with("_call.in_progress")
+                || kind.ends_with("_call.searching")
+                || kind.ends_with("_call.completed") =>
+            {
+                if let Some(item) = event.get("item") {
+                    self.capture_server_tool(item);
+                }
+                Ok(Vec::new())
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn event_output_index(event: &Value) -> Option<usize> {
+        event
+            .get("output_index")
+            .or_else(|| event.get("index"))
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+    }
+
+    fn start_item(&mut self, event: &Value) -> Result<Vec<Event>, String> {
+        let Some(output_index) = Self::event_output_index(event) else {
+            return Ok(Vec::new());
+        };
+        let item = event.get("item").unwrap_or(&Value::Null);
+        let Some(item_type) = item.get("type").and_then(Value::as_str) else {
+            return Ok(Vec::new());
+        };
+        if is_responses_server_tool_item(item_type) {
+            self.capture_server_tool(item);
+            return Ok(Vec::new());
+        }
+        let anthropic_index = self.next_content_index;
+        let (block, content_block) = match item_type {
+            "reasoning" => (
+                ResponsesStreamingBlock::Thinking(String::new()),
+                json!({"type": "thinking", "thinking": ""}),
+            ),
+            "message" => (
+                ResponsesStreamingBlock::Text(String::new()),
+                json!({"type": "text", "text": ""}),
+            ),
+            "function_call" | "custom_tool_call" => {
+                let id = item
+                    .get("call_id")
+                    .or_else(|| item.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("toolu_unknown")
+                    .to_string();
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(if item_type == "custom_tool_call" {
+                        "apply_patch"
+                    } else {
+                        "unknown_function"
+                    })
+                    .to_string();
+                (
+                    ResponsesStreamingBlock::Tool {
+                        id: id.clone(),
+                        name: name.clone(),
+                        arguments: String::new(),
+                        custom: item_type == "custom_tool_call",
+                    },
+                    json!({"type": "tool_use", "id": id, "name": name, "input": {}}),
+                )
+            }
+            _ => return Ok(Vec::new()),
+        };
+        self.next_content_index += 1;
+        self.active_blocks.insert(
+            output_index,
+            ActiveResponsesStreamingBlock {
+                anthropic_index,
+                block,
+            },
+        );
+        let mut events = Vec::new();
+        push_anthropic_event(
+            &mut events,
+            "content_block_start",
+            json!({
+                "type": "content_block_start",
+                "index": anthropic_index,
+                "content_block": content_block
+            }),
+        )?;
+        Ok(events)
+    }
+
+    fn delta_text(&mut self, event: &Value, reasoning: bool) -> Result<Vec<Event>, String> {
+        let Some(output_index) = Self::event_output_index(event) else {
+            return Ok(Vec::new());
+        };
+        let Some(active) = self.active_blocks.get_mut(&output_index) else {
+            return Ok(Vec::new());
+        };
+        let delta = event
+            .get("delta")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if delta.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut events = Vec::new();
+        match (&mut active.block, reasoning) {
+            (ResponsesStreamingBlock::Thinking(text), true) => {
+                text.push_str(delta);
+                push_anthropic_event(
+                    &mut events,
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": active.anthropic_index,
+                        "delta": {"type": "thinking_delta", "thinking": delta}
+                    }),
+                )?;
+            }
+            (ResponsesStreamingBlock::Text(text), false) => {
+                text.push_str(delta);
+                push_anthropic_event(
+                    &mut events,
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": active.anthropic_index,
+                        "delta": {"type": "text_delta", "text": delta}
+                    }),
+                )?;
+            }
+            _ => {}
+        }
+        Ok(events)
+    }
+
+    fn delta_arguments(&mut self, event: &Value, custom: bool) -> Result<Vec<Event>, String> {
+        let Some(output_index) = Self::event_output_index(event) else {
+            return Ok(Vec::new());
+        };
+        let Some(active) = self.active_blocks.get_mut(&output_index) else {
+            return Ok(Vec::new());
+        };
+        let delta = event
+            .get("delta")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let ResponsesStreamingBlock::Tool {
+            arguments,
+            custom: is_custom,
+            ..
+        } = &mut active.block
+        else {
+            return Ok(Vec::new());
+        };
+        if custom != *is_custom || delta.is_empty() {
+            return Ok(Vec::new());
+        }
+        arguments.push_str(delta);
+        // A custom tool carries raw text rather than JSON. Buffer it until the
+        // item is complete so the Anthropic input_json_delta is one valid JSON
+        // object instead of a concatenation of independently escaped chunks.
+        if custom {
+            return Ok(Vec::new());
+        }
+        let mut events = Vec::new();
+        push_anthropic_event(
+            &mut events,
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": active.anthropic_index,
+                "delta": {"type": "input_json_delta", "partial_json": delta}
+            }),
+        )?;
+        Ok(events)
+    }
+
+    fn stop_item(&mut self, event: &Value) -> Result<Vec<Event>, String> {
+        let Some(output_index) = Self::event_output_index(event) else {
+            return Ok(Vec::new());
+        };
+        let item = event.get("item").unwrap_or(&Value::Null);
+        if item
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(is_responses_server_tool_item)
+        {
+            self.capture_server_tool(item);
+            return Ok(Vec::new());
+        }
+        let Some(mut active) = self.active_blocks.shift_remove(&output_index) else {
+            return Ok(Vec::new());
+        };
+        let mut events = Vec::new();
+        match &mut active.block {
+            ResponsesStreamingBlock::Thinking(text) => {
+                if text.is_empty() {
+                    *text = value_to_text(
+                        item.get("content")
+                            .or_else(|| item.get("summary"))
+                            .unwrap_or(&Value::Null),
+                    );
+                    if !text.is_empty() {
+                        push_anthropic_event(
+                            &mut events,
+                            "content_block_delta",
+                            json!({
+                                "type": "content_block_delta",
+                                "index": active.anthropic_index,
+                                "delta": {"type": "thinking_delta", "thinking": text}
+                            }),
+                        )?;
+                    }
+                }
+                self.assistant_content
+                    .push(json!({"type": "thinking", "thinking": text}));
+            }
+            ResponsesStreamingBlock::Text(text) => {
+                if text.is_empty() {
+                    *text = value_to_text(item.get("content").unwrap_or(&Value::Null));
+                    if !text.is_empty() {
+                        push_anthropic_event(
+                            &mut events,
+                            "content_block_delta",
+                            json!({
+                                "type": "content_block_delta",
+                                "index": active.anthropic_index,
+                                "delta": {"type": "text_delta", "text": text}
+                            }),
+                        )?;
+                    }
+                }
+                self.assistant_content
+                    .push(json!({"type": "text", "text": text}));
+            }
+            ResponsesStreamingBlock::Tool {
+                id,
+                name,
+                arguments,
+                custom,
+            } => {
+                if arguments.is_empty() {
+                    *arguments = item
+                        .get(if *custom { "input" } else { "arguments" })
+                        .and_then(Value::as_str)
+                        .unwrap_or(if *custom { "" } else { "{}" })
+                        .to_string();
+                }
+                let input = if *custom {
+                    json!({"patch": arguments})
+                } else {
+                    parse_tool_arguments(arguments)?
+                };
+                if *custom {
+                    push_anthropic_event(
+                        &mut events,
+                        "content_block_delta",
+                        json!({
+                            "type": "content_block_delta",
+                            "index": active.anthropic_index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string())
+                            }
+                        }),
+                    )?;
+                }
+                self.calls.push((id.clone(), name.clone()));
+                self.assistant_content.push(json!({
+                    "type": "tool_use",
+                    "id": id,
+                    "name": name,
+                    "input": input
+                }));
+            }
+        }
+        push_anthropic_event(
+            &mut events,
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": active.anthropic_index}),
+        )?;
+        Ok(events)
+    }
+
+    fn finish(&mut self) -> Result<Vec<Event>, String> {
+        if self.finished {
+            return Ok(Vec::new());
+        }
+        if !self.completed {
+            return Err("Responses stream ended before a terminal response event".to_string());
+        }
+        if !self.active_blocks.is_empty() {
+            return Err("Responses stream ended with an unfinished output item".to_string());
+        }
+        let response_id = self
+            .response_id
+            .as_deref()
+            .ok_or_else(|| "Responses stream completed without a response id".to_string())?;
+        remember_interaction_continuation(
+            &self.continuations,
+            &self.profile_file,
+            &self.request,
+            response_id,
+            &self.assistant_content,
+            &self.calls,
+        );
+        let status = self.status.as_deref().unwrap_or("completed");
+        let stop_reason = if !self.calls.is_empty() {
+            "tool_use"
+        } else if status == "incomplete" {
+            "max_tokens"
+        } else {
+            "end_turn"
+        };
+        let mut delta = json!({"stop_reason": stop_reason, "stop_sequence": Value::Null});
+        if let Some(metadata) = responses_server_tool_metadata(&self.server_tool_items) {
+            delta["provider_metadata"] = metadata;
+        }
+        self.finished = true;
+        let mut events = Vec::new();
+        let mut usage = openai_usage_to_anthropic(&self.usage, self.estimated_input_tokens);
+        if let Some(server_tool_use) = responses_server_tool_usage(&self.server_tool_items) {
+            usage["server_tool_use"] = server_tool_use;
+        }
+        push_anthropic_event(
+            &mut events,
+            "message_delta",
+            json!({
+                "type": "message_delta",
+                "delta": delta,
+                "usage": usage
+            }),
+        )?;
+        push_anthropic_event(&mut events, "message_stop", json!({"type": "message_stop"}))?;
+        Ok(events)
+    }
+}
+
+fn openai_responses_event_stream<S, B, E>(
+    byte_stream: S,
+    model: String,
+    profile_file: String,
+    request: Value,
+    continuations: Arc<InteractionContinuationState>,
+    estimated_input_tokens: u64,
+) -> impl Stream<Item = Result<Event, Infallible>>
+where
+    S: Stream<Item = Result<B, E>> + Send + 'static,
+    B: AsRef<[u8]> + Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    let byte_stream = Box::pin(byte_stream);
+    let translator = OpenAiResponsesStreamTranslator::new(
+        model,
+        profile_file,
+        request,
+        continuations,
+        estimated_input_tokens,
+    );
+    let initial_events = match translator.start_events() {
+        Ok(events) => VecDeque::from(events),
+        Err(message) => VecDeque::from([anthropic_stream_error_event(&message)]),
+    };
+    stream::unfold(
+        (
+            byte_stream,
+            SseDataDecoder::default(),
+            translator,
+            initial_events,
+            false,
+        ),
+        |(mut byte_stream, mut decoder, mut translator, mut pending, mut ended)| async move {
+            loop {
+                if let Some(event) = pending.pop_front() {
+                    return Some((
+                        Ok::<Event, Infallible>(event),
+                        (byte_stream, decoder, translator, pending, ended),
+                    ));
+                }
+                if ended {
+                    return None;
+                }
+                match byte_stream.next().await {
+                    Some(Ok(bytes)) => match decoder.push_bytes(bytes.as_ref()) {
+                        Ok(payloads) => {
+                            for payload in payloads {
+                                if payload.trim() == "[DONE]" {
+                                    match translator.finish() {
+                                        Ok(events) => pending.extend(events),
+                                        Err(message) => pending
+                                            .push_back(anthropic_stream_error_event(&message)),
+                                    }
+                                    ended = true;
+                                    break;
+                                }
+                                match translator.process_payload(&payload) {
+                                    Ok(events) => pending.extend(events),
+                                    Err(message) => {
+                                        pending.push_back(anthropic_stream_error_event(&message));
+                                        ended = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(message) => {
+                            pending.push_back(anthropic_stream_error_event(&message));
+                            ended = true;
+                        }
+                    },
+                    Some(Err(err)) => {
+                        pending.push_back(anthropic_stream_error_event(&format!(
+                            "Responses stream failed: {err}"
+                        )));
+                        ended = true;
+                    }
+                    None => {
+                        let mut failed = false;
+                        match decoder.finish() {
+                            Ok(payloads) => {
+                                for payload in payloads {
+                                    if payload.trim() == "[DONE]" {
+                                        continue;
+                                    }
+                                    match translator.process_payload(&payload) {
+                                        Ok(events) => pending.extend(events),
+                                        Err(message) => {
+                                            pending
+                                                .push_back(anthropic_stream_error_event(&message));
+                                            failed = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(message) => {
+                                pending.push_back(anthropic_stream_error_event(&message));
+                                failed = true;
+                            }
+                        }
+                        if !failed {
+                            match translator.finish() {
+                                Ok(events) => pending.extend(events),
+                                Err(message) => {
+                                    pending.push_back(anthropic_stream_error_event(&message))
+                                }
+                            }
+                        }
+                        ended = true;
+                    }
+                }
+            }
+        },
+    )
+}
+
+fn openai_responses_stream_response(
+    upstream: reqwest::Response,
+    model: String,
+    profile_file: String,
+    request: Value,
+    continuations: Arc<InteractionContinuationState>,
+    estimated_input_tokens: u64,
+) -> Response {
+    let event_stream = openai_responses_event_stream(
+        upstream.bytes_stream(),
+        model,
+        profile_file,
+        request,
+        continuations,
+        estimated_input_tokens,
+    );
+    Sse::new(event_stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
 }
 
 fn apply_anthropic_forward_headers(
@@ -5695,6 +7673,9 @@ struct AnthropicStreamTranslator {
     finish_reason: Option<String>,
     input_tokens: u64,
     output_tokens: u64,
+    cache_read_input_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+    reasoning_tokens: Option<u64>,
     usage_only_tail_seen: bool,
     refusal_seen: bool,
     safety_block_seen: bool,
@@ -5743,6 +7724,9 @@ impl AnthropicStreamTranslator {
             finish_reason: None,
             input_tokens: estimated_input_tokens,
             output_tokens: 0,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+            reasoning_tokens: None,
             usage_only_tail_seen: false,
             refusal_seen: false,
             safety_block_seen: false,
@@ -5805,6 +7789,22 @@ impl AnthropicStreamTranslator {
                 usage_token(usage, &["prompt_tokens", "input_tokens"]).unwrap_or(self.input_tokens);
             self.output_tokens = usage_token(usage, &["completion_tokens", "output_tokens"])
                 .unwrap_or(self.output_tokens);
+            self.cache_read_input_tokens = usage
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
+                .and_then(Value::as_u64)
+                .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(Value::as_u64))
+                .or_else(|| usage.get("cached_tokens").and_then(Value::as_u64))
+                .or(self.cache_read_input_tokens);
+            self.cache_creation_input_tokens = usage
+                .get("cache_creation_input_tokens")
+                .and_then(Value::as_u64)
+                .or(self.cache_creation_input_tokens);
+            self.reasoning_tokens = usage
+                .pointer("/completion_tokens_details/reasoning_tokens")
+                .or_else(|| usage.pointer("/output_tokens_details/reasoning_tokens"))
+                .and_then(Value::as_u64)
+                .or(self.reasoning_tokens);
         }
 
         let Some(choice) = chunk.pointer("/choices/0") else {
@@ -6217,6 +8217,19 @@ impl AnthropicStreamTranslator {
             }
         }
 
+        let mut usage = json!({
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens
+        });
+        if let Some(value) = self.cache_read_input_tokens {
+            usage["cache_read_input_tokens"] = json!(value);
+        }
+        if let Some(value) = self.cache_creation_input_tokens {
+            usage["cache_creation_input_tokens"] = json!(value);
+        }
+        if let Some(value) = self.reasoning_tokens {
+            usage["reasoning_tokens"] = json!(value);
+        }
         push_anthropic_event(
             &mut events,
             "message_delta",
@@ -6226,9 +8239,7 @@ impl AnthropicStreamTranslator {
                     "stop_reason": stop_reason,
                     "stop_sequence": Value::Null
                 },
-                "usage": {
-                    "output_tokens": self.output_tokens
-                }
+                "usage": usage
             }),
         )?;
         push_anthropic_event(&mut events, "message_stop", json!({"type": "message_stop"}))?;
@@ -6574,6 +8585,43 @@ fn gemini_count_tokens_url(profile: &ProviderProfile) -> Result<String, String> 
     ))
 }
 
+fn is_kimi_profile(profile: &ProviderProfile) -> bool {
+    profile.openai_capabilities.chat_dialect == OpenAiChatDialect::Kimi
+        || inferred_openai_chat_dialect(&profile.base_url) == OpenAiChatDialect::Kimi
+}
+
+fn kimi_count_tokens_url(profile: &ProviderProfile) -> Result<String, String> {
+    let mut url = url::Url::parse(&profile.base_url)
+        .map_err(|error| format!("Invalid Kimi base_url '{}': {error}", profile.base_url))?;
+    url.set_path("/v1/tokenizers/estimate-token-count");
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string())
+}
+
+fn kimi_count_tokens_request(
+    request: &Value,
+    profile: &ProviderProfile,
+    thought_signatures: &ThoughtSignatureCache,
+) -> Result<Value, String> {
+    let capabilities = if profile.openai_capabilities.chat_dialect == OpenAiChatDialect::Kimi {
+        profile.openai_capabilities.clone()
+    } else {
+        OpenAiCapabilities::for_openai_base_url(&profile.base_url)
+    };
+    let mut translated = translate_anthropic_request_with_capabilities(
+        request,
+        &display_model_name(&profile.model),
+        thought_signatures,
+        &capabilities,
+    )?;
+    let object = translated
+        .as_object_mut()
+        .ok_or_else(|| "Kimi token count request must be a JSON object".to_string())?;
+    object.retain(|field, _| matches!(field.as_str(), "model" | "messages" | "tools"));
+    Ok(translated)
+}
+
 fn anthropic_token_count_response(input_tokens: usize, source: &'static str) -> Response {
     let mut response = Json(json!({"input_tokens": input_tokens})).into_response();
     response.headers_mut().insert(
@@ -6609,6 +8657,70 @@ async fn anthropic_count_tokens(
     }
 
     let input_tokens = estimate_anthropic_input_tokens(&request);
+    if let Some(profile) = active_profile
+        .as_ref()
+        .filter(|profile| is_kimi_profile(profile))
+    {
+        let diagnostics = openai_request_diagnostics(
+            &request,
+            &OpenAiCapabilities::for_openai_base_url(&profile.base_url),
+            ProviderTransport::OpenAiChat,
+        );
+        let native_result = async {
+            let credential = profile
+                .auth_token
+                .as_ref()
+                .or(profile.api_key.as_ref())
+                .ok_or_else(|| "Kimi profile has no credential".to_string())?;
+            let url = kimi_count_tokens_url(profile)?;
+            let body =
+                kimi_count_tokens_request(&request, profile, state.thought_signatures.as_ref())?;
+            let response = profile
+                .client
+                .post(url)
+                .bearer_auth(credential)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|error| format!("Kimi estimate-token-count request failed: {error}"))?;
+            let status = response.status();
+            let body = read_response_json_limited(response)
+                .await
+                .map_err(|error| format!("Cannot read Kimi token count response: {error}"))?;
+            if !status.is_success() {
+                return Err(format!(
+                    "Kimi estimate-token-count returned HTTP {status}: {}",
+                    safe_error_message(&body)
+                ));
+            }
+            body.pointer("/data/total_tokens")
+                .or_else(|| body.get("total_tokens"))
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| {
+                    "Kimi token count response has no valid data.total_tokens".to_string()
+                })
+        };
+        let response = match tokio::time::timeout(KIMI_COUNT_TOKENS_TIMEOUT, native_result).await {
+            Ok(Ok(native_tokens)) => anthropic_token_count_response(native_tokens, "kimi-native"),
+            Ok(Err(message)) => {
+                warn!(
+                    provider = %profile.file_name,
+                    error = message,
+                    "Falling back to estimated Kimi input token count"
+                );
+                anthropic_token_count_response(input_tokens, "estimated-fallback")
+            }
+            Err(_) => {
+                warn!(
+                    provider = %profile.file_name,
+                    "Kimi estimate-token-count timed out; falling back to estimated input token count"
+                );
+                anthropic_token_count_response(input_tokens, "estimated-fallback")
+            }
+        };
+        return attach_bridge_diagnostics(response, &profile.file_name, &diagnostics);
+    }
     let Some(profile) =
         active_profile.filter(|profile| profile.transport == ProviderTransport::GeminiInteractions)
     else {
@@ -7118,6 +9230,7 @@ fn translate_anthropic_request_with_capabilities(
     let mut messages = Vec::new();
     let mut runtime_identity_reminder = None;
     let mut pending_tool_call_ids = HashSet::new();
+    let mut replayed_reasoning = false;
 
     if let Some(system) = request.get("system") {
         let text = value_to_text(system);
@@ -7143,11 +9256,12 @@ fn translate_anthropic_request_with_capabilities(
 
         match role {
             "assistant" => {
-                translate_anthropic_assistant_message(
+                replayed_reasoning |= translate_anthropic_assistant_message(
                     content,
                     &mut messages,
                     thought_signatures,
                     &mut pending_tool_call_ids,
+                    capabilities.chat_dialect,
                 );
             }
             "user" => translate_anthropic_user_message(
@@ -7219,10 +9333,25 @@ fn translate_anthropic_request_with_capabilities(
         }
     }
 
-    if let Some(choice) = request.get("tool_choice") {
-        if let Some(translated) = translate_anthropic_tool_choice(choice) {
-            body.insert("tool_choice".to_string(), translated);
+    let thinking_enabled = request
+        .pointer("/thinking/type")
+        .and_then(Value::as_str)
+        .map(|kind| kind != "disabled")
+        .unwrap_or(capabilities.chat_dialect == OpenAiChatDialect::DeepSeek);
+
+    // DeepSeek V4 rejects tool_choice while thinking is enabled. Let the
+    // model use the supplied tools automatically instead of forwarding an
+    // otherwise valid Anthropic tool preference that would produce a 400.
+    let suppress_tool_choice =
+        capabilities.chat_dialect == OpenAiChatDialect::DeepSeek && thinking_enabled;
+    if !suppress_tool_choice {
+        if let Some(choice) = request.get("tool_choice") {
+            if let Some(translated) = translate_anthropic_tool_choice(choice) {
+                body.insert("tool_choice".to_string(), translated);
+            }
         }
+    }
+    if let Some(choice) = request.get("tool_choice") {
         if capabilities.parallel_tool_calls
             && choice
                 .get("disable_parallel_tool_use")
@@ -7233,7 +9362,95 @@ fn translate_anthropic_request_with_capabilities(
         }
     }
 
-    if capabilities.reasoning_effort {
+    match capabilities.chat_dialect {
+        OpenAiChatDialect::DeepSeek => {
+            if let Some(kind) = request.pointer("/thinking/type").and_then(Value::as_str) {
+                let kind = if kind == "disabled" {
+                    "disabled"
+                } else {
+                    "enabled"
+                };
+                body.insert("thinking".to_string(), json!({"type": kind}));
+            }
+
+            let effort = request
+                .pointer("/output_config/effort")
+                .and_then(Value::as_str)
+                .map(deepseek_reasoning_effort)
+                .or_else(|| {
+                    request
+                        .pointer("/thinking/budget_tokens")
+                        .and_then(Value::as_u64)
+                        .map(|budget| if budget >= 16_384 { "max" } else { "high" })
+                })
+                .or_else(|| {
+                    capabilities
+                        .default_reasoning_effort
+                        .as_deref()
+                        .map(deepseek_reasoning_effort)
+                });
+            if capabilities.reasoning_effort && thinking_enabled {
+                if let Some(effort) = effort {
+                    body.insert("reasoning_effort".to_string(), json!(effort));
+                }
+            }
+            if let Some(format) = openai_chat_response_format(request, true)? {
+                body.insert("response_format".to_string(), format);
+            }
+        }
+        OpenAiChatDialect::Qwen => {
+            if let Some(kind) = request.pointer("/thinking/type").and_then(Value::as_str) {
+                body.insert("enable_thinking".to_string(), json!(kind != "disabled"));
+            }
+            if let Some(budget) = request
+                .pointer("/thinking/budget_tokens")
+                .and_then(Value::as_u64)
+            {
+                body.insert("thinking_budget".to_string(), json!(budget));
+            }
+            if replayed_reasoning {
+                body.insert("preserve_thinking".to_string(), Value::Bool(true));
+            }
+            if let Some(format) = openai_chat_response_format(request, false)? {
+                body.insert("response_format".to_string(), format);
+            }
+        }
+        OpenAiChatDialect::Kimi => {
+            let effort = request
+                .pointer("/output_config/effort")
+                .and_then(Value::as_str)
+                .map(kimi_reasoning_effort)
+                .or_else(|| {
+                    request
+                        .pointer("/thinking/budget_tokens")
+                        .and_then(Value::as_u64)
+                        .map(kimi_reasoning_effort_from_budget)
+                })
+                .or_else(|| {
+                    capabilities
+                        .default_reasoning_effort
+                        .as_deref()
+                        .map(kimi_reasoning_effort)
+                })
+                .unwrap_or("max");
+            if capabilities.reasoning_effort {
+                body.insert("reasoning_effort".to_string(), json!(effort));
+            }
+            if let Some(format) = openai_chat_response_format(request, false)? {
+                body.insert("response_format".to_string(), format);
+            }
+            body.insert(
+                "prompt_cache_key".to_string(),
+                json!(kimi_prompt_cache_key(request)),
+            );
+            if let Some(identifier) = kimi_safety_identifier(request) {
+                body.insert("safety_identifier".to_string(), json!(identifier));
+            }
+        }
+        OpenAiChatDialect::Generic => {}
+    }
+
+    if capabilities.reasoning_effort && capabilities.chat_dialect == OpenAiChatDialect::Generic {
         if let Some(thinking) = request.get("thinking") {
             let effort = thinking
                 .get("budget_tokens")
@@ -7280,21 +9497,23 @@ fn translate_anthropic_assistant_message(
     messages: &mut Vec<Value>,
     thought_signatures: &ThoughtSignatureCache,
     pending_tool_call_ids: &mut HashSet<String>,
-) {
+    chat_dialect: OpenAiChatDialect,
+) -> bool {
     pending_tool_call_ids.clear();
     if let Some(text) = content.as_str() {
         if !text.is_empty() {
             messages.push(json!({"role": "assistant", "content": text}));
         }
-        return;
+        return false;
     }
 
     let Some(parts) = content.as_array() else {
-        return;
+        return false;
     };
     let mut text_parts = Vec::new();
     let mut tool_calls = Vec::new();
     let mut assistant_signature = None;
+    let mut reasoning_parts = Vec::new();
 
     for part in parts {
         match part.get("type").and_then(Value::as_str) {
@@ -7335,6 +9554,11 @@ fn translate_anthropic_assistant_message(
                 tool_calls.push(translated);
             }
             Some("thinking") => {
+                if let Some(thinking) = part.get("thinking").and_then(Value::as_str) {
+                    if !thinking.is_empty() {
+                        reasoning_parts.push(thinking.to_string());
+                    }
+                }
                 assistant_signature = part
                     .get("signature")
                     .and_then(Value::as_str)
@@ -7361,7 +9585,120 @@ fn translate_anthropic_assistant_message(
         } else if let Some(signature) = assistant_signature {
             translated["extra_content"] = json!({"google": {"thought_signature": signature}});
         }
+        if chat_dialect != OpenAiChatDialect::Generic && !reasoning_parts.is_empty() {
+            translated["reasoning_content"] = Value::String(reasoning_parts.join("\n"));
+        }
         messages.push(translated);
+    }
+
+    !reasoning_parts.is_empty()
+}
+
+fn deepseek_reasoning_effort(effort: &str) -> &'static str {
+    if matches!(effort, "max" | "xhigh") {
+        "max"
+    } else {
+        "high"
+    }
+}
+
+fn kimi_reasoning_effort(effort: &str) -> &'static str {
+    match effort {
+        "none" | "minimal" | "low" => "low",
+        "medium" | "high" => "high",
+        "xhigh" | "max" => "max",
+        _ => "max",
+    }
+}
+
+fn kimi_reasoning_effort_from_budget(budget: u64) -> &'static str {
+    if budget >= 32_768 {
+        "max"
+    } else if budget >= 8_192 {
+        "high"
+    } else {
+        "low"
+    }
+}
+
+fn kimi_prompt_cache_key(request: &Value) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"claude-bridge-kimi-session-v1\0");
+    if let Some(container) = request.get("container").filter(|value| !value.is_null()) {
+        if let Ok(bytes) = serde_json::to_vec(container) {
+            digest.update(b"container\0");
+            digest.update(bytes);
+            return format!("claude-bridge-{:x}", digest.finalize());
+        }
+    }
+    digest.update(b"system\0");
+    if let Some(system) = request.get("system") {
+        if let Ok(bytes) = serde_json::to_vec(system) {
+            digest.update(bytes);
+        }
+    }
+    digest.update(b"\0first-message\0");
+    if let Some(first_message) = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .and_then(|messages| messages.first())
+    {
+        if let Ok(bytes) = serde_json::to_vec(first_message) {
+            digest.update(bytes);
+        }
+    }
+    format!("claude-bridge-{:x}", digest.finalize())
+}
+
+fn kimi_safety_identifier(request: &Value) -> Option<String> {
+    let user_id = request
+        .pointer("/metadata/user_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let mut digest = Sha256::new();
+    digest.update(b"claude-bridge-kimi-user-v1\0");
+    digest.update(user_id.as_bytes());
+    Some(format!("user_{:x}", digest.finalize()))
+}
+
+fn openai_chat_response_format(
+    request: &Value,
+    json_schema_as_json_object: bool,
+) -> Result<Option<Value>, String> {
+    let Some(format) = request
+        .pointer("/output_config/format")
+        .or_else(|| request.get("output_format"))
+        .filter(|format| !format.is_null())
+    else {
+        return Ok(None);
+    };
+    let format_type = format.get("type").and_then(Value::as_str).ok_or_else(|| {
+        "Anthropic structured output format must have a string 'type'".to_string()
+    })?;
+
+    match format_type {
+        "json_object" => Ok(Some(json!({"type": "json_object"}))),
+        "json_schema" if json_schema_as_json_object => Ok(Some(json!({"type": "json_object"}))),
+        "json_schema" => {
+            let schema = format.get("schema").cloned().ok_or_else(|| {
+                "Anthropic json_schema output format is missing 'schema'".to_string()
+            })?;
+            let name = format
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("response");
+            let mut json_schema = json!({"name": name, "schema": schema});
+            if let Some(strict) = format.get("strict").and_then(Value::as_bool) {
+                json_schema["strict"] = Value::Bool(strict);
+            }
+            Ok(Some(
+                json!({"type": "json_schema", "json_schema": json_schema}),
+            ))
+        }
+        unsupported => Err(format!(
+            "Unsupported Anthropic structured output format '{unsupported}'"
+        )),
     }
 }
 
@@ -7677,9 +10014,6 @@ fn translate_anthropic_response_with_capabilities(
             .unwrap_or(true);
         if choices_are_empty {
             let usage = upstream.get("usage").cloned().unwrap_or_else(|| json!({}));
-            let input_tokens = usage_token(&usage, &["prompt_tokens", "input_tokens"]).unwrap_or(0);
-            let output_tokens =
-                usage_token(&usage, &["completion_tokens", "output_tokens"]).unwrap_or(0);
             return Ok(json!({
                 "id": format!("msg_{}", Uuid::new_v4().simple()),
                 "type": "message",
@@ -7691,10 +10025,7 @@ fn translate_anthropic_response_with_capabilities(
                 }],
                 "stop_reason": "refusal",
                 "stop_sequence": Value::Null,
-                "usage": {
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens
-                }
+                "usage": openai_usage_to_anthropic(&usage, 0)
             }));
         }
     }
@@ -7806,8 +10137,6 @@ fn translate_anthropic_response_with_capabilities(
         "refusal"
     };
     let usage = upstream.get("usage").cloned().unwrap_or_else(|| json!({}));
-    let input_tokens = usage_token(&usage, &["prompt_tokens", "input_tokens"]).unwrap_or(0);
-    let output_tokens = usage_token(&usage, &["completion_tokens", "output_tokens"]).unwrap_or(0);
 
     Ok(json!({
         "id": format!("msg_{}", Uuid::new_v4().simple()),
@@ -7817,10 +10146,7 @@ fn translate_anthropic_response_with_capabilities(
         "content": content,
         "stop_reason": stop_reason,
         "stop_sequence": Value::Null,
-        "usage": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens
-        }
+        "usage": openai_usage_to_anthropic(&usage, 0)
     }))
 }
 
@@ -8438,6 +10764,7 @@ mod tests {
             display_name: "Test Provider".to_string(),
             source: ProviderProfileSource::Native,
             model: "test-model".to_string(),
+            context_window: None,
             upstream_identity: None,
             identity_override: true,
             base_url: upstream_url.clone(),
@@ -8519,6 +10846,52 @@ mod tests {
     }
 
     #[test]
+    fn native_kimi_anthropic_profile_uses_bearer_auth_and_exposes_one_million_context() {
+        let root = env::temp_dir().join(format!("claude-bridge-kimi-profile-{}", Uuid::new_v4()));
+        let providers_dir = root.join("bridge-providers");
+        let settings_dir = root.join(".claude");
+        fs::create_dir_all(&providers_dir).unwrap();
+        fs::create_dir_all(&settings_dir).unwrap();
+        fs::write(
+            providers_dir.join("kimi-k3.json"),
+            serde_json::to_vec_pretty(&json!({
+                "name": "Kimi K3",
+                "model": "kimi-k3",
+                "protocol": "anthropic",
+                "base_url": "https://api.moonshot.ai/anthropic",
+                "api_key": "secret",
+                "auth_scheme": "bearer",
+                "context_window": 1_048_576,
+                "capabilities": {
+                    "kimi_formula_tools": ["moonshot/web-search:latest"]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let loaded =
+            load_provider_profiles(&providers_dir, &settings_dir, "http://127.0.0.1:18787")
+                .unwrap();
+        fs::remove_dir_all(&root).unwrap();
+
+        let profile = &loaded.profiles[0];
+        assert_eq!(profile.transport, ProviderTransport::Anthropic);
+        assert_eq!(
+            profile.upstream_url,
+            "https://api.moonshot.ai/anthropic/v1/messages"
+        );
+        assert_eq!(profile.auth_token.as_deref(), Some("secret"));
+        assert!(profile.api_key.is_none());
+        assert_eq!(profile.context_window, Some(1_048_576));
+        assert!(is_kimi_profile(profile));
+        assert_eq!(
+            profile.openai_capabilities.kimi_formula_tools,
+            vec!["moonshot/web-search:latest"]
+        );
+    }
+
+    #[test]
     fn native_openai_base_url_matches_official_sdk_semantics() {
         let cases = [
             (
@@ -8538,6 +10911,16 @@ mod tests {
         for (base_url, expected) in cases {
             assert_eq!(openai_compatible_chat_endpoint(base_url), expected);
         }
+        assert_eq!(
+            openai_responses_endpoint("https://api.deepseek.com/v1"),
+            "https://api.deepseek.com/v1/responses"
+        );
+        assert_eq!(
+            openai_responses_endpoint(
+                "https://workspace.cn-beijing.maas.aliyuncs.com/v1/responses"
+            ),
+            "https://workspace.cn-beijing.maas.aliyuncs.com/v1/responses"
+        );
     }
 
     #[test]
@@ -8695,6 +11078,7 @@ mod tests {
                 display_name: file_name.to_string(),
                 source: ProviderProfileSource::Native,
                 model: file_name.to_string(),
+                context_window: None,
                 upstream_identity: None,
                 identity_override: true,
                 base_url: "https://example.invalid".to_string(),
@@ -8759,6 +11143,7 @@ mod tests {
             display_name: "Gemini Vision".to_string(),
             source: ProviderProfileSource::Native,
             model: "gemini-3.6-flash".to_string(),
+            context_window: None,
             upstream_identity: None,
             identity_override: true,
             base_url: "http://127.0.0.1:18787".to_string(),
@@ -8894,6 +11279,7 @@ mod tests {
             display_name: "Vision Model".to_string(),
             source: ProviderProfileSource::Native,
             model: "vision-model".to_string(),
+            context_window: None,
             upstream_identity: None,
             identity_override: true,
             base_url: format!("http://{address}"),
@@ -8912,6 +11298,7 @@ mod tests {
             display_name: "Text Model".to_string(),
             source: ProviderProfileSource::Native,
             model: "text-model".to_string(),
+            context_window: None,
             upstream_identity: None,
             identity_override: true,
             base_url: "https://example.invalid".to_string(),
@@ -9085,6 +11472,113 @@ mod tests {
         assert_eq!(request["generation_config"]["thinking_level"], "high");
 
         fs::remove_dir_all(&output_dir).unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn configured_kimi_formula_is_exposed_and_executed_only_when_enabled() {
+        let captured = Arc::new(tokio::sync::Mutex::new(None::<Value>));
+        let captured_for_fiber = captured.clone();
+        let mock = Router::new()
+            .route(
+                "/v1/formulas/moonshot/web-search:latest/tools",
+                get(|headers: HeaderMap| async move {
+                    assert_eq!(
+                        headers
+                            .get(AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok()),
+                        Some("Bearer formula-secret")
+                    );
+                    Json(json!({
+                        "tools": [{
+                            "type": "function",
+                            "function": {
+                                "name": "web_search",
+                                "description": "Search the web",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"query": {"type": "string"}},
+                                    "required": ["query"]
+                                }
+                            }
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/v1/formulas/moonshot/web-search:latest/fibers",
+                post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                    let captured = captured_for_fiber.clone();
+                    async move {
+                        assert_eq!(
+                            headers
+                                .get(AUTHORIZATION)
+                                .and_then(|value| value.to_str().ok()),
+                            Some("Bearer formula-secret")
+                        );
+                        *captured.lock().await = Some(body);
+                        Json(json!({"context": {"encrypted_output": "encrypted-search-result"}}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        let mut profile = test_provider_profile(
+            Client::builder().no_proxy().build().unwrap(),
+            format!("http://{address}/anthropic/v1/messages"),
+        );
+        profile.file_name = "kimi-k3.json".to_string();
+        profile.model = "kimi-k3".to_string();
+        profile.base_url = format!("http://{address}/anthropic");
+        profile.auth_token = Some("formula-secret".to_string());
+        profile.openai_capabilities.chat_dialect = OpenAiChatDialect::Kimi;
+        profile.openai_capabilities.kimi_formula_tools =
+            vec!["moonshot/web-search:latest".to_string()];
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let state = AppState {
+            gemini_transport: Arc::new(RwLock::new(GeminiTransport {
+                client: Client::builder().build().unwrap(),
+                proxy_url: None,
+            })),
+            fallback_api_key: Some("local-token".to_string()),
+            upstream_url: "https://example.invalid".to_string(),
+            model: "bridge-router".to_string(),
+            thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
+            interaction_continuations: Arc::new(RwLock::new(
+                InteractionContinuationCache::default(),
+            )),
+            vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
+            routing: Arc::new(RwLock::new(ProviderRoutingState {
+                profiles: vec![profile],
+                active_file: "kimi-k3.json".to_string(),
+                source: ProviderProfileSource::Native,
+            })),
+            shutdown_tx,
+            settings_dir: PathBuf::new(),
+            providers_dir: PathBuf::new(),
+            bridge_state_path: PathBuf::new(),
+            image_output_dir: env::temp_dir(),
+            image_model: DEFAULT_IMAGE_MODEL.to_string(),
+            image_upstream_url: DEFAULT_IMAGE_UPSTREAM.to_string(),
+            local_bridge_base_url: "http://127.0.0.1:18787".to_string(),
+            admin_state_lock: Arc::new(tokio::sync::Mutex::new(())),
+        };
+
+        let tools = configured_kimi_formula_tools(&state).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].mcp_definition["name"], "web_search");
+        let result =
+            execute_kimi_formula(&state, "web_search", Some(&json!({"query": "Moonshot AI"})))
+                .await
+                .unwrap();
+        assert_eq!(kimi_formula_result_text(&result), "encrypted-search-result");
+        let captured = captured.lock().await;
+        assert_eq!(captured.as_ref().unwrap()["name"], "web_search");
+        assert_eq!(
+            captured.as_ref().unwrap()["arguments"],
+            "{\"query\":\"Moonshot AI\"}"
+        );
         server.abort();
     }
 
@@ -9535,6 +12029,186 @@ mod tests {
         );
         assert_eq!(translated["tool_choice"], "auto");
         assert_eq!(translated["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn deepseek_chat_replays_reasoning_and_uses_v4_thinking_contract() {
+        let request = json!({
+            "messages": [
+                {"role": "user", "content": "Inspect the repository"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "I should inspect Cargo.toml first."},
+                    {"type": "text", "text": "I will inspect it."},
+                    {"type": "tool_use", "id": "toolu_ds_1", "name": "read_file", "input": {"path": "Cargo.toml"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_ds_1", "content": "[package]"}
+                ]}
+            ],
+            "thinking": {"type": "enabled", "budget_tokens": 16384},
+            "output_config": {"effort": "max"},
+            "tool_choice": {"type": "auto"}
+        });
+        let capabilities = OpenAiCapabilities {
+            chat_dialect: OpenAiChatDialect::DeepSeek,
+            ..OpenAiCapabilities::default()
+        };
+        let signatures = RwLock::new(IndexMap::new());
+
+        let translated = translate_anthropic_request_with_capabilities(
+            &request,
+            "deepseek-v4-flash",
+            &signatures,
+            &capabilities,
+        )
+        .unwrap();
+
+        assert_eq!(translated["thinking"]["type"], "enabled");
+        assert_eq!(translated["reasoning_effort"], "max");
+        assert!(translated.get("tool_choice").is_none());
+        assert_eq!(
+            translated["messages"][1]["reasoning_content"],
+            "I should inspect Cargo.toml first."
+        );
+    }
+
+    #[test]
+    fn qwen_chat_maps_thinking_history_budget_and_structured_output() {
+        let request = json!({
+            "messages": [
+                {"role": "user", "content": "Extract metadata"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "I need the file."},
+                    {"type": "tool_use", "id": "toolu_qwen_1", "name": "read_file", "input": {"path": "Cargo.toml"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_qwen_1", "content": "[package]"}
+                ]}
+            ],
+            "thinking": {"type": "enabled", "budget_tokens": 12000},
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}},
+                        "required": ["name"]
+                    }
+                }
+            }
+        });
+        let capabilities = OpenAiCapabilities {
+            chat_dialect: OpenAiChatDialect::Qwen,
+            ..OpenAiCapabilities::default()
+        };
+        let signatures = RwLock::new(IndexMap::new());
+
+        let translated = translate_anthropic_request_with_capabilities(
+            &request,
+            "qwen3.8-max",
+            &signatures,
+            &capabilities,
+        )
+        .unwrap();
+
+        assert_eq!(translated["enable_thinking"], true);
+        assert_eq!(translated["thinking_budget"], 12000);
+        assert_eq!(translated["preserve_thinking"], true);
+        assert!(translated.get("reasoning_effort").is_none());
+        assert_eq!(
+            translated["messages"][1]["reasoning_content"],
+            "I need the file."
+        );
+        assert_eq!(translated["response_format"]["type"], "json_schema");
+        assert_eq!(
+            translated["response_format"]["json_schema"]["schema"]["type"],
+            "object"
+        );
+    }
+
+    #[test]
+    fn kimi_chat_replays_reasoning_and_maps_k3_agent_contract() {
+        let request = json!({
+            "system": "You are a coding agent.",
+            "metadata": {"user_id": "private-user@example.com"},
+            "messages": [
+                {"role": "user", "content": "Inspect Cargo.toml"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "I should inspect the file first."},
+                    {"type": "tool_use", "id": "toolu_kimi_1", "name": "read_file", "input": {"path": "Cargo.toml"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_kimi_1", "content": "[package]"}
+                ]}
+            ],
+            "max_tokens": 131072,
+            "temperature": 0.2,
+            "top_p": 0.8,
+            "thinking": {"type": "disabled", "budget_tokens": 12000},
+            "output_config": {
+                "effort": "medium",
+                "format": {
+                    "type": "json_schema",
+                    "name": "package",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}},
+                        "required": ["name"]
+                    }
+                }
+            },
+            "tool_choice": {"type": "any"}
+        });
+        let capabilities = OpenAiCapabilities::for_openai_base_url("https://api.moonshot.ai/v1");
+        let signatures = RwLock::new(IndexMap::new());
+
+        let translated = translate_anthropic_request_with_capabilities(
+            &request,
+            "kimi-k3",
+            &signatures,
+            &capabilities,
+        )
+        .unwrap();
+
+        assert_eq!(capabilities.chat_dialect, OpenAiChatDialect::Kimi);
+        assert_eq!(translated["max_completion_tokens"], 131072);
+        assert!(translated.get("max_tokens").is_none());
+        assert!(translated.get("temperature").is_none());
+        assert!(translated.get("top_p").is_none());
+        assert!(translated.get("thinking").is_none());
+        assert_eq!(translated["reasoning_effort"], "high");
+        assert_eq!(translated["tool_choice"], "required");
+        assert_eq!(
+            translated["messages"][2]["reasoning_content"],
+            "I should inspect the file first."
+        );
+        assert_eq!(translated["response_format"]["type"], "json_schema");
+        assert_eq!(
+            translated["response_format"]["json_schema"]["schema"]["type"],
+            "object"
+        );
+        assert!(translated["prompt_cache_key"]
+            .as_str()
+            .unwrap()
+            .starts_with("claude-bridge-"));
+        assert!(translated["safety_identifier"]
+            .as_str()
+            .unwrap()
+            .starts_with("user_"));
+        assert!(!translated["safety_identifier"]
+            .as_str()
+            .unwrap()
+            .contains("private-user"));
+
+        let mut continued = request.clone();
+        continued["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role": "user", "content": "Continue"}));
+        assert_eq!(
+            kimi_prompt_cache_key(&request),
+            kimi_prompt_cache_key(&continued)
+        );
     }
 
     #[test]
@@ -10827,6 +13501,7 @@ mod tests {
             display_name: "Test".to_string(),
             source: ProviderProfileSource::Native,
             model: "test-model".to_string(),
+            context_window: None,
             upstream_identity: None,
             identity_override: true,
             base_url: "https://example.invalid".to_string(),
@@ -10873,6 +13548,7 @@ mod tests {
             display_name: "Anthropic".to_string(),
             source: ProviderProfileSource::Native,
             model: "claude-test".to_string(),
+            context_window: None,
             upstream_identity: None,
             identity_override: false,
             base_url: "https://example.invalid".to_string(),
@@ -11140,6 +13816,7 @@ mod tests {
             display_name: "DeepSeek".to_string(),
             source: ProviderProfileSource::Legacy,
             model: "deepseek-v4-pro[1m]".to_string(),
+            context_window: None,
             upstream_identity: None,
             identity_override: true,
             base_url: "https://example.invalid".to_string(),
@@ -11214,6 +13891,7 @@ mod tests {
             display_name: "DeepSeek".to_string(),
             source: ProviderProfileSource::Legacy,
             model: "deepseek-chat".to_string(),
+            context_window: None,
             upstream_identity: Some("  DeepSeek\nV3  ".to_string()),
             identity_override: true,
             base_url: "https://example.invalid".to_string(),
@@ -11254,6 +13932,7 @@ mod tests {
             display_name: "Gemini Interactions".to_string(),
             source: ProviderProfileSource::Native,
             model: "gemini-3.6-flash".to_string(),
+            context_window: None,
             upstream_identity: None,
             identity_override: true,
             base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
@@ -11443,6 +14122,104 @@ mod tests {
             generate["generationConfig"]["responseMimeType"],
             "application/json"
         );
+    }
+
+    #[tokio::test]
+    async fn anthropic_count_tokens_uses_kimi_native_estimator() {
+        let captured = Arc::new(tokio::sync::Mutex::new(None::<Value>));
+        let captured_for_handler = captured.clone();
+        let mock = Router::new().route(
+            "/v1/tokenizers/estimate-token-count",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let captured = captured_for_handler.clone();
+                async move {
+                    assert_eq!(
+                        headers
+                            .get(AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok()),
+                        Some("Bearer secret")
+                    );
+                    *captured.lock().await = Some(body);
+                    Json(json!({"data": {"total_tokens": 654}}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        let mut profile = test_provider_profile(
+            Client::builder().no_proxy().build().unwrap(),
+            format!("http://{address}/anthropic/v1/messages"),
+        );
+        profile.file_name = "kimi-k3.json".to_string();
+        profile.model = "kimi-k3".to_string();
+        profile.context_window = Some(1_048_576);
+        profile.base_url = format!("http://{address}/anthropic");
+        profile.transport = ProviderTransport::Anthropic;
+        profile.openai_capabilities.chat_dialect = OpenAiChatDialect::Kimi;
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let state = Arc::new(AppState {
+            gemini_transport: Arc::new(RwLock::new(GeminiTransport {
+                client: Client::builder().build().unwrap(),
+                proxy_url: None,
+            })),
+            fallback_api_key: Some("local-token".to_string()),
+            upstream_url: "https://example.invalid".to_string(),
+            model: "bridge-router".to_string(),
+            thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
+            interaction_continuations: Arc::new(RwLock::new(
+                InteractionContinuationCache::default(),
+            )),
+            vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
+            routing: Arc::new(RwLock::new(ProviderRoutingState {
+                profiles: vec![profile],
+                active_file: "kimi-k3.json".to_string(),
+                source: ProviderProfileSource::Native,
+            })),
+            shutdown_tx,
+            settings_dir: PathBuf::new(),
+            providers_dir: PathBuf::new(),
+            bridge_state_path: PathBuf::new(),
+            image_output_dir: env::temp_dir(),
+            image_model: DEFAULT_IMAGE_MODEL.to_string(),
+            image_upstream_url: DEFAULT_IMAGE_UPSTREAM.to_string(),
+            local_bridge_base_url: "http://127.0.0.1:18787".to_string(),
+            admin_state_lock: Arc::new(tokio::sync::Mutex::new(())),
+        });
+        let response = anthropic_count_tokens(
+            State(state),
+            HeaderMap::new(),
+            Json(json!({
+                "system": "Count this too.",
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [{
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}
+                }]
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-claude-bridge-token-count")
+                .unwrap(),
+            "kimi-native"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["input_tokens"], 654);
+        let captured = captured.lock().await;
+        let captured = captured.as_ref().unwrap();
+        assert_eq!(captured["model"], "kimi-k3");
+        assert!(captured["messages"].is_array());
+        assert_eq!(captured["tools"][0]["function"]["name"], "read_file");
+        assert!(captured.get("stream").is_none());
+        server.abort();
     }
 
     #[tokio::test]
@@ -11960,5 +14737,374 @@ mod tests {
             .unwrap();
         assert_eq!(call.interaction_id, "interaction-stream-1");
         assert_eq!(call.name, "lookup");
+    }
+
+    fn responses_test_profile(file_name: &str, base_url: &str, model: &str) -> ProviderProfile {
+        let mut profile = test_provider_profile(
+            Client::builder().build().unwrap(),
+            openai_responses_endpoint(base_url),
+        );
+        profile.file_name = file_name.to_string();
+        profile.base_url = base_url.to_string();
+        profile.model = model.to_string();
+        profile.transport = ProviderTransport::OpenAiResponses;
+        profile.openai_capabilities = OpenAiCapabilities::for_responses_base_url(base_url);
+        profile
+    }
+
+    #[test]
+    fn deepseek_responses_fixture_preserves_reasoning_custom_tools_and_stateless_history() {
+        let mut profile = responses_test_profile(
+            "deepseek-responses.json",
+            "https://api.deepseek.com/v1",
+            "deepseek-v4-flash",
+        );
+        profile.openai_capabilities.responses_builtin_tools = vec!["web_search".to_string()];
+        let continuations = RwLock::new(InteractionContinuationCache::default());
+        let request = json!({
+            "system": "You are a coding agent.",
+            "messages": [
+                {"role": "user", "content": "Patch the project"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "I need to apply a focused patch."},
+                    {"type": "text", "text": "I will apply the focused change."},
+                    {"type": "tool_use", "id": "call_ds_patch", "name": "apply_patch", "input": {"patch": "*** Begin Patch\n*** End Patch"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_ds_patch", "content": "Done!"}
+                ]}
+            ],
+            "thinking": {"type": "enabled"},
+            "output_config": {"effort": "max"},
+            "tools": [{
+                "name": "apply_patch",
+                "description": "Apply a patch",
+                "input_schema": {"type": "object", "properties": {"patch": {"type": "string"}}}
+            }]
+        });
+
+        let translated =
+            translate_anthropic_to_responses(&request, &profile, &continuations).unwrap();
+        assert_eq!(translated["store"], false);
+        assert!(translated.get("previous_response_id").is_none());
+        assert_eq!(translated["reasoning"]["effort"], "max");
+        assert!(translated["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "reasoning"));
+        let input = translated["input"].as_array().unwrap();
+        let reasoning_index = input
+            .iter()
+            .position(|item| item["type"] == "reasoning")
+            .unwrap();
+        let visible_text_index = input
+            .iter()
+            .position(|item| item["role"] == "assistant")
+            .unwrap();
+        let custom_call_index = input
+            .iter()
+            .position(|item| item["type"] == "custom_tool_call")
+            .unwrap();
+        assert!(reasoning_index < visible_text_index && visible_text_index < custom_call_index);
+        assert!(translated["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "custom_tool_call_output"));
+        assert!(translated["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["type"] == "custom" && tool["name"] == "apply_patch"));
+        assert!(translated["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["type"] == "web_search"));
+    }
+
+    #[test]
+    fn qwen_responses_fixture_uses_exact_stateful_tool_continuation() {
+        let profile = responses_test_profile(
+            "qwen-responses.json",
+            "https://workspace.cn-beijing.maas.aliyuncs.com/v1",
+            "qwen3.8-max",
+        );
+        assert!(profile.openai_capabilities.responses_stateful);
+        assert!(profile.openai_capabilities.responses_session_cache);
+        let continuations = RwLock::new(InteractionContinuationCache::default());
+        let first_request = json!({
+            "system": "You are a coding agent.",
+            "messages": [{"role": "user", "content": "Read Cargo.toml"}]
+        });
+        let assistant_content = vec![
+            json!({"type": "thinking", "thinking": "I should inspect the file."}),
+            json!({"type": "tool_use", "id": "call_qwen_read", "name": "read_file", "input": {"path": "Cargo.toml"}}),
+        ];
+        remember_interaction_continuation(
+            &continuations,
+            &profile.file_name,
+            &first_request,
+            "resp_qwen_1",
+            &assistant_content,
+            &[("call_qwen_read".to_string(), "read_file".to_string())],
+        );
+        let request = json!({
+            "system": "You are a coding agent.",
+            "messages": [
+                {"role": "user", "content": "Read Cargo.toml"},
+                {"role": "assistant", "content": assistant_content},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_qwen_read", "content": "[package]"}]}
+            ]
+        });
+
+        let translated =
+            translate_anthropic_to_responses(&request, &profile, &continuations).unwrap();
+        assert_eq!(translated["store"], true);
+        assert_eq!(translated["previous_response_id"], "resp_qwen_1");
+        assert!(translated.get("instructions").is_none());
+        assert_eq!(translated["input"].as_array().unwrap().len(), 1);
+        assert_eq!(translated["input"][0]["type"], "function_call_output");
+        assert_eq!(translated["input"][0]["call_id"], "call_qwen_read");
+    }
+
+    #[test]
+    fn responses_fixture_maps_semantic_output_server_tools_and_detailed_usage() {
+        let upstream = json!({
+            "id": "resp_ds_2",
+            "status": "completed",
+            "output": [
+                {"type": "reasoning", "id": "rs_1", "content": [{"type": "reasoning_text", "text": "I should search first."}]},
+                {"type": "web_search_call", "id": "ws_1", "status": "completed", "arguments": {"query": "DeepSeek API"}},
+                {"type": "message", "id": "msg_1", "content": [{"type": "output_text", "text": "Found it."}]},
+                {"type": "function_call", "call_id": "call_1", "name": "read_file", "arguments": "{\"path\":\"Cargo.toml\"}"}
+            ],
+            "usage": {
+                "input_tokens": 100,
+                "input_tokens_details": {"cached_tokens": 40},
+                "output_tokens": 20,
+                "output_tokens_details": {"reasoning_tokens": 12}
+            }
+        });
+        let translated =
+            translate_openai_responses_response(&upstream, "deepseek-v4-flash", 1).unwrap();
+        assert_eq!(translated.message["content"][0]["type"], "thinking");
+        assert_eq!(translated.message["content"][1]["text"], "Found it.");
+        assert_eq!(
+            translated.message["content"][2]["input"]["path"],
+            "Cargo.toml"
+        );
+        assert_eq!(translated.message["stop_reason"], "tool_use");
+        assert_eq!(translated.message["usage"]["cache_read_input_tokens"], 40);
+        assert_eq!(translated.message["usage"]["reasoning_tokens"], 12);
+        assert_eq!(
+            translated.message["usage"]["server_tool_use"]["web_search_requests"],
+            1
+        );
+        assert_eq!(
+            translated.message["provider_metadata"]["openai"]["responses_server_tools"][0]["type"],
+            "web_search_call"
+        );
+    }
+
+    #[test]
+    fn chat_usage_fixture_maps_cache_creation_cache_read_and_reasoning_tokens() {
+        let upstream = json!({
+            "choices": [{
+                "message": {"content": "Done."},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 90,
+                "prompt_tokens_details": {"cached_tokens": 30},
+                "cache_creation_input_tokens": 10,
+                "completion_tokens": 18,
+                "completion_tokens_details": {"reasoning_tokens": 11}
+            }
+        });
+        let signatures = RwLock::new(IndexMap::new());
+        let translated = translate_anthropic_response_with_capabilities(
+            &upstream,
+            "qwen3.8-max",
+            &signatures,
+            &OpenAiCapabilities::default(),
+        )
+        .unwrap();
+        assert_eq!(translated["usage"]["input_tokens"], 90);
+        assert_eq!(translated["usage"]["output_tokens"], 18);
+        assert_eq!(translated["usage"]["cache_read_input_tokens"], 30);
+        assert_eq!(translated["usage"]["cache_creation_input_tokens"], 10);
+        assert_eq!(translated["usage"]["reasoning_tokens"], 11);
+    }
+
+    #[test]
+    fn kimi_usage_fixtures_map_top_level_cached_tokens_for_unary_and_streaming() {
+        let capabilities = OpenAiCapabilities::for_openai_base_url("https://api.moonshot.ai/v1");
+        let upstream = json!({
+            "choices": [{
+                "message": {"reasoning_content": "Check the result.", "content": "Done."},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 120,
+                "completion_tokens": 20,
+                "total_tokens": 140,
+                "cached_tokens": 72
+            }
+        });
+        let signatures = RwLock::new(IndexMap::new());
+        let translated = translate_anthropic_response_with_capabilities(
+            &upstream,
+            "kimi-k3",
+            &signatures,
+            &capabilities,
+        )
+        .unwrap();
+        assert_eq!(translated["usage"]["cache_read_input_tokens"], 72);
+        assert_eq!(translated["content"][0]["type"], "thinking");
+
+        let signatures = Arc::new(RwLock::new(IndexMap::new()));
+        let mut stream = AnthropicStreamTranslator::with_capabilities(
+            "kimi-k3".to_string(),
+            signatures,
+            1,
+            capabilities,
+        );
+        stream.start_events().unwrap();
+        stream
+            .process_payload(
+                r#"{"choices":[{"delta":{"reasoning_content":"Think."},"finish_reason":null}]}"#,
+            )
+            .unwrap();
+        stream
+            .process_payload(
+                r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":120,"completion_tokens":20,"cached_tokens":72}}"#,
+            )
+            .unwrap();
+        assert_eq!(stream.cache_read_input_tokens, Some(72));
+        assert_eq!(stream.input_tokens, 120);
+        assert_eq!(stream.output_tokens, 20);
+        stream.finish().unwrap();
+    }
+
+    #[test]
+    fn provider_diagnostics_expose_chat_and_responses_downgrades() {
+        let request = json!({
+            "metadata": {"user_id": "test"},
+            "service_tier": "auto",
+            "thinking": {"type": "enabled", "budget_tokens": 12000},
+            "tool_choice": {"type": "auto"},
+            "output_config": {"format": {"type": "json_schema", "schema": {"type": "object"}}},
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}}]},
+                {"role": "assistant", "content": "Hello."},
+                {"role": "user", "content": "Continue."}
+            ]
+        });
+        let deepseek = OpenAiCapabilities::for_openai_base_url("https://api.deepseek.com/v1");
+        let chat = openai_request_diagnostics(&request, &deepseek, ProviderTransport::OpenAiChat)
+            .join("\n");
+        assert!(chat.contains("metadata"));
+        assert!(chat.contains("service_tier"));
+        assert!(chat.contains("cache_control"));
+        assert!(chat.contains("Suppressed Anthropic tool_choice"));
+        assert!(chat.contains("Downgraded Anthropic json_schema"));
+
+        let mut kimi_request = request.clone();
+        kimi_request["thinking"]["type"] = json!("disabled");
+        kimi_request["output_config"]["effort"] = json!("medium");
+        let kimi = OpenAiCapabilities::for_openai_base_url("https://api.moonshot.ai/v1");
+        let kimi = openai_request_diagnostics(&kimi_request, &kimi, ProviderTransport::OpenAiChat)
+            .join("\n");
+        assert!(kimi.contains("always reasons"));
+        assert!(kimi.contains("reasoning_effort 'high'"));
+
+        let responses = OpenAiCapabilities::for_responses_base_url("https://api.deepseek.com/v1");
+        let responses =
+            openai_request_diagnostics(&request, &responses, ProviderTransport::OpenAiResponses)
+                .join("\n");
+        assert!(responses.contains("thinking budget"));
+        assert!(responses.contains("stateless"));
+    }
+
+    #[test]
+    fn responses_stream_fixture_covers_thinking_tool_call_and_continuation_state() {
+        let continuations = Arc::new(RwLock::new(InteractionContinuationCache::default()));
+        let request = json!({
+            "messages": [{"role": "user", "content": "Inspect Cargo.toml"}],
+            "stream": true
+        });
+        let mut translator = OpenAiResponsesStreamTranslator::new(
+            "qwen3.8-max".to_string(),
+            "qwen-responses.json".to_string(),
+            request,
+            continuations.clone(),
+            10,
+        );
+        assert_eq!(translator.start_events().unwrap().len(), 1);
+        translator.process_payload(r#"{"type":"response.created","response":{"id":"resp_stream_1","status":"in_progress"}}"#).unwrap();
+        translator.process_payload(r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1"}}"#).unwrap();
+        translator.process_payload(r#"{"type":"response.reasoning_text.delta","output_index":0,"delta":"I should inspect it."}"#).unwrap();
+        translator.process_payload(r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1"}}"#).unwrap();
+        translator.process_payload(r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_stream_1","name":"read_file"}}"#).unwrap();
+        translator.process_payload(r#"{"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"path\":\"Cargo.toml\"}"}"#).unwrap();
+        translator.process_payload(r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"call_stream_1","name":"read_file","arguments":"{\"path\":\"Cargo.toml\"}"}}"#).unwrap();
+        translator.process_payload(r#"{"type":"response.completed","response":{"id":"resp_stream_1","status":"completed","usage":{"input_tokens":10,"output_tokens":5,"output_tokens_details":{"reasoning_tokens":3}}}}"#).unwrap();
+        assert_eq!(translator.finish().unwrap().len(), 2);
+        assert_eq!(translator.assistant_content[0]["type"], "thinking");
+        assert_eq!(translator.assistant_content[1]["type"], "tool_use");
+        assert_eq!(
+            translator.assistant_content[1]["input"]["path"],
+            "Cargo.toml"
+        );
+        let cache = continuations.read().unwrap();
+        let call = cache
+            .calls
+            .get("qwen-responses.json\0call_stream_1")
+            .unwrap();
+        assert_eq!(call.interaction_id, "resp_stream_1");
+    }
+
+    #[tokio::test]
+    async fn qwen_responses_forward_enables_official_session_cache_header() {
+        let captured = Arc::new(tokio::sync::Mutex::new(None::<HeaderMap>));
+        let captured_for_handler = captured.clone();
+        let mock = Router::new().route(
+            "/v1/responses",
+            post(move |headers: HeaderMap, Json(_body): Json<Value>| {
+                let captured = captured_for_handler.clone();
+                async move {
+                    *captured.lock().await = Some(headers);
+                    Json(json!({
+                        "id": "resp_qwen_header",
+                        "status": "completed",
+                        "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}],
+                        "usage": {"input_tokens": 2, "output_tokens": 1}
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        let mut profile = responses_test_profile(
+            "qwen-responses.json",
+            "https://workspace.cn-beijing.maas.aliyuncs.com/v1",
+            "qwen3.8-max",
+        );
+        profile.upstream_url = format!("http://{address}/v1/responses");
+        profile.client = Client::builder().no_proxy().build().unwrap();
+        let response = forward_openai_responses_profile(
+            profile,
+            json!({"messages": [{"role": "user", "content": "hello"}]}),
+            Arc::new(RwLock::new(InteractionContinuationCache::default())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = captured.lock().await.clone().unwrap();
+        assert_eq!(headers["x-dashscope-session-cache"], "enable");
+        assert_eq!(headers["authorization"], "Bearer secret");
+        server.abort();
     }
 }

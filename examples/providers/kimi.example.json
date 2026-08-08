@@ -1,6 +1,10 @@
 {
-  "name": "Kimi",
-  "model": "moonshot-v1-8k",
-  "base_url": "https://api.moonshot.cn/v1",
-  "api_key": "<MOONSHOT_API_KEY>"
+  "name": "Kimi K3 1M",
+  "model": "kimi-k3",
+  "protocol": "anthropic",
+  "base_url": "https://api.moonshot.ai/anthropic",
+  "api_key": "<MOONSHOT_API_KEY>",
+  "auth_scheme": "bearer",
+  "context_window": 1048576,
+  "identity": "Kimi K3"
 }
