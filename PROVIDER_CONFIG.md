@@ -63,6 +63,9 @@ DeepSeek V4 Flash 与 Qwen3.8-Max 的推荐默认配置是厂商原生 Anthropic
 }
 ```
 
+Pro 模型只需把 `model` 换成 `deepseek-v4-pro[1m]`，其余字段与 Flash 一致，可直接复制
+[`examples/providers/deepseek-v4-pro.example.json`](examples/providers/deepseek-v4-pro.example.json)。
+
 ```json
 {
   "name": "Qwen3.8 Max",
@@ -97,14 +100,31 @@ tool call ID 命中时发送 `previous_response_id`，同时启用 `x-dashscope-
 Completions 仍可作为 fallback：桥接器会从官方域名推断方言，也可用
 `capabilities.chat_dialect` 显式指定 `deepseek` 或 `qwen`。
 
-DeepSeek 推荐的 Anthropic 路径与 Chat fallback 共用三种实际运行态：`none/minimal/low` 关闭 thinking，
-`medium/high` 映射为官方 `high`，`xhigh/max` 映射为官方 `max`。仅使用
-`thinking.budget_tokens` 时，32,768 以下保持 `high`，达到 32,768 才进入 `max`，避免
-Claude Code 常见的 16K budget 让简单轮次长期运行在最高推理档。DeepSeek 当前没有原生
-`low/medium` reasoning effort，因此降到快速模式时会返回明确的
-`x-claude-bridge-warning`，而不是把 `low` 静默抬成 `high`。Anthropic 路径在
-`max_tokens <= budget_tokens` 时还会把 `max_tokens` 提高到 `budget_tokens + 8,192`，
-避免严格端点因输出上限不大于 thinking budget 而返回 400，并为可见输出保留空间。
+DeepSeek 推荐的 Anthropic 路径与 Chat fallback 共用四种实际运行态：`none` 关闭 thinking，
+`minimal/low` 映射为官方 `low`（V4 GA 起两模型均支持，官方文档与实测确认），`medium/high`
+映射为官方 `high`，`xhigh/max` 映射为官方 `max`。仅使用 `thinking.budget_tokens` 时，
+32,768 以下保持 `high`，达到 32,768 才进入 `max`，避免 Claude Code 常见的 16K budget
+让简单轮次长期运行在最高推理档——DeepSeek Anthropic 端点会忽略 `budget_tokens`（实测
+64 token budget 仍产出完整思考），桥接器的 budget→effort 翻译是唯一让该字段生效的机制。
+Anthropic 路径在 `max_tokens <= budget_tokens` 时还会把 `max_tokens` 提高到
+`budget_tokens + 8,192`，为可见输出保留空间。
+
+DeepSeek V4 thinking 模式接受 `tool_choice` 的 `auto/any/none`，但拒绝命名工具偏好
+（HTTP 400「Thinking mode does not support this tool_choice」，实测），桥接器只剥离
+`{"type":"tool","name":...}` 形式并记录 `x-claude-bridge-warning`，其余形式正常转发。
+
+V4 GA 相关事实（2026-08 官方文档，Pro 与 Flash 的 effort 映射完全一致）：两模型均 1M
+上下文、最大输出 384K、纯文本（视觉走 proxy）；并发额度 Pro 500 / Flash 2500；
+价格按 peak/off-peak 时段计费（off-peak 半价）；`metadata.user_id` 可用于 KVCache
+隔离与每用户限流；Claude Code 的 Web Search 由 DeepSeek 服务端原生执行。
+
+三个传输路径都带 429 退避重试（最多 3 次，500ms/1s/2s 递增，尊重 `Retry-After`，
+上限 10s），多人共用同一账户时单个 peer 的突发不会把并发上限消耗成可见失败。
+Web Search 的 `web_search_20250305` 服务端工具在 Anthropic 路径上原样透传、由
+DeepSeek 服务端执行（实测：模型发出 `server_tool_use`，API 返回
+`web_search_tool_result`）；Chat fallback 无法服务端执行，桥接器会跳过该工具并
+发出 `x-claude-bridge-warning`，历史里的搜索结果以标题/URL 文本形式保留（正文
+`encrypted_content` 仅供客户端解密）。
 
 若希望 Claude Code 对 DeepSeek 默认请求最高 effort，应在 Claude Code 自己的
 `%USERPROFILE%\.claude\settings.json` 中设置 `env.CLAUDE_CODE_EFFORT_LEVEL` 为 `max`；
@@ -195,20 +215,22 @@ Kimi Formula 官方工具通过本地 MCP 显式启用；空数组表示完全�
 
 ## Gemini 原生 Interactions（推荐）
 
-Gemini 3.6 Flash 建议使用 Google 原生 Interactions API，而不是 OpenAI 兼容层：
+Gemini 3.7 Flash 建议使用已 GA 的 Google 原生 Interactions API，而不是 OpenAI 兼容层：
 
 ```json
 {
-  "name": "Google Gemini 3.6 Flash",
-  "model": "gemini-3.6-flash",
+  "name": "Google Gemini 3.7 Flash",
+  "model": "gemini-3.7-flash",
+  "context_window": 1048576,
   "base_url": "https://generativelanguage.googleapis.com/v1beta",
   "api_key": "<GEMINI_API_KEY>",
   "protocol": "gemini-interactions",
   "proxy": "http://127.0.0.1:8080",
   "capabilities": {
-    "default_reasoning_effort": "high",
+    "default_reasoning_effort": "medium",
     "include_thoughts": true,
     "sampling_parameters": false,
+    "max_tool_result_chars": 16000,
     "gemini_builtin_tools": [
       "google_search",
       "url_context",
@@ -219,6 +241,18 @@ Gemini 3.6 Flash 建议使用 Google 原生 Interactions API，而不是 OpenAI 
   }
 }
 ```
+
+Gemini 3.7 Flash 的输入窗口为 1,048,576 tokens、最大输出为 65,536 tokens，默认 Thinking
+档位为 `medium`。模型只接受 `low`、`medium`、`high`；桥接器会把 Claude 的
+`none`/`minimal` 映射到 `low`，把 `xhigh`/`max` 映射到 `high`，并继续丢弃 3.x
+不支持的 `temperature`、`top_p`、`top_k` 和 `candidate_count`。Interactions 流同时兼容
+官方资源 schema 的 `event_type`/`thought_summary`/`arguments_delta`，以及 3.7 迁移示例中的
+`type`/`thought`/`arguments`，并映射 cached、thought 和新旧 token usage 字段。
+
+模型中心为活动的 Gemini 3.7 Flash Interactions profile 提供“低 / 中 / 高”即时选择。该值写入
+`bridge-state.json`，切换后从下一次请求生效，无需重启；它的优先级高于 Claude 请求携带的
+`output_config.effort`、`thinking.budget_tokens` 以及 profile 的 `default_reasoning_effort`。
+因此 GUI 选择表示明确的全局强制档位，而 profile 字段仍是未设置 GUI override 时的默认值。
 
 此 transport 固定发送 `store: true`。首轮成功后，普通多轮按完整消息前缀指纹、
 工具轮次按 Google 的 opaque `call_id` 查找并发送 `previous_interaction_id`；只有
@@ -295,6 +329,7 @@ Claude Code 请求在此 transport 上按下表映射：
     "tool_result_media": "separate_user",
     "tool_schema": "sanitize",
     "max_tokens_field": "max_tokens",
+    "max_tool_result_chars": 16000,
     "chat_dialect": "generic",
     "responses_stateful": false,
     "responses_session_cache": false,
@@ -316,7 +351,11 @@ Claude Code 请求在此 transport 上按下表映射：
 - `name`：可选，默认使用 `model`。
 - `protocol`：可选，默认 `openai`；原生 Anthropic Messages 服务可填
   `anthropic`；OpenAI Responses 使用 `openai-responses`；Google 原生有状态接口使用
-  `gemini-interactions`。安装器生成的本地 Gemini 深度转换路由使用保留值 `gemini`。
+  `gemini-interactions`。旧版安装器生成的本地 Gemini 兼容路由使用保留值 `gemini`。
+- `bridge_managed_credentials`：仅适用于 `gemini-interactions`。设为 `true` 时，profile
+  不必重复保存 Google Key；桥接器使用服务的 `GEMINI_BRIDGE_API_KEY_PROFILE` 凭据，并在
+  profile 未单独设置 `proxy` 时沿用桥接器全局 Gemini 代理。为防止凭据外泄，此模式只允许
+  Google 官方 `https://generativelanguage.googleapis.com` 主机。Windows 安装器默认使用此模式。
 - `endpoint`：可选，完整请求地址；设置后不会根据 `base_url`推导。
 - `identity`：可选，告诉下游模型它在此路由中的真实身份；默认使用模型 ID。
 - `identity_override`：可选，默认 `true`。设为 `false` 可关闭身份提示适配。
@@ -398,21 +437,32 @@ profile 时检查引用是否存在。
 | `parallel_tool_calls`            | `true`                                                           | 允许发送 `parallel_tool_calls` 控制；端点不认识该字段时设为 `false`                                                                          |
 | `reasoning_effort`               | `true`                                                           | 将 Claude Thinking 预算映射为 `reasoning_effort`；端点拒绝该参数时设为 `false`                                                               |
 | `default_reasoning_effort`       | 未设置                                                           | Claude 请求没有 Thinking 配置时使用的默认推理等级；可选 `none`、`minimal`、`low`、`medium`、`high`、`xhigh` 或 `max`                         |
+| `reasoning_effort_map`           | `{}`                                                             | 按 Provider 重映射推理等级；键和值使用上述七种等级。例如本地 Qwen 可把 `high/max` 映射为 `xhigh`、把 `none/minimal` 映射为 `low`             |
+| `reasoning_replay`               | `false`                                                          | 在通用 OpenAI Chat assistant 历史中回放 `reasoning_content`；仅当目标模型的 chat template 明确支持该字段时启用                              |
+| `reasoning_replay_scope`         | 未设置                                                           | 可选 `none`、`all` 或 `active_task`；`active_task` 只回放最新真实用户任务之后的思考，工具结果和最终正文不受影响；未设置时兼容旧 `reasoning_replay` 布尔值 |
 | `reasoning_fields`               | `["reasoning_content", "thinking"]`                              | 响应中按顺序识别的推理文本字段；可以填写一个字符串或字符串数组，空数组表示不提取推理文本                                                     |
 | `thinking_tags`                  | `true`                                                           | 将正文开头的 `<think>...</think>` 提取为 Thinking 块，并支持标签跨流式 Chunk；若模型需要原样输出该标签则设为 `false`                         |
 | `include_thoughts`               | `false`                                                          | 为 Google OpenAI 兼容端点请求思考摘要；启用时桥接器会把推理等级写入同一个 `thinking_config`，避免与 `reasoning_effort` 同时发送导致 HTTP 400 |
-| `sampling_parameters`            | `true`                                                           | 转发 Claude 的 `temperature` 和 `top_p`；Gemini 3.6 Flash 已废弃这些参数，应设为 `false`                                                     |
+| `sampling_parameters`            | `true`                                                           | 转发 Claude 的 `temperature` 和 `top_p`；Gemini 3.7 Flash 不支持这些参数，应设为 `false`                                                     |
 | `tool_result_media`              | `separate_user`                                                  | 保持 `role: tool` 的 `content` 为字符串，并将图片/PDF 移至后一条 `user` 消息；仅对明确支持工具消息内联媒体的端点使用 `inline`                |
 | `tool_schema`                    | `sanitize`                                                       | `sanitize` 清理常见不兼容元数据；确认端点支持完整 JSON Schema 时使用 `preserve`                                                              |
 | `max_tokens_field`               | `max_tokens`                                                     | 可选值为 `max_tokens`、`max_completion_tokens` 或 `omit`                                                                                     |
+| `max_output_tokens`              | 未设置                                                           | 可选正整数；限制单次 OpenAI Chat 响应的最大 token 数，并与 `context_window` 剩余空间取较小值                                                   |
+| `max_tool_result_chars`          | 未设置                                                           | 可选整数且不得小于 1024；仅裁剪发给模型的超长工具文本，确定性保留头尾并加入重读提示，图片/PDF 与 Claude Code 本地完整记录不受影响              |
 | `chat_dialect`                   | 按官方域名推断，否则 `generic`                                   | Chat fallback 可选 `generic`、`deepseek`、`qwen` 或 `kimi`；控制官方专属 thinking、推理回放与结构化输出参数                                  |
 | `responses_stateful`             | Qwen 官方域名为 `true`，其他为 `false`                           | 仅精确命中历史分支后发送 `previous_response_id`                                                                                              |
 | `responses_session_cache`        | Qwen 官方域名为 `true`（含 Anthropic transport），其他为 `false` | 发送 `x-dashscope-session-cache: enable`；Responses 路径已验证，Anthropic 路径效果尚待线上确认，不支持时会被上游忽略                         |
 | `responses_builtin_tools`        | `[]`                                                             | 为 Responses 请求显式增加供应商支持的服务端工具类型；空数组不会产生额外费用                                                                  |
 | `responses_apply_patch_custom`   | DeepSeek 官方域名为 `true`，其他为 `false`                       | 将名为 `apply_patch` 的函数工具映射为 Responses custom tool，并保持 raw patch 输入/输出轮次                                                  |
+| `user_id`                        | 无                                                               | DeepSeek 业务侧用户标识（`[a-zA-Z0-9_-]{1,512}`）；客户端 `metadata.user_id` 有效时优先，否则注入该默认值，用于 KVCache 隔离与每用户并发配额      |
 | `kimi_formula_tools`             | `[]`                                                             | 显式启用的 Kimi 官方 Formula URI；通过本地 MCP 获取 schema 并执行，默认不启用、不产生额外费用                                                |
 | `gemini_builtin_tools`           | `[]`                                                             | 仅 `gemini-interactions` 使用；可启用 `google_search`、`url_context`、`code_execution`、`google_maps` 服务端工具                             |
 | `gemini_file_search_store_names` | `[]`                                                             | 仅 `gemini-interactions` 使用；非空时启用 Google 原生 File Search，并传入指定 `fileSearchStores/...` 资源名                                  |
+
+本地 vLLM 提供的 Qwen OpenAI Chat 端点应继续使用 `chat_dialect: "generic"`，避免发送仅
+DashScope/百炼兼容层支持的 `enable_thinking`、`thinking_budget` 等字段。若模型只接受
+`low/medium/xhigh`，可同时设置 `reasoning_effort_map`；确认其 chat template 会读取 assistant
+消息的 `reasoning_content` 后，再开启 `reasoning_replay`。
 
 例如，一个拒绝 `stream_options` 和 `reasoning_effort`、要求
 `max_completion_tokens`，但支持完整 JSON Schema 的端点可以这样配置：
@@ -455,7 +505,8 @@ profile 时检查引用是否存在。
 仓库的 [`examples/providers`](examples/providers) 目录包含可直接复制的模板：
 
 - `qwen.example.json`：阿里云百炼 / DashScope
-- `deepseek.example.json`：DeepSeek
+- `deepseek.example.json`：DeepSeek V4 Flash
+- `deepseek-v4-pro.example.json`：DeepSeek V4 Pro（`deepseek-v4-pro[1m]`，1M 上下文）
 - `kimi.example.json`：Kimi / Moonshot
 - `gemini.example.json`：Google Gemini 的原生有状态 Interactions 接口
 - `custom-openai.example.json`：其他 OpenAI 兼容网关

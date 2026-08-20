@@ -60,7 +60,7 @@ Anthropic Messages · Agent · MCP · tools · thinking · media
 
 | 模型 | 推荐 transport | 已适配的关键能力 | 可选路径 |
 | --- | --- | --- | --- |
-| **Gemini 3.6 Flash** | `gemini-interactions` | 原生 `step.*` 流、有状态精确续接、Thinking/签名、图片与 PDF、原生 Token Count、结构化输出、Google 服务端工具 | OpenAI Chat fallback |
+| **Gemini 3.7 Flash** | `gemini-interactions` | 最新 `step.*` SSE 双格式、有状态精确续接、Thinking/签名、1M 上下文、图片与 PDF、原生 Token Count、结构化输出、详细 Usage、Google 服务端工具 | OpenAI Chat fallback |
 | **DeepSeek V4 Flash** | `anthropic` | 最少转换保留 Claude Code 协议；Anthropic 与 Chat 路径提供 disabled/high/max 三态推理并让 16K budget 保持 high；Chat 仅在请求完全不携带工具时省略普通推理，携带 `tools` 时按 API 契约完整回放全部推理 | 无状态 `openai-responses`、OpenAI Chat、Vision Proxy |
 | **Qwen3.8 Max** | `anthropic` | Anthropic/Chat 提供真正可区分的 `low/medium/xhigh` 三档并限制普通轮次预算，避免常驻最大推理；Responses 支持七档原生 effort、精确续接、会话缓存及 Usage/延迟观测 | 有状态 `openai-responses`、OpenAI Chat |
 | **Kimi K3** | `anthropic` | Bearer 鉴权、`kimi-k3`、1M 上下文元数据、原生 Token Estimate、缓存 Usage；Chat 路径支持 Kimi effort、推理回放和结构化输出 | OpenAI Chat、显式启用的 Kimi Formula MCP 工具 |
@@ -105,6 +105,8 @@ http://127.0.0.1:18787
 
 Windows 服务名为 `ClaudeCodeBridge`。安装器会备份并更新 Claude Code 的 `settings.json`，让 Claude Code 始终连接这个稳定的本地地址。首次安装后请重新启动正在运行的 Claude Code 会话。
 
+提供 Gemini Key 时，安装器会创建原生 `gemini-interactions` profile；真实 Google 凭据仅保存在受保护的服务凭据文件中，不会重复写入 Provider JSON。
+
 ### 2. 添加 Provider
 
 Provider 默认目录：
@@ -127,12 +129,15 @@ Provider 默认目录：
 
 - [Gemini 原生 Interactions](examples/providers/gemini.example.json)
 - [DeepSeek V4 Flash](examples/providers/deepseek.example.json)
+- [DeepSeek V4 Pro](examples/providers/deepseek-v4-pro.example.json)
 - [Qwen3.8 Max](examples/providers/qwen.example.json)
 - [Kimi K3](examples/providers/kimi.example.json)
 - [通用 OpenAI-compatible](examples/providers/custom-openai.example.json)
 - [能力覆盖示例](examples/providers/capability-overrides.example.json)
 
 保存后打开“Claude Code 模型中心”，点击“刷新配置”并选择模型。下一个请求立即使用新路由，无需重启 VS Code、Claude Code 或桥接服务。
+
+当活动配置是通过 `gemini-interactions` 连接的 Gemini 3.7 Flash 时，模型中心还会显示“低 / 中 / 高”Thinking 控件。选择会持久化并从下一次请求立即生效，无需重启服务或 Claude Code。
 
 完整字段、区域域名、鉴权方式、代理、Responses、Vision Proxy 和旧配置迁移见 [Provider 配置指南](PROVIDER_CONFIG.md)。
 

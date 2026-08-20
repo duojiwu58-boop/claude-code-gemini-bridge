@@ -96,15 +96,17 @@ impl GeminiInteractionsStreamTranslator {
         }
         let event: Value = serde_json::from_str(payload)
             .map_err(|err| format!("Invalid JSON in Gemini Interactions SSE stream: {err}"))?;
-        if event.get("error").is_some()
-            || event.get("event_type").and_then(Value::as_str) == Some("error")
-        {
-            return Err(safe_error_message(&event));
-        }
         let event_type = event
             .get("event_type")
+            .or_else(|| event.get("type"))
             .and_then(Value::as_str)
             .unwrap_or_default();
+        if event.get("error").is_some() || event_type == "error" {
+            return Err(safe_error_message(&event));
+        }
+        if let Some(usage) = event.pointer("/metadata/total_usage") {
+            self.capture_usage(usage);
+        }
         match event_type {
             "interaction.created"
             | "interaction.in_progress"
@@ -120,13 +122,16 @@ impl GeminiInteractionsStreamTranslator {
                         self.status = Some(status.to_string());
                     }
                 }
+                if event_type == "interaction.requires_action" {
+                    self.completed = true;
+                }
                 Ok(Vec::new())
             }
             "interaction.completed" => {
                 if let Some(interaction) = event.get("interaction") {
                     self.capture_interaction(interaction, true);
                 } else {
-                    self.completed = true;
+                    self.capture_interaction(&event, true);
                 }
                 Ok(Vec::new())
             }
@@ -145,9 +150,7 @@ impl GeminiInteractionsStreamTranslator {
             self.status = Some(status.to_string());
         }
         if let Some(usage) = interaction.get("usage") {
-            self.usage = usage.clone();
-            self.input_tokens =
-                usage_token(usage, &["total_input_tokens"]).unwrap_or(self.input_tokens);
+            self.capture_usage(usage);
         }
         if let Some(steps) = interaction.get("steps").and_then(Value::as_array) {
             for step in steps {
@@ -163,6 +166,15 @@ impl GeminiInteractionsStreamTranslator {
                 &self.calls,
             );
         }
+    }
+
+    fn capture_usage(&mut self, usage: &Value) {
+        self.usage = usage.clone();
+        self.input_tokens = usage_token(
+            usage,
+            &["total_input_tokens", "prompt_tokens", "input_tokens"],
+        )
+        .unwrap_or(self.input_tokens);
     }
 
     fn start_step(&mut self, event: &Value) -> Result<Vec<Event>, String> {
@@ -241,6 +253,61 @@ impl GeminiInteractionsStreamTranslator {
                 "content_block": content_block
             }),
         )?;
+        if let Some(active) = self.active_blocks.get_mut(&index) {
+            match &mut active.block {
+                InteractionStreamingBlock::Thought {
+                    thinking,
+                    signature,
+                } => {
+                    let initial_thinking = value_to_text(
+                        step.get("summary")
+                            .or_else(|| step.get("content"))
+                            .unwrap_or(&Value::Null),
+                    );
+                    if !initial_thinking.is_empty() {
+                        thinking.push_str(&initial_thinking);
+                        push_anthropic_event(
+                            &mut events,
+                            "content_block_delta",
+                            json!({
+                                "type": "content_block_delta",
+                                "index": active.anthropic_index,
+                                "delta": {"type": "thinking_delta", "thinking": initial_thinking}
+                            }),
+                        )?;
+                    }
+                    if let Some(value) = step.get("signature").and_then(Value::as_str) {
+                        *signature = Some(value.to_string());
+                        push_anthropic_event(
+                            &mut events,
+                            "content_block_delta",
+                            json!({
+                                "type": "content_block_delta",
+                                "index": active.anthropic_index,
+                                "delta": {"type": "signature_delta", "signature": value}
+                            }),
+                        )?;
+                    }
+                }
+                InteractionStreamingBlock::Text { text } => {
+                    let initial_text =
+                        value_to_text(step.get("content").unwrap_or(&Value::Null));
+                    if !initial_text.is_empty() {
+                        text.push_str(&initial_text);
+                        push_anthropic_event(
+                            &mut events,
+                            "content_block_delta",
+                            json!({
+                                "type": "content_block_delta",
+                                "index": active.anthropic_index,
+                                "delta": {"type": "text_delta", "text": initial_text}
+                            }),
+                        )?;
+                    }
+                }
+                InteractionStreamingBlock::Tool { .. } => {}
+            }
+        }
         Ok(events)
     }
 
@@ -266,8 +333,14 @@ impl GeminiInteractionsStreamTranslator {
                 thinking,
                 signature,
             } => match delta_type {
-                "thought_summary" => {
-                    let text = value_to_text(delta.get("content").unwrap_or(&Value::Null));
+                "thought" | "thought_summary" => {
+                    let text = delta
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| {
+                            value_to_text(delta.get("content").unwrap_or(&Value::Null))
+                        });
                     if !text.is_empty() {
                         thinking.push_str(&text);
                         push_anthropic_event(
@@ -436,14 +509,16 @@ impl GeminiInteractionsStreamTranslator {
         } else {
             "end_turn"
         };
-        let output_tokens = usage_token(&self.usage, &["total_output_tokens"]).unwrap_or(0);
         self.finished = true;
         let mut events = Vec::new();
         let mut delta = json!({"stop_reason": stop_reason, "stop_sequence": Value::Null});
         if let Some(metadata) = self.server_tools.provider_metadata() {
             delta["provider_metadata"] = metadata;
         }
-        let mut usage = json!({"output_tokens": output_tokens});
+        let mut usage = gemini_interaction_usage_to_anthropic(&self.usage, self.input_tokens);
+        if let Some(object) = usage.as_object_mut() {
+            object.remove("input_tokens");
+        }
         if let Some(server_tool_use) = self.server_tools.anthropic_usage() {
             usage["server_tool_use"] = server_tool_use;
         }

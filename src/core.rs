@@ -98,6 +98,28 @@ impl MaxTokensField {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ReasoningReplayScope {
+    #[default]
+    None,
+    All,
+    ActiveTask,
+}
+
+impl ReasoningReplayScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::All => "all",
+            Self::ActiveTask => "active_task",
+        }
+    }
+
+    fn enabled(self) -> bool {
+        self != Self::None
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct OpenAiCapabilities {
     chat_dialect: OpenAiChatDialect,
@@ -105,6 +127,9 @@ struct OpenAiCapabilities {
     parallel_tool_calls: bool,
     reasoning_effort: bool,
     default_reasoning_effort: Option<String>,
+    reasoning_effort_map: HashMap<String, String>,
+    reasoning_replay_scope: ReasoningReplayScope,
+    gemini_thinking_level_override: Option<String>,
     reasoning_fields: Vec<String>,
     thinking_tags: bool,
     include_thoughts: bool,
@@ -112,6 +137,8 @@ struct OpenAiCapabilities {
     tool_result_media: ToolResultMediaMode,
     tool_schema: ToolSchemaMode,
     max_tokens_field: MaxTokensField,
+    max_output_tokens: Option<u64>,
+    max_tool_result_chars: Option<u64>,
     responses_stateful: bool,
     responses_session_cache: bool,
     responses_builtin_tools: Vec<String>,
@@ -119,6 +146,7 @@ struct OpenAiCapabilities {
     kimi_formula_tools: Vec<String>,
     gemini_builtin_tools: Vec<String>,
     gemini_file_search_store_names: Vec<String>,
+    user_id: Option<String>,
 }
 
 impl Default for OpenAiCapabilities {
@@ -129,6 +157,9 @@ impl Default for OpenAiCapabilities {
             parallel_tool_calls: true,
             reasoning_effort: true,
             default_reasoning_effort: None,
+            reasoning_effort_map: HashMap::new(),
+            reasoning_replay_scope: ReasoningReplayScope::None,
+            gemini_thinking_level_override: None,
             reasoning_fields: vec!["reasoning_content".to_string(), "thinking".to_string()],
             thinking_tags: true,
             include_thoughts: false,
@@ -141,6 +172,8 @@ impl Default for OpenAiCapabilities {
             // accept the complete Anthropic schema can opt into preservation.
             tool_schema: ToolSchemaMode::Sanitize,
             max_tokens_field: MaxTokensField::MaxTokens,
+            max_output_tokens: None,
+            max_tool_result_chars: None,
             responses_stateful: false,
             responses_session_cache: false,
             responses_builtin_tools: Vec::new(),
@@ -148,6 +181,7 @@ impl Default for OpenAiCapabilities {
             kimi_formula_tools: Vec::new(),
             gemini_builtin_tools: Vec::new(),
             gemini_file_search_store_names: Vec::new(),
+            user_id: None,
         }
     }
 }
@@ -162,7 +196,7 @@ impl OpenAiCapabilities {
 
     fn gemini_interactions() -> Self {
         Self {
-            default_reasoning_effort: Some("high".to_string()),
+            default_reasoning_effort: Some("medium".to_string()),
             include_thoughts: true,
             sampling_parameters: false,
             tool_result_media: ToolResultMediaMode::Inline,
@@ -327,6 +361,7 @@ struct GeminiTransport {
 #[derive(Clone)]
 struct AppState {
     gemini_transport: Arc<RwLock<GeminiTransport>>,
+    gemini_thinking_level: Arc<RwLock<Option<String>>>,
     fallback_api_key: Option<String>,
     upstream_url: String,
     model: String,
@@ -343,4 +378,79 @@ struct AppState {
     image_upstream_url: String,
     local_bridge_base_url: String,
     admin_state_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+const RATE_LIMIT_RETRY_ATTEMPTS: u32 = 3;
+const RATE_LIMIT_RETRY_BACKOFF_MILLIS: [u64; 3] = [500, 1_000, 2_000];
+const RATE_LIMIT_RETRY_AFTER_CAP_SECS: u64 = 10;
+const MAX_USER_ID_CHARS: usize = 512;
+
+/// DeepSeek enforces per-model concurrency (Pro 500, Flash 2500) with HTTP
+/// 429. A shared bridge pools several peers onto one API account, so a burst
+/// from one peer can exhaust the limit for everyone; retrying the 429 with
+/// backoff keeps that burst from surfacing as failures. Honors Retry-After
+/// when the upstream sends it.
+fn rate_limit_retry_delay(
+    attempt: u32,
+    status_code: u16,
+    retry_after_secs: Option<u64>,
+) -> Option<Duration> {
+    if status_code != StatusCode::TOO_MANY_REQUESTS.as_u16() || attempt >= RATE_LIMIT_RETRY_ATTEMPTS
+    {
+        return None;
+    }
+    if let Some(secs) = retry_after_secs {
+        return Some(Duration::from_secs(secs.min(RATE_LIMIT_RETRY_AFTER_CAP_SECS)));
+    }
+    Some(Duration::from_millis(
+        RATE_LIMIT_RETRY_BACKOFF_MILLIS[attempt as usize],
+    ))
+}
+
+async fn send_with_rate_limit_retry(
+    build: impl Fn() -> reqwest::RequestBuilder,
+    provider: &str,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let mut attempt = 0;
+    loop {
+        let response = build().send().await?;
+        let retry_after_secs = response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        let Some(delay) = rate_limit_retry_delay(
+            attempt,
+            response.status().as_u16(),
+            retry_after_secs,
+        ) else {
+            return Ok(response);
+        };
+        warn!(
+            provider,
+            attempt = attempt + 1,
+            retry_after_ms = delay.as_millis(),
+            "Upstream rate limited (429); retrying with backoff"
+        );
+        drop(response);
+        tokio::time::sleep(delay).await;
+        attempt += 1;
+    }
+}
+
+/// DeepSeek user_id must match [a-zA-Z0-9_-]{1,512}; it isolates KVCache and
+/// per-user concurrency quotas. The API currently accepts arbitrary values,
+/// but the bridge validates so client-supplied values stay portable if
+/// upstream ever enforces the documented shape.
+fn validated_user_id(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > MAX_USER_ID_CHARS
+        || !trimmed
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
 }

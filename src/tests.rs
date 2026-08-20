@@ -607,6 +607,7 @@ async fn vision_proxy_calls_provider_once_and_reuses_base64_cache() {
             client,
             proxy_url: None,
         })),
+        gemini_thinking_level: Arc::new(RwLock::new(None)),
         fallback_api_key: None,
         upstream_url: "https://example.invalid/gemini".to_string(),
         model: "fallback".to_string(),
@@ -692,6 +693,7 @@ async fn mcp_generate_image_calls_gemini_saves_file_and_returns_preview() {
             client,
             proxy_url: None,
         })),
+        gemini_thinking_level: Arc::new(RwLock::new(None)),
         fallback_api_key: Some("image-secret".to_string()),
         upstream_url: "https://example.invalid/gemini".to_string(),
         model: "fallback".to_string(),
@@ -822,6 +824,7 @@ async fn configured_kimi_formula_is_exposed_and_executed_only_when_enabled() {
             client: Client::builder().build().unwrap(),
             proxy_url: None,
         })),
+        gemini_thinking_level: Arc::new(RwLock::new(None)),
         fallback_api_key: Some("local-token".to_string()),
         upstream_url: "https://example.invalid".to_string(),
         model: "bridge-router".to_string(),
@@ -951,11 +954,15 @@ fn provider_capabilities_control_optional_openai_fields() {
                 "stream_options": false,
                 "parallel_tool_calls": false,
                 "reasoning_effort": false,
+                "reasoning_effort_map": {"high": "xhigh"},
+                "reasoning_replay": true,
                 "reasoning_fields": ["analysis"],
                 "thinking_tags": false,
                 "tool_result_media": "inline",
                 "tool_schema": "preserve",
-                "max_tokens_field": "max_completion_tokens"
+                "max_tokens_field": "max_completion_tokens",
+                "max_output_tokens": 16384,
+                "max_tool_result_chars": 16000
             }
         }))
         .unwrap(),
@@ -967,6 +974,23 @@ fn provider_capabilities_control_optional_openai_fields() {
     fs::remove_dir_all(&root).unwrap();
     let profile = &loaded.profiles[0];
     assert_eq!(profile.openai_capabilities.reasoning_fields, ["analysis"]);
+    assert_eq!(
+        profile
+            .openai_capabilities
+            .reasoning_effort_map
+            .get("high")
+            .map(String::as_str),
+        Some("xhigh")
+    );
+    assert_eq!(
+        profile.openai_capabilities.reasoning_replay_scope,
+        ReasoningReplayScope::All
+    );
+    assert_eq!(profile.openai_capabilities.max_output_tokens, Some(16_384));
+    assert_eq!(
+        profile.openai_capabilities.max_tool_result_chars,
+        Some(16_000)
+    );
     assert!(!profile.openai_capabilities.thinking_tags);
     assert_eq!(
         profile.openai_capabilities.tool_result_media,
@@ -1010,6 +1034,47 @@ fn provider_capabilities_control_optional_openai_fields() {
         translated["tools"][0]["function"]["parameters"]["$schema"],
         "https://json-schema.org/draft/2020-12/schema"
     );
+}
+
+#[test]
+fn provider_parses_active_task_reasoning_replay_scope_with_legacy_fallback() {
+    let scoped_profile = json!({
+        "capabilities": {
+            "reasoning_replay_scope": "active_task"
+        }
+    });
+    let scoped =
+        parse_openai_capabilities(scoped_profile.as_object().unwrap(), "scoped.json").unwrap();
+    assert_eq!(
+        scoped.reasoning_replay_scope,
+        ReasoningReplayScope::ActiveTask
+    );
+    assert_eq!(
+        openai_capabilities_json(&scoped)["reasoning_replay_scope"],
+        "active_task"
+    );
+    assert_eq!(openai_capabilities_json(&scoped)["reasoning_replay"], true);
+
+    let legacy_profile = json!({
+        "capabilities": {
+            "reasoning_replay": true
+        }
+    });
+    let legacy =
+        parse_openai_capabilities(legacy_profile.as_object().unwrap(), "legacy.json").unwrap();
+    assert_eq!(legacy.reasoning_replay_scope, ReasoningReplayScope::All);
+
+    let invalid_limit = json!({
+        "capabilities": {
+            "max_tool_result_chars": 1_023
+        }
+    });
+    let error = parse_openai_capabilities(
+        invalid_limit.as_object().unwrap(),
+        "invalid-tool-limit.json",
+    )
+    .unwrap_err();
+    assert!(error.contains("must be at least 1024"));
 }
 
 #[test]
@@ -1059,6 +1124,15 @@ fn rejects_invalid_provider_capability_types() {
 }
 
 #[test]
+fn rejects_invalid_reasoning_effort_map() {
+    let profile = json!({"capabilities": {"reasoning_effort_map": {"high": "ultra"}}});
+    let error =
+        parse_openai_capabilities(profile.as_object().unwrap(), "invalid.json").unwrap_err();
+    assert!(error.contains("reasoning_effort_map"));
+    assert!(error.contains("xhigh"));
+}
+
+#[test]
 fn native_local_gemini_profile_uses_bridge_managed_credential() {
     let root = env::temp_dir().join(format!("claude-bridge-native-gemini-{}", Uuid::new_v4()));
     let providers_dir = root.join("bridge-providers");
@@ -1092,6 +1166,58 @@ fn native_local_gemini_profile_uses_bridge_managed_credential() {
 }
 
 #[test]
+fn native_interactions_profile_can_use_bridge_managed_credential() {
+    let root = env::temp_dir().join(format!("claude-bridge-managed-gemini-{}", Uuid::new_v4()));
+    let providers_dir = root.join("bridge-providers");
+    let settings_dir = root.join(".claude");
+    fs::create_dir_all(&providers_dir).unwrap();
+    fs::create_dir_all(&settings_dir).unwrap();
+    fs::write(
+        providers_dir.join("gemini.json"),
+        serde_json::to_vec_pretty(&json!({
+            "name": "Google Gemini",
+            "model": "gemini-3.7-flash",
+            "base_url": "https://generativelanguage.googleapis.com/v1beta",
+            "protocol": "gemini-interactions",
+            "bridge_managed_credentials": true
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let loaded =
+        load_provider_profiles(&providers_dir, &settings_dir, "http://127.0.0.1:18787").unwrap();
+
+    assert_eq!(loaded.profiles.len(), 1);
+    assert_eq!(
+        loaded.profiles[0].transport,
+        ProviderTransport::GeminiInteractions
+    );
+    assert!(loaded.profiles[0].api_key.is_none());
+    assert_eq!(
+        loaded.profiles[0].upstream_url,
+        "https://generativelanguage.googleapis.com/v1beta/interactions"
+    );
+
+    fs::write(
+        providers_dir.join("gemini.json"),
+        serde_json::to_vec_pretty(&json!({
+            "model": "gemini-3.7-flash",
+            "base_url": "https://credential-collector.example/v1beta",
+            "protocol": "gemini-interactions",
+            "bridge_managed_credentials": true
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let error = load_provider_profiles(&providers_dir, &settings_dir, "http://127.0.0.1:18787")
+        .err()
+        .unwrap();
+    fs::remove_dir_all(&root).unwrap();
+    assert!(error.contains("official Google Gemini HTTPS endpoint"));
+}
+
+#[test]
 fn persists_and_loads_gemini_proxy_modes() {
     let state_path =
         env::temp_dir().join(format!("claude-bridge-proxy-state-{}.json", Uuid::new_v4()));
@@ -1111,6 +1237,108 @@ fn persists_and_loads_gemini_proxy_modes() {
     );
 
     fs::remove_file(state_path).unwrap();
+}
+
+#[test]
+fn persists_and_loads_gemini_thinking_level_without_losing_other_state() {
+    let state_path = env::temp_dir().join(format!(
+        "claude-bridge-thinking-state-{}.json",
+        Uuid::new_v4()
+    ));
+    fs::write(
+        &state_path,
+        serde_json::to_vec(&json!({
+            "active_profile": "gemini.json",
+            "gemini_proxy": "http://127.0.0.1:8080",
+            "listen": "127.0.0.1:18787"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    persist_gemini_thinking_level(&state_path, "low").unwrap();
+    assert_eq!(
+        load_persisted_gemini_thinking_level(&state_path).as_deref(),
+        Some("low")
+    );
+    let persisted: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(persisted["active_profile"], "gemini.json");
+    assert_eq!(persisted["gemini_proxy"], "http://127.0.0.1:8080");
+    assert_eq!(persisted["listen"], "127.0.0.1:18787");
+
+    fs::remove_file(state_path).unwrap();
+}
+
+#[test]
+fn validates_gemini_thinking_level_admin_requests() {
+    for level in ["low", "medium", "high"] {
+        assert_eq!(
+            gemini_thinking_level_from_admin_request(&json!({"level": level})).unwrap(),
+            level
+        );
+    }
+    assert!(gemini_thinking_level_from_admin_request(&json!({"level": "minimal"})).is_err());
+    assert!(gemini_thinking_level_from_admin_request(&json!({})).is_err());
+}
+
+#[tokio::test]
+async fn admin_gemini_thinking_level_is_hot_persisted_and_profile_scoped() {
+    let root = env::temp_dir().join(format!("claude-bridge-thinking-admin-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let state_path = root.join("bridge-state.json");
+    let profile = interactions_test_profile("gemini-3.7-flash.json");
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let state = Arc::new(AppState {
+        gemini_transport: Arc::new(RwLock::new(GeminiTransport {
+            client: Client::builder().build().unwrap(),
+            proxy_url: None,
+        })),
+        gemini_thinking_level: Arc::new(RwLock::new(None)),
+        fallback_api_key: Some("test-key".to_string()),
+        upstream_url: "https://example.invalid".to_string(),
+        model: "gemini-3.7-flash".to_string(),
+        thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
+        interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
+        vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
+        routing: Arc::new(RwLock::new(ProviderRoutingState {
+            profiles: vec![profile],
+            active_file: "gemini-3.7-flash.json".to_string(),
+            source: ProviderProfileSource::Native,
+        })),
+        shutdown_tx,
+        settings_dir: root.clone(),
+        providers_dir: root.clone(),
+        bridge_state_path: state_path.clone(),
+        image_output_dir: root.clone(),
+        image_model: DEFAULT_IMAGE_MODEL.to_string(),
+        image_upstream_url: DEFAULT_IMAGE_UPSTREAM.to_string(),
+        local_bridge_base_url: "http://127.0.0.1:18787".to_string(),
+        admin_state_lock: Arc::new(tokio::sync::Mutex::new(())),
+    });
+
+    let response =
+        admin_set_gemini_thinking_level(State(state.clone()), Json(json!({"level": "low"}))).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        current_gemini_thinking_level(&state).unwrap().as_deref(),
+        Some("low")
+    );
+    assert_eq!(
+        load_persisted_gemini_thinking_level(&state_path).as_deref(),
+        Some("low")
+    );
+
+    state.routing.write().unwrap().profiles[0].transport = ProviderTransport::OpenAiChat;
+    assert_eq!(effective_gemini_thinking_level(&state).unwrap(), None);
+    let response =
+        admin_set_gemini_thinking_level(State(state.clone()), Json(json!({"level": "high"}))).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        current_gemini_thinking_level(&state).unwrap().as_deref(),
+        Some("low")
+    );
+
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1289,18 +1517,408 @@ fn translates_anthropic_messages_and_tools() {
     assert_eq!(translated["stream"], true);
     assert_eq!(translated["stream_options"]["include_usage"], true);
     assert_eq!(translated["messages"][0]["role"], "system");
-    assert_eq!(translated["messages"][1]["role"], "system");
+    assert!(translated["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("Runtime system context."));
     assert_eq!(
-        translated["messages"][3]["tool_calls"][0]["function"]["name"],
+        translated["messages"][2]["tool_calls"][0]["function"]["name"],
         "shell"
     );
-    assert_eq!(translated["messages"][4]["role"], "tool");
+    assert_eq!(translated["messages"][3]["role"], "tool");
     assert_eq!(
         translated["tools"][0]["function"]["parameters"]["type"],
         "object"
     );
     assert_eq!(translated["tool_choice"], "auto");
     assert_eq!(translated["reasoning_effort"], "high");
+}
+
+#[test]
+fn merges_all_system_and_developer_instructions_into_one_leading_message() {
+    let request = json!({
+        "system": "Top-level instruction.",
+        "messages": [
+            {"role": "user", "content": "First turn."},
+            {"role": "assistant", "content": "First response."},
+            {"role": "developer", "content": "Developer instruction."},
+            {"role": "system", "content": "Late system instruction."},
+            {"role": "user", "content": "Second turn."}
+        ]
+    });
+    let signatures = RwLock::new(IndexMap::new());
+    let translated =
+        translate_anthropic_request(&request, "qwen3.8-27b-local", &signatures).unwrap();
+    let messages = translated["messages"].as_array().unwrap();
+
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message["role"] == "system")
+            .count(),
+        1
+    );
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(
+        messages[0]["content"],
+        "Top-level instruction.\n\nDeveloper instruction.\n\nLate system instruction."
+    );
+    assert_eq!(messages[1]["role"], "user");
+    assert_eq!(messages[2]["role"], "assistant");
+    assert_eq!(messages[3]["role"], "user");
+}
+
+#[test]
+fn caps_openai_chat_output_tokens_to_declared_context_window() {
+    let mut request = json!({"max_tokens": 32_000});
+    let capped = cap_openai_chat_output_tokens(&mut request, Some(32_768), None, 769)
+        .unwrap()
+        .unwrap();
+    assert_eq!(capped, ("max_tokens", 32_000, 30_975));
+    assert_eq!(request["max_tokens"], 30_975);
+
+    let mut ordinary = json!({"max_tokens": 4_096});
+    assert_eq!(
+        cap_openai_chat_output_tokens(&mut ordinary, Some(32_768), None, 769).unwrap(),
+        None
+    );
+    assert_eq!(ordinary["max_tokens"], 4_096);
+
+    let mut unspecified = json!({"max_completion_tokens": 32_000});
+    assert_eq!(
+        cap_openai_chat_output_tokens(&mut unspecified, None, None, 769).unwrap(),
+        None
+    );
+    assert_eq!(unspecified["max_completion_tokens"], 32_000);
+
+    let mut provider_limited = json!({"max_tokens": 32_000});
+    let capped =
+        cap_openai_chat_output_tokens(&mut provider_limited, Some(65_536), Some(16_384), 4_096)
+            .unwrap()
+            .unwrap();
+    assert_eq!(capped, ("max_tokens", 32_000, 16_384));
+    assert_eq!(provider_limited["max_tokens"], 16_384);
+
+    let mut context_limited = json!({"max_tokens": 32_000});
+    let capped =
+        cap_openai_chat_output_tokens(&mut context_limited, Some(65_536), Some(16_384), 55_000)
+            .unwrap()
+            .unwrap();
+    assert_eq!(capped, ("max_tokens", 32_000, 9_512));
+    assert_eq!(context_limited["max_tokens"], 9_512);
+
+    let mut no_safe_room = json!({"max_tokens": 128});
+    let error =
+        cap_openai_chat_output_tokens(&mut no_safe_room, Some(32_768), Some(16_384), 31_744)
+            .unwrap_err();
+    assert!(error.contains("less than 1024 tokens"));
+}
+
+#[test]
+fn generic_chat_maps_claude_reasoning_effort_for_local_models() {
+    let capabilities = OpenAiCapabilities {
+        default_reasoning_effort: Some("xhigh".to_string()),
+        reasoning_effort_map: HashMap::from([
+            ("none".to_string(), "low".to_string()),
+            ("minimal".to_string(), "low".to_string()),
+            ("high".to_string(), "xhigh".to_string()),
+            ("max".to_string(), "xhigh".to_string()),
+        ]),
+        ..OpenAiCapabilities::default()
+    };
+    let signatures = RwLock::new(IndexMap::new());
+    let translate = |request: Value| {
+        translate_anthropic_request_with_capabilities(
+            &request,
+            "qwen3.8-27b-local",
+            &signatures,
+            &capabilities,
+        )
+        .unwrap()
+    };
+
+    let explicit = translate(json!({
+        "messages": [{"role": "user", "content": "Solve it"}],
+        "thinking": {"type": "enabled", "budget_tokens": 512},
+        "output_config": {"effort": "high"}
+    }));
+    assert_eq!(explicit["reasoning_effort"], "xhigh");
+
+    let medium = translate(json!({
+        "messages": [{"role": "user", "content": "Solve it"}],
+        "thinking": {"type": "enabled", "budget_tokens": 4096}
+    }));
+    assert_eq!(medium["reasoning_effort"], "medium");
+
+    let adaptive = translate(json!({
+        "messages": [{"role": "user", "content": "Solve it"}],
+        "thinking": {"type": "adaptive"}
+    }));
+    assert_eq!(adaptive["reasoning_effort"], "xhigh");
+
+    let disabled = translate(json!({
+        "messages": [{"role": "user", "content": "Solve it"}],
+        "thinking": {"type": "disabled"}
+    }));
+    assert_eq!(disabled["reasoning_effort"], "low");
+
+    let defaulted = translate(json!({
+        "messages": [{"role": "user", "content": "Solve it"}]
+    }));
+    assert_eq!(defaulted["reasoning_effort"], "xhigh");
+}
+
+#[test]
+fn generic_chat_can_replay_assistant_reasoning_for_local_models() {
+    let request = json!({
+        "messages": [
+            {"role": "user", "content": "Inspect the repository"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "I should inspect Cargo.toml first."},
+                {"type": "text", "text": "I will inspect it."},
+                {"type": "tool_use", "id": "toolu_local_1", "name": "read_file", "input": {"path": "Cargo.toml"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_local_1", "content": "[package]"}
+            ]}
+        ]
+    });
+    let signatures = RwLock::new(IndexMap::new());
+    let enabled = OpenAiCapabilities {
+        reasoning_replay_scope: ReasoningReplayScope::All,
+        ..OpenAiCapabilities::default()
+    };
+    let translated = translate_anthropic_request_with_capabilities(
+        &request,
+        "qwen3.8-27b-local",
+        &signatures,
+        &enabled,
+    )
+    .unwrap();
+    assert_eq!(
+        translated["messages"][1]["reasoning_content"],
+        "I should inspect Cargo.toml first."
+    );
+
+    let defaulted = translate_anthropic_request_with_capabilities(
+        &request,
+        "generic-model",
+        &signatures,
+        &OpenAiCapabilities::default(),
+    )
+    .unwrap();
+    assert!(defaulted["messages"][1].get("reasoning_content").is_none());
+}
+
+#[test]
+fn generic_chat_active_task_replays_only_current_tool_chain_reasoning() {
+    let request = json!({
+        "messages": [
+            {"role": "user", "content": "Finish the first task"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "Old reasoning before a tool."},
+                {"type": "tool_use", "id": "toolu_old", "name": "read_file", "input": {"path": "old.txt"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_old", "content": "old evidence"}
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "Old reasoning after the tool."},
+                {"type": "text", "text": "First conclusion."}
+            ]},
+            {"role": "user", "content": "Start the current task"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "Current reasoning before the first tool."},
+                {"type": "tool_use", "id": "toolu_current_1", "name": "read_file", "input": {"path": "current.txt"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_current_1", "content": "current evidence one"},
+                {"type": "text", "text": "<system-reminder>Keep working.</system-reminder>"}
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "Current reasoning before the second tool."},
+                {"type": "tool_use", "id": "toolu_current_2", "name": "read_file", "input": {"path": "next.txt"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_current_2", "content": "current evidence two"}
+            ]}
+        ]
+    });
+    let signatures = RwLock::new(IndexMap::new());
+    let capabilities = OpenAiCapabilities {
+        reasoning_replay_scope: ReasoningReplayScope::ActiveTask,
+        ..OpenAiCapabilities::default()
+    };
+
+    let translated = translate_anthropic_request_with_capabilities(
+        &request,
+        "qwen3.8-27b-local",
+        &signatures,
+        &capabilities,
+    )
+    .unwrap();
+    let messages = translated["messages"].as_array().unwrap();
+
+    assert!(messages[1].get("reasoning_content").is_none());
+    assert!(messages[3].get("reasoning_content").is_none());
+    assert_eq!(messages[3]["content"], "First conclusion.");
+    assert_eq!(
+        messages[5]["reasoning_content"],
+        "Current reasoning before the first tool."
+    );
+    assert_eq!(messages[6]["content"], "current evidence one");
+    assert_eq!(
+        messages[8]["reasoning_content"],
+        "Current reasoning before the second tool."
+    );
+    assert_eq!(messages[9]["content"], "current evidence two");
+}
+
+#[test]
+fn generic_chat_bounds_oversized_tool_results_for_opted_in_provider() {
+    let oversized = format!(
+        "BEGIN-EVIDENCE\n{}\nOMITTED-MIDDLE-EVIDENCE\n{}\nEND-EVIDENCE",
+        "a".repeat(700),
+        "z".repeat(700)
+    );
+    let request = json!({
+        "messages": [
+            {"role": "user", "content": "Audit the repository"},
+            {"role": "assistant", "content": [{
+                "type": "tool_use",
+                "id": "toolu_large_read",
+                "name": "read_file",
+                "input": {"path": "large.rs"}
+            }]},
+            {"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_large_read",
+                "content": oversized
+            }]}
+        ]
+    });
+    let signatures = RwLock::new(IndexMap::new());
+    let bounded = OpenAiCapabilities {
+        max_tool_result_chars: Some(1_024),
+        ..OpenAiCapabilities::default()
+    };
+    let translated = translate_anthropic_request_with_capabilities(
+        &request,
+        "qwen3.8-27b-local",
+        &signatures,
+        &bounded,
+    )
+    .unwrap();
+    let result = translated["messages"][2]["content"].as_str().unwrap();
+
+    assert!(result.chars().count() <= 1_024);
+    assert!(result.contains("BEGIN-EVIDENCE"));
+    assert!(result.contains("END-EVIDENCE"));
+    assert!(!result.contains("OMITTED-MIDDLE-EVIDENCE"));
+    assert!(result.contains("Bridge truncated oversized tool result"));
+    assert!(result.contains("complete result remains in Claude Code's local transcript"));
+    assert!(result.contains("offset/limit or targeted search"));
+
+    let unchanged = translate_anthropic_request_with_capabilities(
+        &request,
+        "generic-model",
+        &signatures,
+        &OpenAiCapabilities::default(),
+    )
+    .unwrap();
+    assert_eq!(unchanged["messages"][2]["content"], oversized);
+}
+
+#[test]
+fn generic_chat_tool_result_ceiling_preserves_small_text_and_media() {
+    let request = json!({
+        "messages": [
+            {"role": "user", "content": "Inspect the image"},
+            {"role": "assistant", "content": [{
+                "type": "tool_use",
+                "id": "toolu_media",
+                "name": "inspect",
+                "input": {}
+            }]},
+            {"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_media",
+                "content": [
+                    {"type": "text", "text": "small evidence"},
+                    {"type": "image", "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "aGVsbG8="
+                    }}
+                ]
+            }]}
+        ]
+    });
+    let signatures = RwLock::new(IndexMap::new());
+    let capabilities = OpenAiCapabilities {
+        max_tool_result_chars: Some(1_024),
+        ..OpenAiCapabilities::default()
+    };
+    let translated = translate_anthropic_request_with_capabilities(
+        &request,
+        "qwen3.8-27b-local",
+        &signatures,
+        &capabilities,
+    )
+    .unwrap();
+
+    assert_eq!(
+        translated["messages"][2]["content"],
+        "small evidence\n[Image result attached]"
+    );
+    assert_eq!(translated["messages"][3]["role"], "user");
+    assert_eq!(
+        translated["messages"][3]["content"][0]["image_url"]["url"],
+        "data:image/png;base64,aGVsbG8="
+    );
+
+    let oversized_text = format!("MEDIA-BEGIN\n{}\nMEDIA-END", "x".repeat(2_000));
+    let oversized_request = json!({
+        "messages": [
+            {"role": "user", "content": "Inspect the image"},
+            {"role": "assistant", "content": [{
+                "type": "tool_use",
+                "id": "toolu_large_media",
+                "name": "inspect",
+                "input": {}
+            }]},
+            {"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_large_media",
+                "content": [
+                    {"type": "text", "text": oversized_text},
+                    {"type": "image", "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "aGVsbG8="
+                    }}
+                ]
+            }]}
+        ]
+    });
+    let translated = translate_anthropic_request_with_capabilities(
+        &oversized_request,
+        "qwen3.8-27b-local",
+        &signatures,
+        &capabilities,
+    )
+    .unwrap();
+    let result = translated["messages"][2]["content"].as_str().unwrap();
+
+    assert!(result.chars().count() <= 1_024);
+    assert!(result.contains("MEDIA-BEGIN"));
+    assert!(result.contains("MEDIA-END"));
+    assert!(result.contains("Bridge truncated oversized tool result"));
+    assert_eq!(translated["messages"][3]["role"], "user");
+    assert_eq!(
+        translated["messages"][3]["content"][0]["image_url"]["url"],
+        "data:image/png;base64,aGVsbG8="
+    );
 }
 
 #[test]
@@ -1337,7 +1955,7 @@ fn deepseek_chat_replays_reasoning_and_uses_v4_thinking_contract() {
 
     assert_eq!(translated["thinking"]["type"], "enabled");
     assert_eq!(translated["reasoning_effort"], "max");
-    assert!(translated.get("tool_choice").is_none());
+    assert_eq!(translated["tool_choice"], "auto");
     assert_eq!(
         translated["messages"][1]["reasoning_content"],
         "I should inspect Cargo.toml first."
@@ -1345,18 +1963,20 @@ fn deepseek_chat_replays_reasoning_and_uses_v4_thinking_contract() {
 }
 
 #[test]
-fn deepseek_chat_preserves_fast_high_and_max_reasoning_modes() {
+fn deepseek_chat_preserves_low_high_and_max_reasoning_modes() {
     let capabilities = OpenAiCapabilities {
         chat_dialect: OpenAiChatDialect::DeepSeek,
         ..OpenAiCapabilities::default()
     };
     let signatures = RwLock::new(IndexMap::new());
     for (effort, thinking_type, expected_effort, keeps_tool_choice) in [
-        ("low", "disabled", None, true),
-        ("medium", "enabled", Some("high"), false),
-        ("high", "enabled", Some("high"), false),
-        ("xhigh", "enabled", Some("max"), false),
-        ("max", "enabled", Some("max"), false),
+        ("none", "disabled", None, true),
+        ("minimal", "enabled", Some("low"), true),
+        ("low", "enabled", Some("low"), true),
+        ("medium", "enabled", Some("high"), true),
+        ("high", "enabled", Some("high"), true),
+        ("xhigh", "enabled", Some("max"), true),
+        ("max", "enabled", Some("max"), true),
     ] {
         let request = json!({
             "messages": [{"role": "user", "content": "Inspect one file"}],
@@ -1379,6 +1999,192 @@ fn deepseek_chat_preserves_fast_high_and_max_reasoning_modes() {
         );
         assert_eq!(translated.get("tool_choice").is_some(), keeps_tool_choice);
     }
+
+    // Named tool_choice is the only form DeepSeek thinking mode rejects.
+    let named = json!({
+        "messages": [{"role": "user", "content": "Inspect one file"}],
+        "thinking": {"type": "enabled"},
+        "output_config": {"effort": "high"},
+        "tool_choice": {"type": "tool", "name": "read_file"}
+    });
+    let translated = translate_anthropic_request_with_capabilities(
+        &named,
+        "deepseek-v4-flash",
+        &signatures,
+        &capabilities,
+    )
+    .unwrap();
+    assert_eq!(translated["thinking"]["type"], "enabled");
+    assert!(translated.get("tool_choice").is_none());
+}
+
+#[test]
+fn deepseek_chat_forwards_validated_user_id_and_profile_default() {
+    let capabilities = OpenAiCapabilities {
+        chat_dialect: OpenAiChatDialect::DeepSeek,
+        user_id: Some("profile-default".to_string()),
+        ..OpenAiCapabilities::default()
+    };
+    let signatures = RwLock::new(IndexMap::new());
+
+    let client_value = json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "metadata": {"user_id": "client-peer"}
+    });
+    let translated = translate_anthropic_request_with_capabilities(
+        &client_value,
+        "deepseek-v4-flash",
+        &signatures,
+        &capabilities,
+    )
+    .unwrap();
+    assert_eq!(translated["user_id"], "client-peer");
+
+    let invalid_client = json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "metadata": {"user_id": "bad user id!"}
+    });
+    let translated = translate_anthropic_request_with_capabilities(
+        &invalid_client,
+        "deepseek-v4-flash",
+        &signatures,
+        &capabilities,
+    )
+    .unwrap();
+    assert_eq!(translated["user_id"], "profile-default");
+
+    let no_client = json!({"messages": [{"role": "user", "content": "hi"}]});
+    let translated = translate_anthropic_request_with_capabilities(
+        &no_client,
+        "deepseek-v4-flash",
+        &signatures,
+        &capabilities,
+    )
+    .unwrap();
+    assert_eq!(translated["user_id"], "profile-default");
+
+    let generic = OpenAiCapabilities {
+        chat_dialect: OpenAiChatDialect::Generic,
+        user_id: Some("profile-default".to_string()),
+        ..OpenAiCapabilities::default()
+    };
+    let translated = translate_anthropic_request_with_capabilities(
+        &no_client,
+        "generic-model",
+        &signatures,
+        &generic,
+    )
+    .unwrap();
+    assert!(translated.get("user_id").is_none());
+}
+
+#[test]
+fn deepseek_chat_skips_server_web_search_tools_and_textifies_history() {
+    let capabilities = OpenAiCapabilities {
+        chat_dialect: OpenAiChatDialect::DeepSeek,
+        ..OpenAiCapabilities::default()
+    };
+    let signatures = RwLock::new(IndexMap::new());
+    let request = json!({
+        "tools": [
+            {"type": "web_search_20250305", "name": "web_search", "max_uses": 3},
+            {"name": "read_file", "description": "Read a file",
+             "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}}
+        ],
+        "messages": [
+            {"role": "user", "content": "Search then read"},
+            {"role": "assistant", "content": [
+                {"type": "server_tool_use", "id": "srv_1", "name": "web_search",
+                 "input": {"query": "rust"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "web_search_tool_result", "tool_use_id": "srv_1", "content": [
+                    {"type": "web_search_result", "title": "Rust Blog",
+                     "url": "https://blog.rust-lang.org", "encrypted_content": "AAAA"}
+                ]}
+            ]},
+            {"role": "user", "content": "Read Cargo.toml"}
+        ]
+    });
+    let translated = translate_anthropic_request_with_capabilities(
+        &request,
+        "deepseek-v4-flash",
+        &signatures,
+        &capabilities,
+    )
+    .unwrap();
+
+    let tool_names: Vec<&str> = translated["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(tool_names, vec!["read_file"]);
+
+    let serialized = serde_json::to_string(&translated).unwrap();
+    assert!(serialized.contains("Rust Blog"));
+    assert!(!serialized.contains("web_search_20250305"));
+}
+
+#[test]
+fn chat_diagnostics_warn_when_server_web_search_tools_are_skipped() {
+    let request = json!({
+        "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let capabilities = OpenAiCapabilities::for_openai_base_url("https://api.deepseek.com/v1");
+    let diagnostics =
+        openai_request_diagnostics(&request, &capabilities, ProviderTransport::OpenAiChat)
+            .join("\n");
+    assert!(diagnostics.contains("server-side web_search"));
+}
+
+#[test]
+fn rate_limit_retry_delay_honors_attempts_backoff_and_retry_after() {
+    assert_eq!(
+        rate_limit_retry_delay(0, 429, None),
+        Some(Duration::from_millis(500))
+    );
+    assert_eq!(
+        rate_limit_retry_delay(2, 429, None),
+        Some(Duration::from_millis(2_000))
+    );
+    assert_eq!(rate_limit_retry_delay(3, 429, None), None);
+    assert_eq!(rate_limit_retry_delay(0, 200, None), None);
+    assert_eq!(
+        rate_limit_retry_delay(0, 429, Some(3)),
+        Some(Duration::from_secs(3))
+    );
+    assert_eq!(
+        rate_limit_retry_delay(0, 429, Some(120)),
+        Some(Duration::from_secs(10))
+    );
+}
+
+#[test]
+fn validated_user_id_accepts_documented_shape_only() {
+    assert_eq!(
+        validated_user_id("peer-alice_01"),
+        Some("peer-alice_01".to_string())
+    );
+    assert_eq!(validated_user_id("  padded  "), Some("padded".to_string()));
+    assert_eq!(validated_user_id(""), None);
+    assert_eq!(validated_user_id("has spaces"), None);
+    assert_eq!(validated_user_id("emoji-\u{1F600}"), None);
+    assert_eq!(validated_user_id(&"x".repeat(513)), None);
+}
+
+#[test]
+fn provider_profile_validates_user_id_capability() {
+    let valid = json!({"capabilities": {"user_id": "peer_alice-01"}});
+    let parsed = parse_openai_capabilities(valid.as_object().unwrap(), "valid-user.json").unwrap();
+    assert_eq!(parsed.user_id.as_deref(), Some("peer_alice-01"));
+
+    let invalid = json!({"capabilities": {"user_id": "bad user id!"}});
+    let error =
+        parse_openai_capabilities(invalid.as_object().unwrap(), "invalid.json").unwrap_err();
+    assert!(error.contains("user_id"));
 }
 
 #[test]
@@ -1505,6 +2311,39 @@ fn deepseek_chat_replay_respects_complete_tools_contract() {
             "Second complete tool reasoning."
         ]
     );
+
+    let mut request_with_server_search = request.clone();
+    request_with_server_search["tools"] = json!([{
+        "type": "web_search_20250305",
+        "name": "web_search",
+        "max_uses": 3
+    }]);
+    let translated_with_server_search = translate_anthropic_request_with_capabilities(
+        &request_with_server_search,
+        "deepseek-v4-flash",
+        &signatures,
+        &capabilities,
+    )
+    .unwrap();
+    let replayed_with_server_search: Vec<&str> = translated_with_server_search["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|message| message.get("reasoning_content").and_then(Value::as_str))
+        .collect();
+    // When every tool is a server-side web_search_* tool, upstream receives
+    // no tools at all: only the tool-chain reasoning required by the DeepSeek
+    // contract is replayed, ordinary-turn reasoning is dropped.
+    assert_eq!(
+        replayed_with_server_search,
+        vec![
+            "First complete tool reasoning.",
+            "Second complete tool reasoning."
+        ]
+    );
+    assert!(!serde_json::to_string(&translated_with_server_search)
+        .unwrap()
+        .contains("web_search_20250305"));
 }
 
 #[test]
@@ -1521,27 +2360,28 @@ fn deepseek_anthropic_route_applies_fast_and_default_reasoning_policy() {
                 {"type": "text", "text": "Done."}
             ]}
         ],
-        "thinking": {"type": "enabled", "budget_tokens": 16_384},
+        "thinking": {"type": "enabled", "budget_tokens": 1_024},
         "output_config": {
             "effort": "low",
             "format": {"type": "json_schema", "schema": {"type": "object"}}
         },
-        "max_tokens": 1_024
+        "max_tokens": 2_000
     });
     assert!(!deepseek_anthropic_reasoning_diagnostics(&fast_request)
         .iter()
         .any(|message| message.contains("Raised DeepSeek Anthropic max_tokens")));
     let policy =
         apply_deepseek_anthropic_reasoning_policy(&mut fast_request, &capabilities).unwrap();
-    assert!(!policy.thinking_enabled);
-    assert_eq!(fast_request["thinking"]["type"], "disabled");
-    assert!(fast_request["thinking"].get("budget_tokens").is_none());
-    assert!(fast_request["output_config"].get("effort").is_none());
+    assert!(policy.thinking_enabled);
+    assert_eq!(policy.effort, Some("low"));
+    assert_eq!(fast_request["thinking"]["type"], "enabled");
+    assert_eq!(fast_request["thinking"]["budget_tokens"], 1_024);
+    assert_eq!(fast_request["output_config"]["effort"], "low");
     assert_eq!(
         fast_request["output_config"]["format"]["type"],
         "json_schema"
     );
-    assert_eq!(fast_request["max_tokens"], 1_024);
+    assert_eq!(fast_request["max_tokens"], 2_000);
     let (messages, tokens) = deepseek_anthropic_reasoning_stats(&fast_request);
     assert_eq!(messages, 1);
     assert!(tokens > 0);
@@ -3032,6 +3872,28 @@ fn max_tokens_suppresses_truncated_non_streaming_tool_call() {
 }
 
 #[test]
+fn ignores_null_non_streaming_tool_call_fields() {
+    let upstream = json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "56",
+                "tool_calls": null,
+                "function_call": null
+            },
+            "finish_reason": "stop"
+        }]
+    });
+    let signatures = RwLock::new(IndexMap::new());
+
+    let message =
+        translate_anthropic_response(&upstream, "qwen3.8-27b-local", &signatures).unwrap();
+
+    assert_eq!(message["stop_reason"], "end_turn");
+    assert_eq!(message["content"], json!([{"type": "text", "text": "56"}]));
+}
+
+#[test]
 fn max_tokens_suppresses_truncated_streaming_tool_call() {
     let signatures = Arc::new(RwLock::new(IndexMap::new()));
     let mut translator =
@@ -3318,7 +4180,7 @@ fn explicit_transport_and_upstream_url_override_auto_routing() {
 }
 
 #[test]
-fn neutralizes_claude_identity_and_appends_runtime_identity() {
+fn neutralizes_claude_identity_without_appending_a_trailing_system_message() {
     let original = "You are Claude Code, Anthropic's official CLI for Claude.";
     let mut request = json!({
         "system": format!("<system-reminder>Runtime context.</system-reminder>\n{original}"),
@@ -3349,12 +4211,8 @@ fn neutralizes_claude_identity_and_appends_runtime_identity() {
         ));
     assert!(translated_system.contains(BRIDGE_IDENTITY_MARKER));
     let translated_messages = translated["messages"].as_array().unwrap();
-    let reminder = translated_messages.last().unwrap();
-    assert_eq!(reminder["role"], "system");
-    assert!(reminder["content"]
-        .as_str()
-        .unwrap()
-        .starts_with(BRIDGE_IDENTITY_MARKER));
+    assert_eq!(translated_messages.len(), 2);
+    assert_eq!(translated_messages.last().unwrap()["role"], "user");
 }
 
 #[test]
@@ -3609,7 +4467,7 @@ fn interactions_test_profile(file_name: &str) -> ProviderProfile {
         file_name: file_name.to_string(),
         display_name: "Gemini Interactions".to_string(),
         source: ProviderProfileSource::Native,
-        model: "gemini-3.6-flash".to_string(),
+        model: "gemini-3.7-flash".to_string(),
         context_window: None,
         upstream_identity: None,
         identity_override: true,
@@ -3743,6 +4601,7 @@ fn exposes_explicit_diagnostics_for_unmapped_anthropic_fields() {
         "metadata": {"user_id": "test"},
         "container": "container-1",
         "temperature": 0.7,
+        "candidate_count": 2,
         "service_tier": "auto",
         "tool_choice": {"type": "auto", "disable_parallel_tool_use": true},
         "messages": [{
@@ -3754,6 +4613,7 @@ fn exposes_explicit_diagnostics_for_unmapped_anthropic_fields() {
     assert!(diagnostics.contains("metadata"));
     assert!(diagnostics.contains("container"));
     assert!(diagnostics.contains("temperature"));
+    assert!(diagnostics.contains("candidate_count"));
     assert!(diagnostics.contains("default standard tier"));
     assert!(diagnostics.contains("disable_parallel_tool_use"));
     assert!(diagnostics.contains("cache_control"));
@@ -3778,7 +4638,7 @@ fn builds_google_native_count_tokens_request_with_prompt_and_tools() {
     });
     let translated = gemini_count_tokens_request(&request, &profile).unwrap();
     let generate = &translated["generateContentRequest"];
-    assert_eq!(generate["model"], "models/gemini-3.6-flash");
+    assert_eq!(generate["model"], "models/gemini-3.7-flash");
     assert_eq!(
         generate["systemInstruction"]["parts"][0]["text"],
         "You are a coding agent."
@@ -3840,6 +4700,7 @@ async fn anthropic_count_tokens_uses_kimi_native_estimator() {
             client: Client::builder().build().unwrap(),
             proxy_url: None,
         })),
+        gemini_thinking_level: Arc::new(RwLock::new(None)),
         fallback_api_key: Some("local-token".to_string()),
         upstream_url: "https://example.invalid".to_string(),
         model: "bridge-router".to_string(),
@@ -3898,11 +4759,85 @@ async fn anthropic_count_tokens_uses_kimi_native_estimator() {
 }
 
 #[tokio::test]
+async fn anthropic_messages_uses_bridge_managed_gemini_credential() {
+    let mock = Router::new().route(
+        "/v1beta/interactions",
+        post(|headers: HeaderMap, Json(body): Json<Value>| async move {
+            assert_eq!(
+                headers
+                    .get("x-goog-api-key")
+                    .and_then(|value| value.to_str().ok()),
+                Some("managed-google-key")
+            );
+            assert_eq!(body["model"], "gemini-3.7-flash");
+            Json(json!({
+                "id": "interaction-managed-credential",
+                "status": "completed",
+                "steps": [{"type": "model_output", "content": [{"type": "text", "text": "Ready."}]}],
+                "usage": {"total_input_tokens": 3, "total_output_tokens": 1}
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let mut profile = interactions_test_profile("gemini-interactions.json");
+    profile.base_url = format!("http://{address}/v1beta");
+    profile.upstream_url = format!("http://{address}/v1beta/interactions");
+    profile.api_key = None;
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let state = Arc::new(AppState {
+        gemini_transport: Arc::new(RwLock::new(GeminiTransport {
+            client: Client::builder().no_proxy().build().unwrap(),
+            proxy_url: None,
+        })),
+        gemini_thinking_level: Arc::new(RwLock::new(None)),
+        fallback_api_key: Some("managed-google-key".to_string()),
+        upstream_url: "https://example.invalid".to_string(),
+        model: "gemini-3.7-flash".to_string(),
+        thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
+        interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
+        vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
+        routing: Arc::new(RwLock::new(ProviderRoutingState {
+            profiles: vec![profile],
+            active_file: "gemini-interactions.json".to_string(),
+            source: ProviderProfileSource::Native,
+        })),
+        shutdown_tx,
+        settings_dir: PathBuf::new(),
+        providers_dir: PathBuf::new(),
+        bridge_state_path: PathBuf::new(),
+        image_output_dir: env::temp_dir(),
+        image_model: DEFAULT_IMAGE_MODEL.to_string(),
+        image_upstream_url: DEFAULT_IMAGE_UPSTREAM.to_string(),
+        local_bridge_base_url: "http://127.0.0.1:18787".to_string(),
+        admin_state_lock: Arc::new(tokio::sync::Mutex::new(())),
+    });
+
+    let response = anthropic_messages(
+        State(state),
+        HeaderMap::new(),
+        Json(json!({
+            "stream": false,
+            "messages": [{"role": "user", "content": "Hello"}]
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["content"][0]["text"], "Ready.");
+    server.abort();
+}
+
+#[tokio::test]
 async fn anthropic_count_tokens_uses_google_native_endpoint() {
     let captured = Arc::new(tokio::sync::Mutex::new(None::<Value>));
     let captured_for_handler = captured.clone();
     let mock = Router::new().route(
-        "/v1beta/models/gemini-3.6-flash:countTokens",
+        "/v1beta/models/gemini-3.7-flash:countTokens",
         post(move |headers: HeaderMap, Json(body): Json<Value>| {
             let captured = captured_for_handler.clone();
             async move {
@@ -3922,15 +4857,17 @@ async fn anthropic_count_tokens_uses_google_native_endpoint() {
     let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
     let mut profile = interactions_test_profile("gemini-interactions.json");
     profile.base_url = format!("http://{address}/v1beta");
+    profile.api_key = None;
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
     let state = Arc::new(AppState {
         gemini_transport: Arc::new(RwLock::new(GeminiTransport {
             client: Client::builder().build().unwrap(),
             proxy_url: None,
         })),
-        fallback_api_key: Some("local-token".to_string()),
+        gemini_thinking_level: Arc::new(RwLock::new(None)),
+        fallback_api_key: Some("test-key".to_string()),
         upstream_url: "https://example.invalid".to_string(),
-        model: "gemini-3.6-flash".to_string(),
+        model: "gemini-3.7-flash".to_string(),
         thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
         interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
         vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
@@ -4159,7 +5096,7 @@ fn builds_stateful_interactions_delta_only_after_exact_transcript_match() {
     let initial = translate_gemini_interactions_request(&first, &profile, &continuations).unwrap();
     assert_eq!(initial["store"], true);
     assert!(initial.get("previous_interaction_id").is_none());
-    assert_eq!(initial["generation_config"]["thinking_level"], "high");
+    assert_eq!(initial["generation_config"]["thinking_level"], "medium");
     assert_eq!(initial["generation_config"]["thinking_summaries"], "auto");
     assert_eq!(initial["tools"].as_array().unwrap().len(), 4);
     assert_eq!(initial["input"][0]["type"], "user_input");
@@ -4250,6 +5187,67 @@ fn continues_interactions_tool_result_by_opaque_call_id() {
     assert_eq!(translated["input"][0]["call_id"], "call-opaque-1");
     assert_eq!(translated["input"][0]["name"], "read_file");
     assert_eq!(translated["input"][0]["result"], "package data");
+}
+
+#[test]
+fn bounds_oversized_gemini_interactions_tool_results() {
+    let mut profile = interactions_test_profile("gemini-interactions.json");
+    profile.openai_capabilities.max_tool_result_chars = Some(1_024);
+    let continuations = RwLock::new(InteractionContinuationCache::default());
+    let first = json!({
+        "messages": [{"role": "user", "content": "Read the source file"}]
+    });
+    let assistant_content = vec![json!({
+        "type": "tool_use",
+        "id": "call-large-read",
+        "name": "read_file",
+        "input": {"path": "large.rs"}
+    })];
+    remember_interaction_continuation(
+        &continuations,
+        &profile.file_name,
+        &first,
+        "interaction-large-read",
+        &assistant_content,
+        &[("call-large-read".to_string(), "read_file".to_string())],
+    );
+    let request = json!({
+        "messages": [
+            {"role": "user", "content": "Read the source file"},
+            {"role": "assistant", "content": assistant_content},
+            {"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "call-large-read",
+                "content": "A".repeat(2_000)
+            }]}
+        ]
+    });
+
+    let translated =
+        translate_gemini_interactions_request(&request, &profile, &continuations).unwrap();
+    let result = translated["input"][0]["result"].as_str().unwrap();
+    assert_eq!(result.chars().count(), 1_024);
+    assert!(result.starts_with('A'));
+    assert!(result.ends_with('A'));
+    assert!(result.contains("Bridge truncated oversized tool result"));
+
+    let media_result = interaction_tool_result_value(
+        &json!([
+            {"type": "text", "text": "B".repeat(2_000)},
+            {"type": "image", "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "aGVsbG8="
+            }}
+        ]),
+        Some(1_024),
+    );
+    assert_eq!(
+        media_result[0]["text"].as_str().unwrap().chars().count(),
+        1_024
+    );
+    assert_eq!(media_result[1]["type"], "image");
+    assert_eq!(media_result[1]["data"], "aGVsbG8=");
 }
 
 #[test]
@@ -4408,6 +5406,157 @@ fn translates_interactions_stream_and_remembers_tool_continuation() {
     assert_eq!(call.name, "lookup");
 }
 
+#[test]
+fn translates_gemini_37_rest_stream_schema_without_losing_content_or_usage() {
+    let continuations = Arc::new(RwLock::new(InteractionContinuationCache::default()));
+    let request = json!({
+        "messages": [{"role": "user", "content": "Tell me a story"}],
+        "stream": true
+    });
+    let mut translator = GeminiInteractionsStreamTranslator::new(
+        "gemini-3.7-flash".to_string(),
+        "gemini-interactions.json".to_string(),
+        request,
+        continuations,
+        1,
+    );
+    translator
+        .process_payload(r#"{"type":"interaction.created","interaction":{"id":"interaction-37","status":"in_progress"}}"#)
+        .unwrap();
+    translator
+        .process_payload(
+            r#"{"type":"step.start","index":0,"step":{"type":"thought","signature":"sig-start"}}"#,
+        )
+        .unwrap();
+    translator
+        .process_payload(
+            r#"{"type":"step.delta","index":0,"delta":{"type":"thought","text":"Planning."}}"#,
+        )
+        .unwrap();
+    translator
+        .process_payload(r#"{"type":"step.stop","index":0,"status":"done"}"#)
+        .unwrap();
+    translator
+        .process_payload(r#"{"type":"step.start","index":1,"step":{"type":"model_output","content":[{"type":"text","text":"Once upon"}]}}"#)
+        .unwrap();
+    translator
+        .process_payload(
+            r#"{"type":"step.delta","index":1,"delta":{"type":"text","text":" a time."}}"#,
+        )
+        .unwrap();
+    translator
+        .process_payload(r#"{"type":"step.stop","index":1,"status":"done"}"#)
+        .unwrap();
+    translator
+        .process_payload(r#"{"type":"interaction.completed","interaction":{"id":"interaction-37","status":"completed","usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}}"#)
+        .unwrap();
+
+    let finish_events = translator.finish().unwrap();
+    assert_eq!(translator.input_tokens, 10);
+    assert_eq!(translator.assistant_content[0]["thinking"], "Planning.");
+    assert_eq!(translator.assistant_content[0]["signature"], "sig-start");
+    assert_eq!(translator.assistant_content[1]["text"], "Once upon a time.");
+    assert!(format!("{finish_events:?}").contains("output_tokens\\\":5"));
+}
+
+#[test]
+fn treats_gemini_37_requires_action_as_a_terminal_tool_stream_event() {
+    let continuations = Arc::new(RwLock::new(InteractionContinuationCache::default()));
+    let mut translator = GeminiInteractionsStreamTranslator::new(
+        "gemini-3.7-flash".to_string(),
+        "gemini-interactions.json".to_string(),
+        json!({"messages": [{"role": "user", "content": "Check weather"}]}),
+        continuations,
+        4,
+    );
+    for payload in [
+        r#"{"type":"interaction.created","interaction":{"id":"interaction-tool-37","status":"in_progress"}}"#,
+        r#"{"type":"step.start","index":0,"step":{"type":"function_call","id":"call-weather","name":"get_weather"}}"#,
+        r#"{"type":"step.delta","index":0,"delta":{"type":"arguments","partial_arguments":"{\"city\":\"Boston\"}"}}"#,
+        r#"{"type":"step.stop","index":0,"status":"waiting"}"#,
+        r#"{"type":"interaction.requires_action","interaction":{"id":"interaction-tool-37","status":"requires_action"}}"#,
+    ] {
+        translator.process_payload(payload).unwrap();
+    }
+
+    assert_eq!(translator.finish().unwrap().len(), 2);
+    assert_eq!(translator.assistant_content[0]["type"], "tool_use");
+    assert_eq!(translator.assistant_content[0]["input"]["city"], "Boston");
+}
+
+#[test]
+fn maps_latest_interactions_usage_details_to_anthropic_usage() {
+    let upstream = json!({
+        "id": "interaction-usage-37",
+        "status": "completed",
+        "steps": [{"type": "model_output", "content": [{"type": "text", "text": "Done."}]}],
+        "usage": {
+            "total_input_tokens": 12,
+            "total_output_tokens": 4,
+            "total_thought_tokens": 6,
+            "total_cached_tokens": 3,
+            "total_tool_use_tokens": 2,
+            "total_tokens": 22
+        }
+    });
+    let translated = translate_gemini_interactions_response(&upstream, "gemini-3.7-flash").unwrap();
+    assert_eq!(translated.message["usage"]["input_tokens"], 12);
+    assert_eq!(translated.message["usage"]["output_tokens"], 10);
+    assert_eq!(translated.message["usage"]["reasoning_tokens"], 6);
+    assert_eq!(translated.message["usage"]["cache_read_input_tokens"], 3);
+}
+
+#[test]
+fn normalizes_gemini_37_thinking_levels_and_rejects_assistant_prefill() {
+    let mut profile = interactions_test_profile("gemini-interactions.json");
+    let continuations = RwLock::new(InteractionContinuationCache::default());
+    let request = json!({"messages": [{"role": "user", "content": "Hello"}]});
+    let translated =
+        translate_gemini_interactions_request(&request, &profile, &continuations).unwrap();
+    assert_eq!(translated["generation_config"]["thinking_level"], "medium");
+
+    profile.openai_capabilities.default_reasoning_effort = Some("max".to_string());
+    let translated =
+        translate_gemini_interactions_request(&request, &profile, &continuations).unwrap();
+    assert_eq!(translated["generation_config"]["thinking_level"], "high");
+
+    let disabled = json!({
+        "messages": [{"role": "user", "content": "Answer directly"}],
+        "thinking": {"type": "disabled"},
+        "output_config": {"effort": "max"}
+    });
+    let translated =
+        translate_gemini_interactions_request(&disabled, &profile, &continuations).unwrap();
+    assert_eq!(translated["generation_config"]["thinking_level"], "low");
+
+    profile.openai_capabilities.gemini_thinking_level_override = Some("medium".to_string());
+    let forced = json!({
+        "messages": [{"role": "user", "content": "Use the GUI-selected level"}],
+        "thinking": {"type": "disabled", "budget_tokens": 1},
+        "output_config": {"effort": "max"}
+    });
+    let translated =
+        translate_gemini_interactions_request(&forced, &profile, &continuations).unwrap();
+    assert_eq!(translated["generation_config"]["thinking_level"], "medium");
+
+    let prefill = json!({
+        "messages": [
+            {"role": "user", "content": "Complete this"},
+            {"role": "assistant", "content": "The answer begins"}
+        ]
+    });
+    let error =
+        translate_gemini_interactions_request(&prefill, &profile, &continuations).unwrap_err();
+    assert!(error.contains("assistant prefill"));
+
+    profile.openai_capabilities.gemini_thinking_level_override = None;
+    profile.model = "gemini-2.5-flash".to_string();
+    profile.openai_capabilities.default_reasoning_effort = Some("minimal".to_string());
+    let translated =
+        translate_gemini_interactions_request(&request, &profile, &continuations).unwrap();
+    assert_eq!(translated["generation_config"]["thinking_level"], "minimal");
+}
+
 fn responses_test_profile(file_name: &str, base_url: &str, model: &str) -> ProviderProfile {
     let mut profile = test_provider_profile(
         Client::builder().build().unwrap(),
@@ -4490,6 +5639,106 @@ fn deepseek_responses_fixture_preserves_reasoning_custom_tools_and_stateless_his
         .unwrap()
         .iter()
         .any(|tool| tool["type"] == "web_search"));
+}
+
+#[test]
+fn deepseek_responses_maps_disabled_thinking_and_default_effort() {
+    let profile = responses_test_profile(
+        "deepseek-responses.json",
+        "https://api.deepseek.com/v1",
+        "deepseek-v4-pro",
+    );
+    let continuations = RwLock::new(InteractionContinuationCache::default());
+
+    let disabled = json!({
+        "messages": [{"role": "user", "content": "Summarize"}],
+        "thinking": {"type": "disabled"}
+    });
+    let translated = translate_anthropic_to_responses(&disabled, &profile, &continuations).unwrap();
+    assert_eq!(translated["reasoning"]["effort"], "none");
+
+    let xhigh = json!({
+        "messages": [{"role": "user", "content": "Summarize"}],
+        "output_config": {"effort": "xhigh"}
+    });
+    let translated = translate_anthropic_to_responses(&xhigh, &profile, &continuations).unwrap();
+    assert_eq!(translated["reasoning"]["effort"], "max");
+
+    let budget = json!({
+        "messages": [{"role": "user", "content": "Summarize"}],
+        "thinking": {"type": "enabled", "budget_tokens": 32_768}
+    });
+    let translated = translate_anthropic_to_responses(&budget, &profile, &continuations).unwrap();
+    assert_eq!(translated["reasoning"]["effort"], "max");
+
+    let plain = json!({"messages": [{"role": "user", "content": "Summarize"}]});
+    let translated = translate_anthropic_to_responses(&plain, &profile, &continuations).unwrap();
+    assert_eq!(translated["reasoning"]["effort"], "high");
+
+    let mut defaulted_profile = profile;
+    defaulted_profile
+        .openai_capabilities
+        .default_reasoning_effort = Some("minimal".to_string());
+    let translated =
+        translate_anthropic_to_responses(&plain, &defaulted_profile, &continuations).unwrap();
+    assert_eq!(translated["reasoning"]["effort"], "low");
+}
+
+#[test]
+fn deepseek_responses_omits_reasoning_when_capability_disabled() {
+    let mut profile = responses_test_profile(
+        "deepseek-responses.json",
+        "https://api.deepseek.com/v1",
+        "deepseek-v4-flash",
+    );
+    profile.openai_capabilities.reasoning_effort = false;
+    let continuations = RwLock::new(InteractionContinuationCache::default());
+
+    let disabled = json!({
+        "messages": [{"role": "user", "content": "Summarize"}],
+        "thinking": {"type": "disabled"}
+    });
+    let translated = translate_anthropic_to_responses(&disabled, &profile, &continuations).unwrap();
+    assert!(translated.get("reasoning").is_none());
+
+    let xhigh = json!({
+        "messages": [{"role": "user", "content": "Summarize"}],
+        "output_config": {"effort": "xhigh"}
+    });
+    let translated = translate_anthropic_to_responses(&xhigh, &profile, &continuations).unwrap();
+    assert!(translated.get("reasoning").is_none());
+}
+
+#[test]
+fn deepseek_responses_injects_validated_user_id() {
+    let mut profile = responses_test_profile(
+        "deepseek-responses.json",
+        "https://api.deepseek.com/v1",
+        "deepseek-v4-pro",
+    );
+    profile.openai_capabilities.user_id = Some("default-peer".to_string());
+    let continuations = RwLock::new(InteractionContinuationCache::default());
+
+    let client_value = json!({
+        "messages": [{"role": "user", "content": "Hi"}],
+        "metadata": {"user_id": "peer-alice_01"}
+    });
+    let translated =
+        translate_anthropic_to_responses(&client_value, &profile, &continuations).unwrap();
+    assert_eq!(translated["user_id"], "peer-alice_01");
+
+    let invalid_client = json!({
+        "messages": [{"role": "user", "content": "Hi"}],
+        "metadata": {"user_id": "bad value!"}
+    });
+    let translated =
+        translate_anthropic_to_responses(&invalid_client, &profile, &continuations).unwrap();
+    assert_eq!(translated["user_id"], "default-peer");
+
+    let no_client = json!({"messages": [{"role": "user", "content": "Hi"}]});
+    let translated =
+        translate_anthropic_to_responses(&no_client, &profile, &continuations).unwrap();
+    assert_eq!(translated["user_id"], "default-peer");
 }
 
 #[test]
@@ -4706,7 +5955,7 @@ fn provider_diagnostics_expose_chat_and_responses_downgrades() {
         "metadata": {"user_id": "test"},
         "service_tier": "auto",
         "thinking": {"type": "enabled", "budget_tokens": 12000},
-        "tool_choice": {"type": "auto"},
+        "tool_choice": {"type": "tool", "name": "read_file"},
         "output_config": {"format": {"type": "json_schema", "schema": {"type": "object"}}},
         "messages": [
             {"role": "user", "content": [{"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}}]},
@@ -4724,7 +5973,7 @@ fn provider_diagnostics_expose_chat_and_responses_downgrades() {
     assert!(chat.contains("Downgraded Anthropic json_schema"));
 
     let mut deepseek_fast_request = request.clone();
-    deepseek_fast_request["output_config"]["effort"] = json!("low");
+    deepseek_fast_request["output_config"]["effort"] = json!("none");
     let deepseek_fast = openai_request_diagnostics(
         &deepseek_fast_request,
         &deepseek,

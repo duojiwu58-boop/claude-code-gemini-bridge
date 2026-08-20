@@ -35,7 +35,7 @@ $tool = @{
 }
 
 $firstBody = @{
-    model = 'gemini-3.6-flash'
+    model = 'gemini-3.7-flash'
     max_tokens = 512
     stream = $false
     thinking = @{
@@ -67,7 +67,7 @@ if ($null -eq $toolUse) {
 }
 
 $secondBody = @{
-    model = 'gemini-3.6-flash'
+    model = 'gemini-3.7-flash'
     max_tokens = 512
     stream = $true
     thinking = @{

@@ -281,25 +281,51 @@ fn translate_anthropic_to_responses(
             body.insert("top_p".to_string(), json!(top_p));
         }
     }
-    if profile.openai_capabilities.chat_dialect == OpenAiChatDialect::Qwen {
-        let (effort, _) = qwen_responses_reasoning_effort(request, &profile.openai_capabilities);
-        body.insert("reasoning".to_string(), json!({"effort": effort}));
-    } else if request.pointer("/thinking/type").and_then(Value::as_str) != Some("disabled") {
-        let effort = request
-            .pointer("/output_config/effort")
-            .and_then(Value::as_str)
-            .map(|effort| match profile.openai_capabilities.chat_dialect {
-                OpenAiChatDialect::DeepSeek => deepseek_reasoning_effort(effort),
-                _ => effort,
-            })
-            .or({
-                profile
-                    .openai_capabilities
-                    .default_reasoning_effort
-                    .as_deref()
-            });
-        if let Some(effort) = effort {
+    match profile.openai_capabilities.chat_dialect {
+        OpenAiChatDialect::Qwen => {
+            let (effort, _) =
+                qwen_responses_reasoning_effort(request, &profile.openai_capabilities);
             body.insert("reasoning".to_string(), json!({"effort": effort}));
+        }
+        OpenAiChatDialect::DeepSeek => {
+            // DeepSeek Responses controls reasoning exclusively through
+            // reasoning.effort (none/low/high/max). A disabled thinking
+            // request must still send {"effort":"none"}: omitting the field
+            // leaves upstream default reasoning switched on. The profile
+            // default goes through the same policy as the request value so
+            // configured tiers like "minimal"/"xhigh" never leak unmapped
+            // values that upstream would reject with HTTP 400. Profiles that
+            // set reasoning_effort: false opt out of the field entirely for
+            // endpoints that reject it.
+            if profile.openai_capabilities.reasoning_effort {
+                let policy = deepseek_reasoning_policy(request, &profile.openai_capabilities);
+                body.insert(
+                    "reasoning".to_string(),
+                    json!({"effort": policy.effort.unwrap_or("none")}),
+                );
+            }
+            // DeepSeek user_id isolates KVCache and per-user concurrency
+            // quotas. Prefer a validated client value, then the profile
+            // default, and drop values that violate [a-zA-Z0-9_-]{1,512}.
+            if let Some(user_id) = request
+                .pointer("/metadata/user_id")
+                .and_then(Value::as_str)
+                .and_then(validated_user_id)
+                .or_else(|| profile.openai_capabilities.user_id.clone())
+            {
+                body.insert("user_id".to_string(), json!(user_id));
+            }
+        }
+        _ => {
+            if request.pointer("/thinking/type").and_then(Value::as_str) != Some("disabled") {
+                let effort = request
+                    .pointer("/output_config/effort")
+                    .and_then(Value::as_str)
+                    .or(profile.openai_capabilities.default_reasoning_effort.as_deref());
+                if let Some(effort) = effort {
+                    body.insert("reasoning".to_string(), json!({"effort": effort}));
+                }
+            }
         }
     }
     let tools = responses_tools_from_anthropic(request, &profile.openai_capabilities);
@@ -652,16 +678,19 @@ async fn forward_openai_responses_profile(
             "The active Responses profile has no API credential",
         );
     };
-    let mut upstream_request = profile
-        .client
-        .post(&profile.upstream_url)
-        .bearer_auth(credential)
-        .json(&responses_request);
-    if profile.openai_capabilities.responses_session_cache {
-        upstream_request = upstream_request.header("x-dashscope-session-cache", "enable");
-    }
     let upstream_started = Instant::now();
-    let upstream = match upstream_request.send().await {
+    let upstream_build = || {
+        let mut upstream_request = profile
+            .client
+            .post(&profile.upstream_url)
+            .bearer_auth(credential)
+            .json(&responses_request);
+        if profile.openai_capabilities.responses_session_cache {
+            upstream_request = upstream_request.header("x-dashscope-session-cache", "enable");
+        }
+        upstream_request
+    };
+    let upstream = match send_with_rate_limit_retry(upstream_build, &profile.file_name).await {
         Ok(response) => response,
         Err(err) => {
             error!(

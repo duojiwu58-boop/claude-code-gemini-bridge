@@ -1,13 +1,15 @@
 {
   "name": "Google Gemini",
-  "model": "gemini-3.6-flash",
+  "model": "gemini-3.7-flash",
+  "context_window": 1048576,
   "base_url": "https://generativelanguage.googleapis.com/v1beta",
   "api_key": "<GEMINI_API_KEY>",
   "protocol": "gemini-interactions",
   "capabilities": {
-    "default_reasoning_effort": "high",
+    "default_reasoning_effort": "medium",
     "include_thoughts": true,
     "sampling_parameters": false,
+    "max_tool_result_chars": 16000,
     "gemini_builtin_tools": [
       "google_search",
       "url_context",

@@ -25,6 +25,7 @@ __history/
 *.log.*
 *.tmp
 *.bak
+/.firecrawl/
 .DS_Store
 Thumbs.db
 .idea/

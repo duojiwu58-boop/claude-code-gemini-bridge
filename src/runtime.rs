@@ -74,7 +74,8 @@ where
     let upstream_url = env::var("GEMINI_BRIDGE_UPSTREAM").unwrap_or_else(|_| {
         "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions".to_string()
     });
-    let model = env::var("GEMINI_BRIDGE_MODEL").unwrap_or_else(|_| "gemini-3.6-flash".to_string());
+    let model =
+        env::var("GEMINI_BRIDGE_MODEL").unwrap_or_else(|_| DEFAULT_GEMINI_MODEL.to_string());
     let settings_dir = env::var("CLAUDE_SETTINGS_DIR")
         .map(PathBuf::from)
         .or_else(|_| env::var("USERPROFILE").map(|profile| PathBuf::from(profile).join(".claude")))
@@ -127,12 +128,14 @@ where
             .filter(|value| !value.is_empty())
     });
     let gemini_client = build_gemini_client(proxy_url.as_deref(), None)?;
+    let gemini_thinking_level = load_persisted_gemini_thinking_level(&bridge_state_path);
 
     let state = Arc::new(AppState {
         gemini_transport: Arc::new(RwLock::new(GeminiTransport {
             client: gemini_client,
             proxy_url,
         })),
+        gemini_thinking_level: Arc::new(RwLock::new(gemini_thinking_level)),
         fallback_api_key,
         upstream_url,
         model,
@@ -168,6 +171,10 @@ where
         .route("/admin/reload-profiles", post(admin_reload_profiles))
         .route("/admin/gemini-proxy", post(admin_set_gemini_proxy))
         .route("/admin/gemini-proxy/test", post(admin_test_gemini_proxy))
+        .route(
+            "/admin/gemini-thinking-level",
+            post(admin_set_gemini_thinking_level),
+        )
         .route("/admin/shutdown", post(admin_shutdown))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
@@ -189,7 +196,7 @@ where
     info!("Claude Code bridge listening on http://{address}");
     info!(
         "Upstream model: {}",
-        env::var("GEMINI_BRIDGE_MODEL").unwrap_or_else(|_| "gemini-3.6-flash".into())
+        env::var("GEMINI_BRIDGE_MODEL").unwrap_or_else(|_| DEFAULT_GEMINI_MODEL.into())
     );
 
     axum::serve(listener, app)

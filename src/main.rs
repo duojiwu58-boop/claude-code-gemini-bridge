@@ -69,6 +69,7 @@ const UPSTREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 const BRIDGE_IDENTITY_MARKER: &str = "<bridge_runtime_identity>";
 const MAX_UPSTREAM_IDENTITY_CHARS: usize = 200;
+const DEFAULT_GEMINI_MODEL: &str = "gemini-3.7-flash";
 const DEFAULT_IMAGE_MODEL: &str = "gemini-3.1-flash-image";
 const DEFAULT_IMAGE_UPSTREAM: &str =
     "https://generativelanguage.googleapis.com/v1beta/interactions";

@@ -6,7 +6,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Net.Http
 
 $body = @{
-    model = 'gemini-3.6-flash'
+    model = 'gemini-3.7-flash'
     max_tokens = 2048
     stream = $true
     messages = @(

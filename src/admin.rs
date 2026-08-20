@@ -21,6 +21,36 @@ fn provider_profile_json(profile: &ProviderProfile, active_file: &str) -> Value 
     })
 }
 
+fn is_gemini_37_flash_profile(profile: &ProviderProfile) -> bool {
+    profile.transport == ProviderTransport::GeminiInteractions
+        && display_model_name(&profile.model).eq_ignore_ascii_case("gemini-3.7-flash")
+}
+
+fn effective_gemini_thinking_level(state: &AppState) -> Result<Option<String>, String> {
+    let routing = state
+        .routing
+        .read()
+        .map_err(|_| "Cannot read provider routing state".to_string())?;
+    let Some(profile) = routing
+        .profiles
+        .iter()
+        .find(|profile| profile.file_name == routing.active_file)
+        .filter(|profile| is_gemini_37_flash_profile(profile))
+    else {
+        return Ok(None);
+    };
+    if let Some(level) = current_gemini_thinking_level(state)? {
+        return Ok(Some(level));
+    }
+    Ok(profile
+        .openai_capabilities
+        .default_reasoning_effort
+        .as_deref()
+        .and_then(|level| normalize_gemini_thinking_level(level, "gemini-3.7-flash"))
+        .or(Some("medium"))
+        .map(str::to_owned))
+}
+
 async fn admin_status(State(state): State<Arc<AppState>>) -> Response {
     let transport = match current_gemini_transport(&state) {
         Ok(transport) => transport,
@@ -64,6 +94,16 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Response {
                     .into_response();
             }
         };
+    let gemini_thinking_level = match effective_gemini_thinking_level(&state) {
+        Ok(level) => level,
+        Err(message) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": message})),
+            )
+                .into_response();
+        }
+    };
     Json(json!({
         "status": "ok",
         "active_profile": active_profile,
@@ -74,6 +114,7 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Response {
         "providers_dir": state.providers_dir.to_string_lossy(),
         "profile_source": profile_source,
         "settings_dir": state.settings_dir.to_string_lossy(),
+        "gemini_thinking_level": gemini_thinking_level,
         "config_stamp": config_stamp,
         "settings_stamp": config_stamp
     }))
@@ -290,6 +331,75 @@ fn proxy_from_admin_request(request: &Value) -> Result<Option<String>, String> {
     }
 }
 
+fn gemini_thinking_level_from_admin_request(request: &Value) -> Result<String, String> {
+    match request.get("level").and_then(Value::as_str) {
+        Some(level @ ("low" | "medium" | "high")) => Ok(level.to_string()),
+        Some(_) => Err("Field 'level' must be low, medium, or high".to_string()),
+        None => Err("Missing string field 'level'".to_string()),
+    }
+}
+
+async fn admin_set_gemini_thinking_level(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<Value>,
+) -> Response {
+    let level = match gemini_thinking_level_from_admin_request(&request) {
+        Ok(level) => level,
+        Err(message) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": message}))).into_response();
+        }
+    };
+    let _transition = state.admin_state_lock.lock().await;
+    let supported = match state.routing.read() {
+        Ok(routing) => routing
+            .profiles
+            .iter()
+            .find(|profile| profile.file_name == routing.active_file)
+            .is_some_and(is_gemini_37_flash_profile),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Cannot read provider routing state"})),
+            )
+                .into_response();
+        }
+    };
+    if !supported {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Thinking level control requires an active gemini-3.7-flash Interactions profile"})),
+        )
+            .into_response();
+    }
+    if let Err(message) = persist_gemini_thinking_level_async(
+        state.bridge_state_path.clone(),
+        level.clone(),
+    )
+    .await
+    {
+        error!("{message}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": message})),
+        )
+            .into_response();
+    }
+    let Ok(mut current_level) = state.gemini_thinking_level.write() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "Cannot update Gemini thinking-level state"})),
+        )
+            .into_response();
+    };
+    *current_level = Some(level.clone());
+    info!(level = %level, "Gemini thinking level changed");
+    Json(json!({
+        "status": "ok",
+        "gemini_thinking_level": level
+    }))
+    .into_response()
+}
+
 async fn admin_set_gemini_proxy(
     State(state): State<Arc<AppState>>,
     Json(request): Json<Value>,
@@ -443,6 +553,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
         "model": state.model,
         "upstream": state.upstream_url,
         "gemini_proxy": proxy_url,
+        "gemini_thinking_level": effective_gemini_thinking_level(&state).ok().flatten(),
         "active_profile": active_profile.as_ref().map(|profile| provider_profile_json(profile, &profile.file_name))
     }))
 }

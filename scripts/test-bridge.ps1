@@ -22,7 +22,7 @@ $headers = @{
 }
 
 $body = @{
-    model = 'gemini-3.6-flash'
+    model = 'gemini-3.7-flash'
     input = 'Reply with exactly OK.'
     stream = $true
     reasoning = @{

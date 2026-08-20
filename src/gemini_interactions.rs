@@ -161,21 +161,36 @@ fn interaction_content_from_anthropic(part: &Value) -> Option<Value> {
     }
 }
 
-fn interaction_tool_result_value(content: &Value) -> Value {
+fn interaction_tool_result_value(content: &Value, max_chars: Option<u64>) -> Value {
     if let Some(parts) = content.as_array() {
         let translated: Vec<Value> = parts
             .iter()
             .filter_map(interaction_content_from_anthropic)
             .collect();
         if !translated.is_empty() {
+            let combined_text = translated
+                .iter()
+                .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let bounded_text = bound_tool_result_text(combined_text.clone(), max_chars);
+            if bounded_text != combined_text {
+                let mut bounded = vec![json!({"type": "text", "text": bounded_text})];
+                bounded.extend(translated.into_iter().filter(|part| {
+                    part.get("type").and_then(Value::as_str) != Some("text")
+                }));
+                return Value::Array(bounded);
+            }
             return Value::Array(translated);
         }
     }
-    if let Some(text) = content.as_str() {
-        Value::String(text.to_string())
+    let text = if let Some(text) = content.as_str() {
+        text.to_string()
     } else {
-        Value::String(value_to_text(content))
-    }
+        value_to_text(content)
+    };
+    Value::String(bound_tool_result_text(text, max_chars))
 }
 
 fn is_legacy_interaction_tool_call_text(text: &str) -> bool {
@@ -187,6 +202,7 @@ fn interaction_user_steps(
     content: &Value,
     tool_names: &HashMap<String, String>,
     text_tool_history: bool,
+    max_tool_result_chars: Option<u64>,
 ) -> Vec<Value> {
     if let Some(text) = content.as_str() {
         return if text.is_empty() {
@@ -222,7 +238,10 @@ fn interaction_user_steps(
                         "An earlier {name} operation produced this {status}. It is historical context:"
                     )
                 }));
-                match interaction_tool_result_value(part.get("content").unwrap_or(&Value::Null)) {
+                match interaction_tool_result_value(
+                    part.get("content").unwrap_or(&Value::Null),
+                    max_tool_result_chars,
+                ) {
                     Value::Array(result_content) => user_content.extend(result_content),
                     Value::String(text) if !text.is_empty() => {
                         user_content.push(json!({"type": "text", "text": text}));
@@ -242,7 +261,10 @@ fn interaction_user_steps(
                 "call_id": call_id,
                 "name": name,
                 "is_error": part.get("is_error").and_then(Value::as_bool).unwrap_or(false),
-                "result": interaction_tool_result_value(part.get("content").unwrap_or(&Value::Null))
+                "result": interaction_tool_result_value(
+                    part.get("content").unwrap_or(&Value::Null),
+                    max_tool_result_chars
+                )
             }));
         } else if let Some(translated) = interaction_content_from_anthropic(part) {
             user_content.push(translated);
@@ -391,7 +413,11 @@ fn interaction_tool_names_from_messages(messages: &[Value]) -> HashMap<String, S
     names
 }
 
-fn interaction_steps_from_messages(messages: &[Value], text_tool_history: bool) -> Vec<Value> {
+fn interaction_steps_from_messages(
+    messages: &[Value],
+    text_tool_history: bool,
+    max_tool_result_chars: Option<u64>,
+) -> Vec<Value> {
     let mut steps = Vec::new();
     let mut tool_names = HashMap::new();
     for message in messages {
@@ -408,6 +434,7 @@ fn interaction_steps_from_messages(messages: &[Value], text_tool_history: bool) 
                 content,
                 &tool_names,
                 text_tool_history,
+                max_tool_result_chars,
             )),
             _ => {}
         }
@@ -471,16 +498,27 @@ fn interaction_tool_choice(choice: &Value) -> Option<Value> {
 fn interaction_thinking_level(
     request: &Value,
     capabilities: &OpenAiCapabilities,
+    model: &str,
 ) -> Option<String> {
+    if let Some(level) = capabilities
+        .gemini_thinking_level_override
+        .as_deref()
+        .and_then(|level| normalize_gemini_thinking_level(level, model))
+    {
+        return Some(level.to_string());
+    }
+    if request.pointer("/thinking/type").and_then(Value::as_str) == Some("disabled") {
+        return Some(if model.starts_with("gemini-3") {
+            "low"
+        } else {
+            "none"
+        }
+        .to_string());
+    }
     request
         .pointer("/output_config/effort")
         .and_then(Value::as_str)
-        .and_then(|effort| match effort {
-            "low" => Some("low"),
-            "medium" => Some("medium"),
-            "high" | "xhigh" | "max" => Some("high"),
-            _ => None,
-        })
+        .and_then(|effort| normalize_gemini_thinking_level(effort, model))
         .map(str::to_owned)
         .or_else(|| {
             request
@@ -505,7 +543,23 @@ fn interaction_thinking_level(
                 })
                 .map(str::to_owned)
         })
-        .or_else(|| capabilities.default_reasoning_effort.clone())
+        .or_else(|| {
+            capabilities
+                .default_reasoning_effort
+                .as_deref()
+                .and_then(|effort| normalize_gemini_thinking_level(effort, model))
+                .map(str::to_owned)
+        })
+}
+
+fn normalize_gemini_thinking_level<'a>(effort: &'a str, model: &str) -> Option<&'a str> {
+    match effort {
+        "none" | "minimal" if model.starts_with("gemini-3") => Some("low"),
+        "none" | "minimal" | "low" => Some(effort),
+        "medium" => Some("medium"),
+        "high" | "xhigh" | "max" => Some("high"),
+        _ => None,
+    }
 }
 
 fn interaction_response_format(request: &Value) -> Result<Option<Value>, String> {
@@ -591,14 +645,21 @@ fn gemini_interaction_request_diagnostics(request: &Value) -> Vec<String> {
             ignored_sampling.join(", ")
         ));
     }
+    if request.get("candidate_count").is_some() {
+        add("Ignored candidate_count: Gemini 3.x supports a single response candidate");
+    }
     if let Some(effort) = request
         .pointer("/output_config/effort")
         .and_then(Value::as_str)
     {
-        if !matches!(effort, "low" | "medium" | "high" | "xhigh" | "max") {
-            add(&format!(
+        match effort {
+            "none" | "minimal" => add(&format!(
+                "Mapped Anthropic output_config.effort '{effort}' to Gemini 3.7 minimum thinking level 'low'"
+            )),
+            "low" | "medium" | "high" | "xhigh" | "max" => {}
+            _ => add(&format!(
                 "Ignored unsupported Anthropic output_config.effort '{effort}'"
-            ));
+            )),
         }
     }
     if let Some(tier) = request.get("service_tier").and_then(Value::as_str) {
@@ -658,8 +719,12 @@ fn deepseek_effort_mapping_diagnostic(request: &Value) -> Option<String> {
         .pointer("/output_config/effort")
         .and_then(Value::as_str)?;
     match effort {
-        "none" | "minimal" | "low" => Some(format!(
-            "Mapped Anthropic output_config.effort '{effort}' to DeepSeek thinking.type=disabled because DeepSeek exposes only high/max reasoning effort"
+        "none" => Some(
+            "Mapped Anthropic output_config.effort 'none' to DeepSeek thinking.type=disabled because DeepSeek has no zero-effort reasoning tier"
+                .to_string(),
+        ),
+        "minimal" | "low" => Some(format!(
+            "Mapped Anthropic output_config.effort '{effort}' to DeepSeek reasoning_effort 'low'"
         )),
         "medium" => Some(
             "Mapped Anthropic output_config.effort 'medium' to DeepSeek reasoning_effort 'high'"
@@ -689,7 +754,7 @@ fn anthropic_max_tokens_headroom_diagnostic(
         return None;
     }
     Some(format!(
-        "Raised {provider} Anthropic max_tokens from {max_tokens} to {} because extended thinking requires max_tokens > thinking.budget_tokens; the extra headroom keeps visible output possible",
+        "Raised {provider} Anthropic max_tokens from {max_tokens} to {} because the client's thinking budget exceeds max_tokens; the raise preserves visible-output headroom",
         budget.saturating_add(ANTHROPIC_THINKING_OUTPUT_HEADROOM_TOKENS)
     ))
 }
@@ -700,6 +765,18 @@ fn deepseek_anthropic_reasoning_diagnostics(request: &Value) -> Vec<String> {
         diagnostics.push(diagnostic);
     }
     let policy = deepseek_reasoning_policy(request, &OpenAiCapabilities::default());
+    if policy.thinking_enabled
+        && request
+            .get("tool_choice")
+            .and_then(|choice| choice.get("type"))
+            .and_then(Value::as_str)
+            == Some("tool")
+    {
+        diagnostics.push(
+            "Suppressed Anthropic tool_choice because DeepSeek thinking mode rejects a named tool preference; the model may still call the supplied tools automatically"
+                .to_string(),
+        );
+    }
     if let Some(diagnostic) =
         anthropic_max_tokens_headroom_diagnostic(request, "DeepSeek", policy.thinking_enabled)
     {
@@ -843,11 +920,28 @@ fn openai_request_diagnostics(
         );
     }
     if transport == ProviderTransport::OpenAiChat {
+        if request.get("tools").and_then(Value::as_array).is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                tool.get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind.starts_with("web_search_"))
+            })
+        }) {
+            add(
+                "Skipped Claude Code's server-side web_search tool: this OpenAI Chat transport cannot execute it natively; the provider's Anthropic transport performs server-side search"
+                    .to_string(),
+            );
+        }
         if capabilities.chat_dialect == OpenAiChatDialect::DeepSeek {
             let policy = deepseek_reasoning_policy(request, capabilities);
-            if policy.thinking_enabled && request.get("tool_choice").is_some() {
+            let named_tool_choice = request
+                .get("tool_choice")
+                .and_then(|choice| choice.get("type"))
+                .and_then(Value::as_str)
+                == Some("tool");
+            if policy.thinking_enabled && named_tool_choice {
                 add(
-                    "Suppressed Anthropic tool_choice because DeepSeek thinking mode rejects it"
+                    "Suppressed Anthropic tool_choice because DeepSeek thinking mode rejects a named tool preference; the model may still call the supplied tools automatically"
                         .to_string(),
                 );
             }
@@ -1030,6 +1124,18 @@ fn translate_gemini_interactions_request_with_continuation(
     if messages.is_empty() {
         return Err("Gemini Interactions requires at least one message".to_string());
     }
+    if display_model_name(&profile.model).starts_with("gemini-3")
+        && messages
+        .last()
+        .and_then(|message| message.get("role"))
+        .and_then(Value::as_str)
+        == Some("assistant")
+    {
+        return Err(
+            "Gemini 3.x does not support an assistant prefill; the final message must be user input or a tool result"
+                .to_string(),
+        );
+    }
     let continuation = allow_continuation
         .then(|| {
             interaction_continuation_for_request(
@@ -1050,9 +1156,14 @@ fn translate_gemini_interactions_request_with_continuation(
                 .unwrap_or(&Value::Null),
             tool_names,
             false,
+            profile.openai_capabilities.max_tool_result_chars,
         )
     } else {
-        interaction_steps_from_messages(messages, text_tool_history)
+        interaction_steps_from_messages(
+            messages,
+            text_tool_history,
+            profile.openai_capabilities.max_tool_result_chars,
+        )
     };
     if input.is_empty() {
         return Err("Gemini Interactions request produced no supported input steps".to_string());
@@ -1070,7 +1181,11 @@ fn translate_gemini_interactions_request_with_continuation(
             );
         }
     }
-    if let Some(level) = interaction_thinking_level(request, &profile.openai_capabilities) {
+    if let Some(level) = interaction_thinking_level(
+        request,
+        &profile.openai_capabilities,
+        &display_model_name(&profile.model),
+    ) {
         generation_config.insert("thinking_level".to_string(), json!(level));
     }
     generation_config.insert(
@@ -1300,6 +1415,34 @@ fn interaction_server_tool_summary(step: &Value) -> Value {
     Value::Object(summary)
 }
 
+fn gemini_interaction_usage_to_anthropic(usage: &Value, fallback_input_tokens: u64) -> Value {
+    let input_tokens = usage_token(
+        usage,
+        &["total_input_tokens", "prompt_tokens", "input_tokens"],
+    )
+    .unwrap_or(fallback_input_tokens);
+    let visible_output_tokens = usage_token(
+        usage,
+        &["total_output_tokens", "completion_tokens", "output_tokens"],
+    )
+    .unwrap_or(0);
+    let thought_tokens = usage_token(
+        usage,
+        &["total_thought_tokens", "total_reasoning_tokens", "reasoning_tokens"],
+    );
+    let mut translated = json!({
+        "input_tokens": input_tokens,
+        "output_tokens": visible_output_tokens.saturating_add(thought_tokens.unwrap_or(0))
+    });
+    if let Some(tokens) = thought_tokens {
+        translated["reasoning_tokens"] = json!(tokens);
+    }
+    if let Some(tokens) = usage_token(usage, &["total_cached_tokens", "cached_tokens"]) {
+        translated["cache_read_input_tokens"] = json!(tokens);
+    }
+    translated
+}
+
 fn translate_gemini_interactions_response(
     upstream: &Value,
     model: &str,
@@ -1383,9 +1526,10 @@ fn translate_gemini_interactions_response(
             _ => {}
         }
     }
-    let usage = upstream.get("usage").unwrap_or(&Value::Null);
-    let input_tokens = usage_token(usage, &["total_input_tokens"]).unwrap_or(0);
-    let output_tokens = usage_token(usage, &["total_output_tokens"]).unwrap_or(0);
+    let usage = gemini_interaction_usage_to_anthropic(
+        upstream.get("usage").unwrap_or(&Value::Null),
+        0,
+    );
     let stop_reason = if !calls.is_empty() || status == "requires_action" {
         "tool_use"
     } else if status == "incomplete" {
@@ -1401,10 +1545,7 @@ fn translate_gemini_interactions_response(
         "content": content,
         "stop_reason": stop_reason,
         "stop_sequence": Value::Null,
-        "usage": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens
-        }
+        "usage": usage
     });
     if let Some(usage) = server_tools.anthropic_usage() {
         message["usage"]["server_tool_use"] = usage;

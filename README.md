@@ -61,7 +61,7 @@ Anthropic Messages · agent · MCP · tools · thinking · media
 
 | Model | Recommended transport | Key adaptations | Optional paths |
 | --- | --- | --- | --- |
-| **Gemini 3.6 Flash** | `gemini-interactions` | Native `step.*` stream, exact stateful continuation, thinking/signatures, images and PDFs, native token count, structured output, and Google server-side tools | OpenAI Chat fallback |
+| **Gemini 3.7 Flash** | `gemini-interactions` | Current `step.*` SSE variants, exact stateful continuation, thinking/signatures, 1M context, images and PDFs, native token count, structured output, detailed usage, and Google server-side tools | OpenAI Chat fallback |
 | **DeepSeek V4 Flash** | `anthropic` | Minimal translation of the Claude Code contract; Anthropic and Chat routes provide disabled/high/max reasoning modes and keep 16K budgets at high; Chat omits ordinary reasoning only in tool-free requests and fully replays it whenever `tools` are present, as required by the API | Stateless `openai-responses`, OpenAI Chat, Vision Proxy |
 | **Qwen3.8 Max** | `anthropic` | Three effective Anthropic/Chat reasoning modes (`low/medium/xhigh`) with bounded normal-turn budgets instead of permanent maximum reasoning; exact Responses continuation, seven-level native effort, session cache, usage and latency observability | Stateful `openai-responses`, OpenAI Chat |
 | **Kimi K3** | `anthropic` | Bearer authentication, verified `kimi-k3` model ID, 1M context metadata, native token estimate, and cache usage; Chat fallback maps Kimi effort, reasoning replay, and structured output | OpenAI Chat and explicitly enabled Kimi Formula MCP tools |
@@ -106,6 +106,8 @@ http://127.0.0.1:18787
 
 The Windows service is named `ClaudeCodeBridge`. The installer backs up and updates Claude Code's `settings.json` so Claude Code always connects to this stable local endpoint. Restart any running Claude Code session after the first installation.
 
+When a Gemini key is supplied, the installer creates a native `gemini-interactions` profile and keeps the real Google credential in the protected service credential file rather than duplicating it in provider JSON.
+
 ### 2. Add a provider
 
 The default provider directory is:
@@ -128,12 +130,15 @@ For a priority model, copy its adapted template instead of guessing from the min
 
 - [Gemini native Interactions](examples/providers/gemini.example.json)
 - [DeepSeek V4 Flash](examples/providers/deepseek.example.json)
+- [DeepSeek V4 Pro](examples/providers/deepseek-v4-pro.example.json)
 - [Qwen3.8 Max](examples/providers/qwen.example.json)
 - [Kimi K3](examples/providers/kimi.example.json)
 - [Generic OpenAI-compatible provider](examples/providers/custom-openai.example.json)
 - [Capability overrides](examples/providers/capability-overrides.example.json)
 
 Save the file, open **Claude Code Model Center**, select **Reload profiles**, and choose the model. The next request uses the new route without restarting VS Code, Claude Code, or the bridge service.
+
+When the active profile is Gemini 3.7 Flash over `gemini-interactions`, Model Center also exposes **Low / Medium / High** Thinking controls. A selection is persisted and takes effect on the next request immediately—no service or Claude Code restart is required.
 
 See the [Provider configuration guide](PROVIDER_CONFIG.md) for the complete field reference, regional endpoints, authentication, proxies, Responses, Vision Proxy, and legacy migration.
 

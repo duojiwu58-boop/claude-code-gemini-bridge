@@ -39,6 +39,8 @@ type
     HasProfile: Boolean;
     Model: string;
     FileName: string;
+    Transport: string;
+    ThinkingLevel: string;
     Stamp: string;
     SettingsDir: string;
     Detail: string;
@@ -58,6 +60,7 @@ type
     FStatusLabel: TLabel;
     FCurrentModelLabel: TLabel;
     FHintLabel: TLabel;
+    FThinkingGroup: TRadioGroup;
     FContentPanel: TPanel;
     FListPanel: TPanel;
     FListTitleLabel: TLabel;
@@ -78,6 +81,8 @@ type
     FProfilesBusy: Boolean;
     FProfilesLoaded: Boolean;
     FSettingsStamp: string;
+    FThinkingLevel: string;
+    FUpdatingThinkingUi: Boolean;
     FWorkerCount: Integer;
     procedure FormShown(Sender: TObject);
     procedure FormResize(Sender: TObject);
@@ -85,6 +90,7 @@ type
     procedure SwitchClick(Sender: TObject);
     procedure StartClick(Sender: TObject);
     procedure StopClick(Sender: TObject);
+    procedure ThinkingLevelClick(Sender: TObject);
     procedure PollTimer(Sender: TObject);
     procedure ProfileDblClick(Sender: TObject);
     procedure ListSelectItem(Sender: TObject; Item: TListItem;
@@ -97,9 +103,11 @@ type
     procedure RefreshStatusAsync(const AQuiet: Boolean);
     procedure StartProfilesRefresh(const AQuiet: Boolean);
     procedure SwitchProfileAsync(const AFileName: string);
+    procedure SetThinkingLevelAsync(const ALevel: string);
     procedure StartStopAsync(const AStart: Boolean);
     procedure ApplyStatusSnapshot(const ASnapshot: TStatusSnapshot;
       const AQuiet: Boolean);
+    procedure ApplyThinkingControls(const ASnapshot: TStatusSnapshot);
     procedure FillProfileList(const ARows: TArray<TProfileRow>);
     procedure AdjustProfileColumns;
     procedure SetBridgeState(const AOnline: Boolean; const ADetail: string);
@@ -252,6 +260,18 @@ begin
   FCurrentModelLabel.Caption := '当前模型：-';
   FCurrentModelLabel.Font.Name := 'Segoe UI';
   FCurrentModelLabel.Font.Color := $00606060;
+
+  FThinkingGroup := TRadioGroup.Create(Self);
+  FThinkingGroup.Parent := FTopPanel;
+  FThinkingGroup.SetBounds(596, 78, 400, 70);
+  FThinkingGroup.Caption := 'Gemini Thinking（下一请求生效）';
+  FThinkingGroup.Columns := 3;
+  FThinkingGroup.Items.Add('低');
+  FThinkingGroup.Items.Add('中');
+  FThinkingGroup.Items.Add('高');
+  FThinkingGroup.ItemIndex := -1;
+  FThinkingGroup.Enabled := False;
+  FThinkingGroup.OnClick := ThinkingLevelClick;
 
   FRefreshButton := TButton.Create(Self);
   FRefreshButton.Parent := FTopPanel;
@@ -430,6 +450,8 @@ begin
       FStartButton.Left - CONTROL_GAP - FSwitchButton.Width;
     FRefreshButton.Left :=
       FSwitchButton.Left - CONTROL_GAP - FRefreshButton.Width;
+    FThinkingGroup.Left :=
+      FTopPanel.ClientWidth - EDGE_MARGIN - FThinkingGroup.Width;
   end;
 
   if Assigned(FStatusBar) then
@@ -722,6 +744,7 @@ begin
     FSwitchButton.Enabled := False;
     FStartButton.Enabled := False;
     FStopButton.Enabled := False;
+    FThinkingGroup.Enabled := False;
     Screen.Cursor := crHourGlass;
   end
   else
@@ -729,6 +752,8 @@ begin
     Screen.Cursor := crDefault;
     FRefreshButton.Enabled := True;
     FProfileList.Enabled := True;
+    FThinkingGroup.Enabled :=
+      (FStatusLabel.Tag = 1) and (FThinkingLevel <> '');
     RefreshStatusAsync(True);
   end;
 end;
@@ -757,6 +782,7 @@ begin
     FStatusPanel.Color := $00EDEFFB;
     FStatusLabel.Tag := 0;
     FCurrentModelLabel.Caption := '当前模型：-';
+    FThinkingGroup.Enabled := False;
     FSwitchButton.Enabled := False;
     FStopButton.Enabled := False;
     FStartButton.Enabled := True;
@@ -798,7 +824,12 @@ begin
               LSnapshot.HasProfile := True;
               LSnapshot.Model := JsonText(LProfile, 'model');
               LSnapshot.FileName := JsonText(LProfile, 'file');
+              LSnapshot.Transport := JsonText(LProfile, 'transport');
             end;
+            LSnapshot.ThinkingLevel := JsonText(
+              LJson,
+              'gemini_thinking_level'
+            );
             LSnapshot.Stamp := JsonText(LJson, 'config_stamp');
             if LSnapshot.Stamp = '' then
               LSnapshot.Stamp := JsonText(LJson, 'settings_stamp');
@@ -853,6 +884,7 @@ begin
     end;
     if ASnapshot.SettingsDir <> '' then
       FStatusBar.Panels[1].Text := '配置目录：' + ASnapshot.SettingsDir;
+    ApplyThinkingControls(ASnapshot);
     LStampChanged :=
       (ASnapshot.Stamp <> '') and (ASnapshot.Stamp <> FSettingsStamp);
     if LStampChanged then
@@ -864,8 +896,44 @@ begin
   else
   begin
     SetBridgeState(False, ASnapshot.Detail);
+    ApplyThinkingControls(ASnapshot);
     if not AQuiet then
       AppendLog('状态检查失败：' + ASnapshot.Detail);
+  end;
+end;
+
+procedure TMainForm.ApplyThinkingControls(const ASnapshot: TStatusSnapshot);
+var
+  LSupported: Boolean;
+begin
+  LSupported := ASnapshot.Online and ASnapshot.HasProfile and
+    SameText(ASnapshot.Transport, 'gemini-interactions') and
+    SameText(ASnapshot.Model, 'gemini-3.7-flash');
+  FUpdatingThinkingUi := True;
+  try
+    if LSupported then
+    begin
+      FThinkingGroup.Caption := 'Gemini Thinking（下一请求生效）';
+      FThinkingLevel := LowerCase(ASnapshot.ThinkingLevel);
+      if SameText(FThinkingLevel, 'low') then
+        FThinkingGroup.ItemIndex := 0
+      else if SameText(FThinkingLevel, 'medium') then
+        FThinkingGroup.ItemIndex := 1
+      else if SameText(FThinkingLevel, 'high') then
+        FThinkingGroup.ItemIndex := 2
+      else
+        FThinkingGroup.ItemIndex := -1;
+      FThinkingGroup.Enabled := not FBusy;
+    end
+    else
+    begin
+      FThinkingLevel := '';
+      FThinkingGroup.ItemIndex := -1;
+      FThinkingGroup.Enabled := False;
+      FThinkingGroup.Caption := 'Gemini Thinking（仅 3.7 Flash）';
+    end;
+  finally
+    FUpdatingThinkingUi := False;
   end;
 end;
 
@@ -1065,6 +1133,86 @@ end;
 procedure TMainForm.RefreshClick(Sender: TObject);
 begin
   StartProfilesRefresh(False);
+end;
+
+procedure TMainForm.SetThinkingLevelAsync(const ALevel: string);
+begin
+  if FClosing or FBusy then
+    Exit;
+  SetBusy(True);
+  Inc(FWorkerCount);
+  TThread.CreateAnonymousThread(
+    procedure
+    var
+      LClient: THTTPClient;
+      LRequest: TJSONObject;
+      LResult: TJSONObject;
+      LAppliedLevel: string;
+      LError: string;
+    begin
+      LAppliedLevel := '';
+      LError := '';
+      try
+        LClient := NewHttpClient(ACTION_RESPONSE_TIMEOUT_MS);
+        try
+          LRequest := TJSONObject.Create;
+          try
+            LRequest.AddPair('level', ALevel);
+            LResult := PostJsonWith(
+              LClient,
+              '/admin/gemini-thinking-level',
+              LRequest.ToJSON
+            );
+          finally
+            LRequest.Free;
+          end;
+          try
+            LAppliedLevel := JsonText(LResult, 'gemini_thinking_level');
+          finally
+            LResult.Free;
+          end;
+        finally
+          LClient.Free;
+        end;
+      except
+        on E: Exception do
+          LError := E.Message;
+      end;
+      QueueToMain(
+        procedure
+        begin
+          SetBusy(False);
+          if LError <> '' then
+          begin
+            AppendLog('Thinking 档位切换失败：' + LError);
+            MessageDlg(LError, mtError, [mbOK], 0);
+          end
+          else
+          begin
+            FThinkingLevel := LAppliedLevel;
+            AppendLog('Gemini Thinking 已切换为：' + LAppliedLevel);
+          end;
+          RefreshStatusAsync(True);
+        end);
+    end).Start;
+end;
+
+procedure TMainForm.ThinkingLevelClick(Sender: TObject);
+var
+  LLevel: string;
+begin
+  if FUpdatingThinkingUi or FBusy or not FThinkingGroup.Enabled then
+    Exit;
+  case FThinkingGroup.ItemIndex of
+    0: LLevel := 'low';
+    1: LLevel := 'medium';
+    2: LLevel := 'high';
+  else
+    Exit;
+  end;
+  if SameText(LLevel, FThinkingLevel) then
+    Exit;
+  SetThinkingLevelAsync(LLevel);
 end;
 
 procedure TMainForm.SwitchClick(Sender: TObject);

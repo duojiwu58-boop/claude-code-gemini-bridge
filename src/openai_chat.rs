@@ -333,23 +333,32 @@ fn translate_anthropic_request_with_capabilities(
     thought_signatures: &ThoughtSignatureCache,
     capabilities: &OpenAiCapabilities,
 ) -> Result<Value, String> {
+    let mut system_parts = Vec::new();
     let mut messages = Vec::new();
-    let mut runtime_identity_reminder = None;
     let mut pending_tool_call_ids = HashSet::new();
     let mut replayed_reasoning = false;
+    // Server-side tools (web_search_*) are dropped during tool translation,
+    // so the DeepSeek reasoning replay decision must use the tools that
+    // actually reach upstream. Basing it on the raw request would replay
+    // every historical reasoning block even when upstream receives no tools
+    // at all, needlessly inflating context.
+    let translated_tools: Vec<Value> = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| translate_anthropic_tool_with_capabilities(tool, capabilities))
+                .collect()
+        })
+        .unwrap_or_default();
     let deepseek_request_has_tools = capabilities.chat_dialect == OpenAiChatDialect::DeepSeek
-        && request
-            .get("tools")
-            .and_then(Value::as_array)
-            .is_some_and(|tools| !tools.is_empty());
+        && !translated_tools.is_empty();
 
     if let Some(system) = request.get("system") {
         let text = value_to_text(system);
         if !text.is_empty() {
-            runtime_identity_reminder = text
-                .rfind(BRIDGE_IDENTITY_MARKER)
-                .map(|start| text[start..].to_string());
-            messages.push(json!({"role": "system", "content": text}));
+            system_parts.push(text);
         }
     }
 
@@ -357,8 +366,20 @@ fn translate_anthropic_request_with_capabilities(
         .get("messages")
         .and_then(Value::as_array)
         .ok_or_else(|| "Missing required array field 'messages'".to_string())?;
+    let active_task_start = if capabilities.reasoning_replay_scope
+        == ReasoningReplayScope::ActiveTask
+    {
+        source_messages.iter().rposition(|message| {
+            message.get("role").and_then(Value::as_str) == Some("user")
+                && is_genuine_anthropic_user_task(
+                    message.get("content").unwrap_or(&Value::Null),
+                )
+        })
+    } else {
+        None
+    };
 
-    for message in source_messages {
+    for (message_index, message) in source_messages.iter().enumerate() {
         let role = message
             .get("role")
             .and_then(Value::as_str)
@@ -367,12 +388,20 @@ fn translate_anthropic_request_with_capabilities(
 
         match role {
             "assistant" => {
+                let replay_reasoning = match capabilities.reasoning_replay_scope {
+                    ReasoningReplayScope::None => false,
+                    ReasoningReplayScope::All => true,
+                    ReasoningReplayScope::ActiveTask => {
+                        active_task_start.is_some_and(|start| message_index > start)
+                    }
+                };
                 replayed_reasoning |= translate_anthropic_assistant_message(
                     content,
                     &mut messages,
                     thought_signatures,
                     &mut pending_tool_call_ids,
                     capabilities.chat_dialect,
+                    replay_reasoning,
                     deepseek_request_has_tools,
                 );
             }
@@ -385,15 +414,18 @@ fn translate_anthropic_request_with_capabilities(
             "system" | "developer" => {
                 let text = value_to_text(content);
                 if !text.is_empty() {
-                    messages.push(json!({"role": "system", "content": text}));
+                    system_parts.push(text);
                 }
             }
             _ => return Err(format!("Unsupported Anthropic message role '{role}'")),
         }
     }
 
-    if let Some(reminder) = runtime_identity_reminder {
-        messages.push(json!({"role": "system", "content": reminder}));
+    if !system_parts.is_empty() {
+        messages.insert(
+            0,
+            json!({"role": "system", "content": system_parts.join("\n\n")}),
+        );
     }
 
     let mut body = Map::new();
@@ -435,14 +467,8 @@ fn translate_anthropic_request_with_capabilities(
         }
     }
 
-    if let Some(tools) = request.get("tools").and_then(Value::as_array) {
-        let translated_tools: Vec<Value> = tools
-            .iter()
-            .filter_map(|tool| translate_anthropic_tool_with_capabilities(tool, capabilities))
-            .collect();
-        if !translated_tools.is_empty() {
-            body.insert("tools".to_string(), Value::Array(translated_tools));
-        }
+    if !translated_tools.is_empty() {
+        body.insert("tools".to_string(), Value::Array(translated_tools));
     }
 
     let deepseek_policy = (capabilities.chat_dialect == OpenAiChatDialect::DeepSeek)
@@ -457,11 +483,17 @@ fn translate_anthropic_request_with_capabilities(
                 .unwrap_or(false)
         });
 
-    // DeepSeek V4 rejects tool_choice while thinking is enabled. Let the
-    // model use the supplied tools automatically instead of forwarding an
-    // otherwise valid Anthropic tool preference that would produce a 400.
-    let suppress_tool_choice =
-        capabilities.chat_dialect == OpenAiChatDialect::DeepSeek && thinking_enabled;
+    // DeepSeek V4 thinking mode accepts tool_choice auto/any/none but rejects
+    // a named tool preference with HTTP 400 ("Thinking mode does not support
+    // this tool_choice", verified live). Drop only the named form and let the
+    // model use the supplied tools automatically.
+    let suppress_tool_choice = capabilities.chat_dialect == OpenAiChatDialect::DeepSeek
+        && thinking_enabled
+        && request
+            .get("tool_choice")
+            .and_then(|choice| choice.get("type"))
+            .and_then(Value::as_str)
+            == Some("tool");
     if !suppress_tool_choice {
         if let Some(choice) = request.get("tool_choice") {
             if let Some(translated) = translate_anthropic_tool_choice(choice) {
@@ -493,6 +525,17 @@ fn translate_anthropic_request_with_capabilities(
                 if let Some(effort) = policy.effort {
                     body.insert("reasoning_effort".to_string(), json!(effort));
                 }
+            }
+            // DeepSeek user_id isolates KVCache and per-user concurrency
+            // quotas. Prefer a validated client value, then the profile
+            // default, and drop values that violate [a-zA-Z0-9_-]{1,512}.
+            if let Some(user_id) = request
+                .pointer("/metadata/user_id")
+                .and_then(Value::as_str)
+                .and_then(validated_user_id)
+                .or_else(|| capabilities.user_id.clone())
+            {
+                body.insert("user_id".to_string(), json!(user_id));
             }
             if let Some(format) = openai_chat_response_format(request, true)? {
                 body.insert("response_format".to_string(), format);
@@ -550,31 +593,50 @@ fn translate_anthropic_request_with_capabilities(
     }
 
     if capabilities.reasoning_effort && capabilities.chat_dialect == OpenAiChatDialect::Generic {
-        if let Some(thinking) = request.get("thinking") {
-            let effort = thinking
-                .get("budget_tokens")
-                .and_then(Value::as_u64)
-                .map(|budget| {
-                    if budget >= 8_192 {
-                        "high"
-                    } else if budget >= 2_048 {
-                        "medium"
-                    } else {
-                        "low"
-                    }
+        let thinking = request.get("thinking");
+        let disabled = thinking
+            .and_then(|value| value.get("type"))
+            .and_then(Value::as_str)
+            == Some("disabled");
+        let effort = if disabled {
+            capabilities
+                .reasoning_effort_map
+                .contains_key("none")
+                .then_some("none")
+        } else {
+            request
+                .pointer("/output_config/effort")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    thinking
+                        .and_then(|value| value.get("budget_tokens"))
+                        .and_then(Value::as_u64)
+                        .map(|budget| {
+                            if budget >= 8_192 {
+                                "high"
+                            } else if budget >= 2_048 {
+                                "medium"
+                            } else {
+                                "low"
+                            }
+                        })
                 })
                 .or_else(|| {
-                    (thinking.get("type").and_then(Value::as_str) == Some("adaptive"))
+                    thinking
+                        .and_then(|value| value.get("type"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|kind| kind == "adaptive")
                         .then_some("high")
-                });
-            if let Some(effort) = effort {
-                body.insert("reasoning_effort".to_string(), json!(effort));
-            }
-        }
-        if !body.contains_key("reasoning_effort") {
-            if let Some(effort) = &capabilities.default_reasoning_effort {
-                body.insert("reasoning_effort".to_string(), json!(effort));
-            }
+                })
+                .or(capabilities.default_reasoning_effort.as_deref())
+        };
+        if let Some(effort) = effort {
+            let effort = capabilities
+                .reasoning_effort_map
+                .get(effort)
+                .map(String::as_str)
+                .unwrap_or(effort);
+            body.insert("reasoning_effort".to_string(), json!(effort));
         }
     }
     if capabilities.include_thoughts {
@@ -591,12 +653,40 @@ fn translate_anthropic_request_with_capabilities(
     Ok(Value::Object(body))
 }
 
+fn is_genuine_anthropic_user_task(content: &Value) -> bool {
+    if let Some(text) = content.as_str() {
+        return !text.trim().is_empty();
+    }
+
+    let Some(parts) = content.as_array() else {
+        return false;
+    };
+    if parts
+        .iter()
+        .any(|part| part.get("type").and_then(Value::as_str) == Some("tool_result"))
+    {
+        return false;
+    }
+
+    parts
+        .iter()
+        .any(|part| match part.get("type").and_then(Value::as_str) {
+            Some("text") => part
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.trim().is_empty()),
+            Some("image" | "document") => true,
+            _ => false,
+        })
+}
+
 fn translate_anthropic_assistant_message(
     content: &Value,
     messages: &mut Vec<Value>,
     thought_signatures: &ThoughtSignatureCache,
     pending_tool_call_ids: &mut HashSet<String>,
     chat_dialect: OpenAiChatDialect,
+    reasoning_replay: bool,
     deepseek_request_has_tools: bool,
 ) -> bool {
     pending_tool_call_ids.clear();
@@ -687,7 +777,7 @@ fn translate_anthropic_assistant_message(
             translated["extra_content"] = json!({"google": {"thought_signature": signature}});
         }
         let replay_reasoning = !reasoning_parts.is_empty()
-            && chat_dialect != OpenAiChatDialect::Generic
+            && (reasoning_replay || chat_dialect != OpenAiChatDialect::Generic)
             && (chat_dialect != OpenAiChatDialect::DeepSeek
                 || deepseek_request_has_tools
                 || has_tool_calls);
@@ -699,14 +789,6 @@ fn translate_anthropic_assistant_message(
     }
 
     false
-}
-
-fn deepseek_reasoning_effort(effort: &str) -> &'static str {
-    if matches!(effort, "max" | "xhigh") {
-        "max"
-    } else {
-        "high"
-    }
 }
 
 const DEEPSEEK_MAX_EFFORT_BUDGET_TOKENS: u64 = 32_768;
@@ -733,6 +815,9 @@ fn ensure_anthropic_thinking_output_headroom(
     if max_tokens > budget {
         return Ok(());
     }
+    // DeepSeek ignores budget_tokens upstream, but a client that sent
+    // max_tokens <= budget_tokens still expects visible output beyond its
+    // thinking budget; raising max_tokens preserves that headroom.
     let required_max_tokens = budget
         .checked_add(ANTHROPIC_THINKING_OUTPUT_HEADROOM_TOKENS)
         .ok_or_else(|| {
@@ -764,9 +849,17 @@ fn deepseek_reasoning_policy(
     }
 
     let effort_policy = |effort: &str, source| match effort {
-        "none" | "minimal" | "low" => DeepSeekReasoningPolicy {
+        "none" => DeepSeekReasoningPolicy {
             thinking_enabled: false,
             effort: None,
+            source,
+        },
+        // DeepSeek V4 (flash and pro, verified live) accepts a "low"
+        // reasoning tier. Keep thinking on for minimal/low requests so
+        // simple turns still get the cheapest reasoning tier.
+        "minimal" | "low" => DeepSeekReasoningPolicy {
+            thinking_enabled: true,
+            effort: Some("low"),
             source,
         },
         "xhigh" | "max" => DeepSeekReasoningPolicy {
@@ -791,6 +884,10 @@ fn deepseek_reasoning_policy(
         .pointer("/thinking/budget_tokens")
         .and_then(Value::as_u64)
     {
+        // DeepSeek's Anthropic endpoint ignores budget_tokens (verified
+        // live: a 64-token budget still produced full reasoning), so the
+        // bridge is the only place the budget has meaning. Translate it
+        // into effort so Claude Code's thinking intensity is preserved.
         return DeepSeekReasoningPolicy {
             thinking_enabled: true,
             effort: Some(if budget >= DEEPSEEK_MAX_EFFORT_BUDGET_TOKENS {
@@ -856,6 +953,20 @@ fn apply_deepseek_anthropic_reasoning_policy(
         if output_config.is_empty() {
             request.remove("output_config");
         }
+    }
+
+    // DeepSeek V4 thinking mode rejects a named tool preference with HTTP 400
+    // ("Thinking mode does not support this tool_choice", verified live) but
+    // accepts auto/any/none. Strip only the named form so the model can still
+    // call the supplied tools automatically.
+    if policy.thinking_enabled
+        && request
+            .get("tool_choice")
+            .and_then(|choice| choice.get("type"))
+            .and_then(Value::as_str)
+            == Some("tool")
+    {
+        request.remove("tool_choice");
     }
 
     ensure_anthropic_thinking_output_headroom(request, policy.thinking_enabled, "DeepSeek")?;
@@ -1294,6 +1405,7 @@ fn translate_anthropic_user_message(
                     part.get("content").unwrap_or(&Value::Null),
                     part.get("is_error").and_then(Value::as_bool) == Some(true),
                     capabilities.tool_result_media,
+                    capabilities.max_tool_result_chars,
                 );
                 tool_results.push(json!({
                     "role": "tool",
@@ -1317,6 +1429,14 @@ fn translate_anthropic_user_message(
                     user_parts.push(media_part);
                 }
             }
+            Some("web_search_tool_result") => {
+                // Server-side search results keep cross-transport history
+                // continuous: titles and URLs survive even though the body
+                // arrives encrypted for the client, not the model.
+                if let Some(text) = textify_web_search_tool_result(part) {
+                    user_parts.push(json!({"type": "text", "text": text}));
+                }
+            }
             _ => {}
         }
     }
@@ -1330,10 +1450,35 @@ fn translate_anthropic_user_message(
     pending_tool_call_ids.clear();
 }
 
+fn textify_web_search_tool_result(part: &Value) -> Option<String> {
+    let results = part.get("content").and_then(Value::as_array)?;
+    let mut lines = Vec::new();
+    for result in results {
+        let title = result.get("title").and_then(Value::as_str).unwrap_or("");
+        let url = result.get("url").and_then(Value::as_str).unwrap_or("");
+        if title.is_empty() && url.is_empty() {
+            continue;
+        }
+        lines.push(if url.is_empty() {
+            format!("- {title}")
+        } else {
+            format!("- {title} ({url})")
+        });
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Web search performed earlier in this conversation returned these results:\n{}",
+        lines.join("\n")
+    ))
+}
+
 fn translate_anthropic_tool_result_content(
     content: &Value,
     is_error: bool,
     media_mode: ToolResultMediaMode,
+    max_chars: Option<u64>,
 ) -> (Value, Vec<Value>) {
     if let Some(parts) = content.as_array() {
         let mut translated_parts = Vec::new();
@@ -1371,6 +1516,18 @@ fn translate_anthropic_tool_result_content(
         }
 
         if has_media && media_mode == ToolResultMediaMode::Inline {
+            let mut combined_text = result_text.join("\n");
+            if is_error {
+                combined_text = format!("Tool error: {combined_text}");
+            }
+            let bounded_text = bound_tool_result_text(combined_text.clone(), max_chars);
+            if bounded_text != combined_text {
+                let mut bounded_parts = vec![json!({"type": "text", "text": bounded_text})];
+                bounded_parts.extend(translated_parts.into_iter().filter(|part| {
+                    part.get("type").and_then(Value::as_str) != Some("text")
+                }));
+                return (Value::Array(bounded_parts), Vec::new());
+            }
             if is_error {
                 if let Some(text_part) = translated_parts
                     .iter_mut()
@@ -1392,7 +1549,10 @@ fn translate_anthropic_tool_result_content(
             if is_error {
                 text = format!("Tool error: {text}");
             }
-            return (Value::String(text), media_parts);
+            return (
+                Value::String(bound_tool_result_text(text, max_chars)),
+                media_parts,
+            );
         }
     }
 
@@ -1400,7 +1560,37 @@ fn translate_anthropic_tool_result_content(
     if is_error {
         result_text = format!("Tool error: {result_text}");
     }
-    (Value::String(result_text), Vec::new())
+    (
+        Value::String(bound_tool_result_text(result_text, max_chars)),
+        Vec::new(),
+    )
+}
+
+fn bound_tool_result_text(text: String, max_chars: Option<u64>) -> String {
+    let Some(max_chars) = max_chars.and_then(|value| usize::try_from(value).ok()) else {
+        return text;
+    };
+    let original_chars = text.chars().count();
+    if original_chars <= max_chars {
+        return text;
+    }
+
+    let original_lines = text.lines().count();
+    let marker = format!(
+        "\n\n[Bridge truncated oversized tool result: original {original_chars} chars across {original_lines} lines. Showing the beginning and end only. The complete result remains in Claude Code's local transcript. Re-run the tool with offset/limit or targeted search to inspect omitted evidence; do not treat omitted text as reviewed.]\n\n"
+    );
+    let marker_chars = marker.chars().count();
+    if marker_chars >= max_chars {
+        return marker.chars().take(max_chars).collect();
+    }
+
+    let excerpt_chars = max_chars - marker_chars;
+    let head_chars = excerpt_chars / 2;
+    let tail_chars = excerpt_chars - head_chars;
+    let head: String = text.chars().take(head_chars).collect();
+    let mut tail: Vec<char> = text.chars().rev().take(tail_chars).collect();
+    tail.reverse();
+    format!("{head}{marker}{}", tail.into_iter().collect::<String>())
 }
 
 fn translate_anthropic_media(part: &Value) -> Option<Value> {
@@ -1464,6 +1654,21 @@ fn translate_anthropic_tool_with_capabilities(
     capabilities: &OpenAiCapabilities,
 ) -> Option<Value> {
     let name = tool.get("name")?.as_str()?;
+    // Claude Code server tools (web_search_*) are executed server-side by
+    // providers that implement them natively; no OpenAI Chat endpoint treats
+    // them as client-side function tools, so never downgrade one to an empty
+    // function schema.
+    if tool
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.starts_with("web_search_"))
+    {
+        warn!(
+            tool = name,
+            "Skipping Anthropic server tool in OpenAI Chat translation"
+        );
+        return None;
+    }
     let mut function = Map::new();
     function.insert("name".to_string(), json!(name));
     if let Some(description) = tool.get("description") {
@@ -1592,7 +1797,21 @@ fn translate_anthropic_response_with_capabilities(
     let finish_reason = upstream
         .pointer("/choices/0/finish_reason")
         .and_then(Value::as_str);
-    let allow_tool_calls = anthropic_stop_reason(finish_reason, true) == "tool_use";
+    let mut tool_calls = upstream_message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if tool_calls.is_empty() {
+        if let Some(function_call) = upstream_message
+            .get("function_call")
+            .filter(|function_call| !function_call.is_null())
+        {
+            tool_calls.push(json!({"type": "function", "function": function_call}));
+        }
+    }
+    let allow_tool_calls =
+        anthropic_stop_reason(finish_reason, !tool_calls.is_empty()) == "tool_use";
     let mut content = Vec::new();
     let mut assistant_signature = upstream_message
         .pointer("/extra_content/google/thought_signature")
@@ -1631,16 +1850,6 @@ fn translate_anthropic_response_with_capabilities(
     }
 
     if allow_tool_calls {
-        let mut tool_calls = upstream_message
-            .get("tool_calls")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        if tool_calls.is_empty() {
-            if let Some(function_call) = upstream_message.get("function_call") {
-                tool_calls.push(json!({"type": "function", "function": function_call}));
-            }
-        }
         for tool_call in &tool_calls {
             let call_id = tool_call
                 .get("id")

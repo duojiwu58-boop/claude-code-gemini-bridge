@@ -1,4 +1,8 @@
-fn gemini_count_token_parts(content: &Value, tool_names: &HashMap<String, String>) -> Vec<Value> {
+fn gemini_count_token_parts(
+    content: &Value,
+    tool_names: &HashMap<String, String>,
+    max_tool_result_chars: Option<u64>,
+) -> Vec<Value> {
     let Some(parts) = content.as_array() else {
         return content
             .as_str()
@@ -75,7 +79,10 @@ fn gemini_count_token_parts(content: &Value, tool_names: &HashMap<String, String
                     "functionResponse": {
                         "name": name,
                         "response": {
-                            "result": interaction_tool_result_value(part.get("content").unwrap_or(&Value::Null)),
+                            "result": interaction_tool_result_value(
+                                part.get("content").unwrap_or(&Value::Null),
+                                max_tool_result_chars
+                            ),
                             "is_error": part.get("is_error").and_then(Value::as_bool).unwrap_or(false)
                         }
                     }
@@ -107,6 +114,7 @@ fn gemini_count_tokens_request(
             let parts = gemini_count_token_parts(
                 message.get("content").unwrap_or(&Value::Null),
                 &tool_names,
+                profile.openai_capabilities.max_tool_result_chars,
             );
             (!parts.is_empty()).then(|| json!({"role": role, "parts": parts}))
         })
@@ -315,13 +323,15 @@ async fn anthropic_count_tokens(
         };
         return attach_bridge_diagnostics(response, &profile.file_name, &diagnostics);
     }
-    let Some(profile) =
+    let Some(mut profile) =
         active_profile.filter(|profile| profile.transport == ProviderTransport::GeminiInteractions)
     else {
         return anthropic_token_count_response(input_tokens, "estimated");
     };
     let diagnostics = gemini_interaction_request_diagnostics(&request);
+    let credential_result = apply_bridge_managed_gemini_credentials(&state, &mut profile);
     let native_result = async {
+        credential_result?;
         let api_key = profile
             .api_key
             .as_ref()

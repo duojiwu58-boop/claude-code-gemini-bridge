@@ -1,0 +1,11 @@
+{
+  "name": "DeepSeek V4 Pro",
+  "model": "deepseek-v4-pro[1m]",
+  "context_window": 1048576,
+  "protocol": "anthropic",
+  "base_url": "https://api.deepseek.com/anthropic",
+  "api_key": "<DEEPSEEK_API_KEY>",
+  "vision": {
+    "mode": "proxy"
+  }
+}

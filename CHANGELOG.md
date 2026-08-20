@@ -7,6 +7,19 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 
 ## English
 
+## [v0.6.0] - 2026-08-19
+
+### Gemini 3.7 Flash and Current Interactions API
+
+- Updated runtime, installer, provider, Claude settings, test scripts, documentation, and marketing defaults to the GA `gemini-3.7-flash` model. The native profile records its 1,048,576-token context window and uses the model's recommended `medium` default thinking level.
+- Changed the Windows installer's generated Gemini profile to the native `gemini-interactions` transport. Its Google key remains in the service-managed credential file instead of being duplicated in provider JSON, while the native Messages and Token Count paths inherit the bridge's global Gemini proxy.
+- Added dual-schema SSE compatibility for both the formal `event_type`/`thought_summary`/`arguments_delta` resource schema and the `type`/`thought`/`arguments` shapes in the Gemini 3.7 migration examples. Initial thought signatures, initial model-output content, and terminal `interaction.requires_action` tool streams are now preserved.
+- Normalized all Claude reasoning settings to Gemini 3.7's supported `low`/`medium`/`high` levels. Disabled, `none`, and `minimal` requests use the model's minimum `low` level; `xhigh` and `max` clamp to `high`.
+- Mapped current Interactions usage (`total_input_tokens`, `total_output_tokens`, `total_thought_tokens`, and `total_cached_tokens`) plus the migration aliases (`prompt_tokens` and `completion_tokens`) into Claude usage. Thought tokens are included in `output_tokens` and also exposed as `reasoning_tokens`.
+- Reject assistant-prefill requests locally with a clear Anthropic error because Gemini 3.7 no longer accepts prefilled model turns. Deprecated sampling parameters remain suppressed, and `candidate_count` is diagnosed and ignored.
+- Added a Model Center **Low / Medium / High** control for active Gemini 3.7 Flash Interactions profiles. The persisted override applies to the next request without restarting the service and intentionally takes precedence over request-level effort/budget and the profile default.
+- Expanded the Rust regression suite from 121 to 130 passing tests with Gemini 3.7 REST SSE, function-tool pause, usage-detail, reasoning-level, hot GUI override, persistence, prefill, bridge-managed credential, and native token-count coverage.
+
 ## [v0.5.1] - 2026-08-08
 
 ### Qwen3.8-Max Capability Maximization
@@ -260,6 +273,19 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 ---
 
 ## 中文
+
+## [v0.6.0] - 2026-08-19
+
+### Gemini 3.7 Flash 与最新 Interactions API
+
+- 将运行时、安装器、Provider、Claude settings、测试脚本、文档和推广内容的默认模型升级为 GA 的 `gemini-3.7-flash`。原生配置记录 1,048,576-token 上下文窗口，并采用模型推荐的 `medium` 默认 Thinking 档位。
+- Windows 安装器生成的 Gemini profile 已切换到原生 `gemini-interactions` transport。Google Key 继续只保存在服务托管的凭据文件中，不会重复写入 Provider JSON；原生 Messages 与 Token Count 路径会继承桥接器全局 Gemini 代理。
+- 同时兼容正式资源 schema 的 `event_type`/`thought_summary`/`arguments_delta`，以及 Gemini 3.7 迁移示例中的 `type`/`thought`/`arguments`。现在会保留 step 起始签名、起始模型文本，并把 `interaction.requires_action` 正确视为工具流终态。
+- 将 Claude 的所有推理设置规范化到 Gemini 3.7 支持的 `low`/`medium`/`high`：disabled、`none`、`minimal` 使用最低的 `low`，`xhigh`、`max` 收敛到 `high`。
+- 映射最新 Interactions Usage（`total_input_tokens`、`total_output_tokens`、`total_thought_tokens`、`total_cached_tokens`）及迁移示例别名（`prompt_tokens`、`completion_tokens`）。Thinking tokens 会计入 `output_tokens`，并单独暴露为 `reasoning_tokens`。
+- Gemini 3.7 不再接受 assistant prefill，因此桥接器会在本地返回清晰的 Anthropic 请求错误；废弃采样参数继续被抑制，`candidate_count` 会产生诊断并被忽略。
+- 模型中心新增 Gemini 3.7 Flash Interactions 专用的“低 / 中 / 高”Thinking 控件；选择会持久化并从下一次请求生效，无需重启服务，且明确优先于请求级 effort/budget 和 profile 默认值。
+- Rust 回归测试由 121 增加到 130 个且全部通过，新增覆盖 3.7 REST SSE、函数工具暂停、Usage 细分、推理档位、GUI 热切换与持久化、prefill、桥接器托管凭据及原生 Token Count。
 
 ## [v0.5.1] - 2026-08-08
 

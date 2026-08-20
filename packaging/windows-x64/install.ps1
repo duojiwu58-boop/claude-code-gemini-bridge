@@ -396,10 +396,15 @@ $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 if ($configureGemini) {
     $geminiTemplate = [ordered]@{
         name = 'Google Gemini'
-        model = 'gemini-3.6-flash'
-        base_url = "http://127.0.0.1:$Port"
-        protocol = 'gemini'
-        identity = 'Google Gemini (gemini-3.6-flash)'
+        model = 'gemini-3.7-flash'
+        context_window = 1048576
+        base_url = 'https://generativelanguage.googleapis.com/v1beta'
+        protocol = 'gemini-interactions'
+        bridge_managed_credentials = $true
+        identity = 'Google Gemini (gemini-3.7-flash)'
+        capabilities = [ordered]@{
+            max_tool_result_chars = 16000
+        }
     }
     if (Test-Path -LiteralPath $geminiProfile -PathType Leaf) {
         Copy-Item `

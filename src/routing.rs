@@ -186,6 +186,30 @@ async fn anthropic_messages(
             return attach_bridge_diagnostics(response, &provider_file, &diagnostics);
         }
         ProviderTransport::GeminiInteractions => {
+            let mut active_profile = active_profile;
+            match current_gemini_thinking_level(&state) {
+                Ok(level) => {
+                    active_profile
+                        .openai_capabilities
+                        .gemini_thinking_level_override = level;
+                }
+                Err(message) => {
+                    return anthropic_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "api_error",
+                        &message,
+                    );
+                }
+            }
+            if let Err(message) =
+                apply_bridge_managed_gemini_credentials(&state, &mut active_profile)
+            {
+                return anthropic_error(
+                    StatusCode::UNAUTHORIZED,
+                    "authentication_error",
+                    &message,
+                );
+            }
             let diagnostics = gemini_interaction_request_diagnostics(&request);
             let provider_file = active_profile.file_name.clone();
             let response = forward_gemini_interactions_profile(
@@ -339,6 +363,30 @@ async fn forward_anthropic_profile(
                 reasoning_replay_estimated_tokens = replay_tokens,
                 "DeepSeek Anthropic reasoning policy"
             );
+            // DeepSeek user_id isolates KVCache and per-user concurrency
+            // quotas. Forward a validated client value or the profile
+            // default, and drop values that violate the documented
+            // [a-zA-Z0-9_-]{1,512} shape.
+            if let Some(request_object) = request.as_object_mut() {
+                let metadata = request_object
+                    .entry("metadata".to_string())
+                    .or_insert_with(|| json!({}));
+                if let Some(metadata) = metadata.as_object_mut() {
+                    let user_id = metadata
+                        .get("user_id")
+                        .and_then(Value::as_str)
+                        .and_then(validated_user_id)
+                        .or_else(|| profile.openai_capabilities.user_id.clone());
+                    match user_id {
+                        Some(user_id) => {
+                            metadata.insert("user_id".to_string(), json!(user_id));
+                        }
+                        None => {
+                            metadata.remove("user_id");
+                        }
+                    }
+                }
+            }
         }
         OpenAiChatDialect::Qwen => {
             let policy = match apply_qwen_anthropic_reasoning_policy(
@@ -377,12 +425,13 @@ async fn forward_anthropic_profile(
     };
     request_object.insert("model".to_string(), Value::String(profile.model.clone()));
     let upstream_url = profile.upstream_url.clone();
-    let upstream_request = profile.client.post(&upstream_url).json(&request);
-    let upstream_request =
-        apply_anthropic_forward_headers(upstream_request, &profile, client_headers);
+    let upstream_build = || {
+        let upstream_request = profile.client.post(&upstream_url).json(&request);
+        apply_anthropic_forward_headers(upstream_request, &profile, client_headers)
+    };
 
     let upstream_started = Instant::now();
-    let upstream = match upstream_request.send().await {
+    let upstream = match send_with_rate_limit_retry(upstream_build, &profile.file_name).await {
         Ok(response) => response,
         Err(err) => {
             error!(

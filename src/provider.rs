@@ -303,6 +303,74 @@ fn capability_string_array(
     Ok(default)
 }
 
+fn is_reasoning_effort(value: &str) -> bool {
+    matches!(
+        value,
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+    )
+}
+
+fn capability_u64(
+    object: &Map<String, Value>,
+    names: &[&str],
+    default: Option<u64>,
+    file_name: &str,
+) -> Result<Option<u64>, String> {
+    for name in names {
+        if let Some(value) = object.get(*name) {
+            return value
+                .as_u64()
+                .filter(|value| *value > 0)
+                .map(Some)
+                .ok_or_else(|| {
+                    format!(
+                        "Provider profile '{file_name}' capability '{name}' must be a positive integer"
+                    )
+                });
+        }
+    }
+    Ok(default)
+}
+
+fn capability_reasoning_effort_map(
+    object: &Map<String, Value>,
+    default: HashMap<String, String>,
+    file_name: &str,
+) -> Result<HashMap<String, String>, String> {
+    let Some(value) = object
+        .get("reasoning_effort_map")
+        .or_else(|| object.get("reasoningEffortMap"))
+    else {
+        return Ok(default);
+    };
+    let entries = value.as_object().ok_or_else(|| {
+        format!(
+            "Provider profile '{file_name}' capability 'reasoning_effort_map' must be a JSON object"
+        )
+    })?;
+    let mut mapped = HashMap::with_capacity(entries.len());
+    for (source, target) in entries {
+        let source = source.trim().to_ascii_lowercase();
+        let target = target
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase)
+            .ok_or_else(|| {
+                format!(
+                    "Provider profile '{file_name}' capability 'reasoning_effort_map' values must be non-empty strings"
+                )
+            })?;
+        if !is_reasoning_effort(&source) || !is_reasoning_effort(&target) {
+            return Err(format!(
+                "Provider profile '{file_name}' capability 'reasoning_effort_map' keys and values must be none, minimal, low, medium, high, xhigh, or max"
+            ));
+        }
+        mapped.insert(source, target);
+    }
+    Ok(mapped)
+}
+
 #[cfg(test)]
 fn parse_openai_capabilities(
     profile: &Map<String, Value>,
@@ -359,12 +427,10 @@ fn parse_openai_capabilities_with_defaults(
         file_name,
     )?
     .or_else(|| defaults.default_reasoning_effort.clone());
-    if default_reasoning_effort.as_deref().is_some_and(|effort| {
-        !matches!(
-            effort,
-            "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
-        )
-    }) {
+    if default_reasoning_effort
+        .as_deref()
+        .is_some_and(|effort| !is_reasoning_effort(effort))
+    {
         return Err(format!(
             "Provider profile '{file_name}' capability 'default_reasoning_effort' must be none, minimal, low, medium, high, xhigh, or max"
         ));
@@ -391,6 +457,35 @@ fn parse_openai_capabilities_with_defaults(
     if chat_dialect == OpenAiChatDialect::Kimi && default_reasoning_effort.is_none() {
         default_reasoning_effort = Some("max".to_string());
     }
+    let reasoning_effort_map = capability_reasoning_effort_map(
+        object,
+        defaults.reasoning_effort_map.clone(),
+        file_name,
+    )?;
+    let legacy_reasoning_replay = capability_bool(
+        object,
+        &["reasoning_replay", "reasoningReplay"],
+        defaults.reasoning_replay_scope.enabled(),
+        file_name,
+    )?;
+    let reasoning_replay_scope = match capability_string(
+        object,
+        &["reasoning_replay_scope", "reasoningReplayScope"],
+        file_name,
+    )?
+    .as_deref()
+    {
+        Some("none") => ReasoningReplayScope::None,
+        Some("all") => ReasoningReplayScope::All,
+        Some("active_task") => ReasoningReplayScope::ActiveTask,
+        Some(other) => {
+            return Err(format!(
+                "Provider profile '{file_name}' capability 'reasoning_replay_scope' has unsupported value '{other}' (expected none, all, or active_task)"
+            ))
+        }
+        None if legacy_reasoning_replay => ReasoningReplayScope::All,
+        None => ReasoningReplayScope::None,
+    };
 
     let default_tool_schema = if chat_dialect == OpenAiChatDialect::Kimi {
         "preserve"
@@ -500,6 +595,26 @@ fn parse_openai_capabilities_with_defaults(
             "Provider profile '{file_name}' configures kimi_formula_tools but is not a Kimi profile"
         ));
     }
+    let max_tool_result_chars = capability_u64(
+        object,
+        &["max_tool_result_chars", "maxToolResultChars"],
+        defaults.max_tool_result_chars,
+        file_name,
+    )?;
+    if max_tool_result_chars.is_some_and(|value| value < 1_024) {
+        return Err(format!(
+            "Provider profile '{file_name}' capability 'max_tool_result_chars' must be at least 1024"
+        ));
+    }
+    let user_id = capability_string(object, &["user_id", "userId"], file_name)?;
+    if user_id
+        .as_deref()
+        .is_some_and(|value| validated_user_id(value).is_none())
+    {
+        return Err(format!(
+            "Provider profile '{file_name}' capability 'user_id' must match [a-zA-Z0-9_-]{{1,512}}"
+        ));
+    }
 
     Ok(OpenAiCapabilities {
         chat_dialect,
@@ -522,6 +637,9 @@ fn parse_openai_capabilities_with_defaults(
             file_name,
         )?,
         default_reasoning_effort,
+        reasoning_effort_map,
+        reasoning_replay_scope,
+        gemini_thinking_level_override: None,
         reasoning_fields,
         thinking_tags: capability_bool(
             object,
@@ -548,6 +666,13 @@ fn parse_openai_capabilities_with_defaults(
         tool_result_media,
         tool_schema,
         max_tokens_field,
+        max_output_tokens: capability_u64(
+            object,
+            &["max_output_tokens", "maxOutputTokens"],
+            defaults.max_output_tokens,
+            file_name,
+        )?,
+        max_tool_result_chars,
         responses_stateful: capability_bool(
             object,
             &["responses_stateful", "responsesStateful"],
@@ -570,6 +695,7 @@ fn parse_openai_capabilities_with_defaults(
         kimi_formula_tools,
         gemini_builtin_tools,
         gemini_file_search_store_names,
+        user_id,
     })
 }
 
@@ -580,6 +706,9 @@ fn openai_capabilities_json(capabilities: &OpenAiCapabilities) -> Value {
         "parallel_tool_calls": capabilities.parallel_tool_calls,
         "reasoning_effort": capabilities.reasoning_effort,
         "default_reasoning_effort": capabilities.default_reasoning_effort,
+        "reasoning_effort_map": capabilities.reasoning_effort_map,
+        "reasoning_replay": capabilities.reasoning_replay_scope.enabled(),
+        "reasoning_replay_scope": capabilities.reasoning_replay_scope.as_str(),
         "reasoning_fields": capabilities.reasoning_fields,
         "thinking_tags": capabilities.thinking_tags,
         "include_thoughts": capabilities.include_thoughts,
@@ -587,6 +716,8 @@ fn openai_capabilities_json(capabilities: &OpenAiCapabilities) -> Value {
         "tool_result_media": capabilities.tool_result_media.as_str(),
         "tool_schema": capabilities.tool_schema.as_str(),
         "max_tokens_field": capabilities.max_tokens_field.as_str(),
+        "max_output_tokens": capabilities.max_output_tokens,
+        "max_tool_result_chars": capabilities.max_tool_result_chars,
         "responses_stateful": capabilities.responses_stateful,
         "responses_session_cache": capabilities.responses_session_cache,
         "responses_builtin_tools": capabilities.responses_builtin_tools,
@@ -698,7 +829,24 @@ fn load_native_provider_profiles(
             (None, None) => None,
         }
         .filter(|value| !value.is_empty());
-        if transport != ProviderTransport::LocalGemini && api_key.is_none() {
+        let bridge_managed_credentials = object
+            .get("bridge_managed_credentials")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if bridge_managed_credentials
+            && (transport != ProviderTransport::GeminiInteractions
+                || !is_official_google_gemini_url(&base_url)
+                || !is_official_google_gemini_url(&upstream_url))
+        {
+            return Err(format!(
+                "Provider profile '{file_name}' may use bridge-managed credentials only with the official Google Gemini HTTPS endpoint"
+            ));
+        }
+        if transport != ProviderTransport::LocalGemini
+            && api_key.is_none()
+            && !(transport == ProviderTransport::GeminiInteractions
+                && bridge_managed_credentials)
+        {
             return Err(format!(
                 "Provider profile '{file_name}' has no API credential"
             ));
@@ -863,6 +1011,15 @@ fn load_legacy_provider_profile(
 
 fn normalize_base_url(value: &str) -> String {
     value.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
+fn is_official_google_gemini_url(value: &str) -> bool {
+    url::Url::parse(value).ok().is_some_and(|url| {
+        url.scheme() == "https"
+            && url
+                .host_str()
+                .is_some_and(|host| host.eq_ignore_ascii_case("generativelanguage.googleapis.com"))
+    })
 }
 
 fn resolve_provider_transport(
@@ -1119,6 +1276,23 @@ fn load_persisted_gemini_proxy(state_path: &Path) -> Option<Option<String>> {
     }
 }
 
+fn load_persisted_gemini_thinking_level(state_path: &Path) -> Option<String> {
+    read_state_object(state_path)
+        .get("gemini_thinking_level")
+        .and_then(Value::as_str)
+        .filter(|level| matches!(*level, "low" | "medium" | "high"))
+        .map(str::to_owned)
+}
+
+fn persist_gemini_thinking_level(state_path: &Path, level: &str) -> Result<(), String> {
+    let mut state_json = read_state_object(state_path);
+    state_json.insert(
+        "gemini_thinking_level".to_string(),
+        Value::String(level.to_string()),
+    );
+    write_state_atomically(state_path, &Value::Object(state_json).to_string())
+}
+
 fn persist_bridge_state(
     state_path: &Path,
     active_profile: &str,
@@ -1225,12 +1399,49 @@ async fn persist_bridge_state_async(
     .map_err(|err| format!("Cannot join bridge-state writer: {err}"))?
 }
 
+async fn persist_gemini_thinking_level_async(
+    state_path: PathBuf,
+    level: String,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || persist_gemini_thinking_level(&state_path, &level))
+        .await
+        .map_err(|err| format!("Cannot join Gemini thinking-level writer: {err}"))?
+}
+
+fn current_gemini_thinking_level(state: &AppState) -> Result<Option<String>, String> {
+    state
+        .gemini_thinking_level
+        .read()
+        .map(|level| level.clone())
+        .map_err(|_| "Cannot read Gemini thinking-level state".to_string())
+}
+
 fn current_gemini_transport(state: &AppState) -> Result<GeminiTransport, String> {
     state
         .gemini_transport
         .read()
         .map(|transport| transport.clone())
         .map_err(|_| "Cannot read Gemini proxy state".to_string())
+}
+
+fn apply_bridge_managed_gemini_credentials(
+    state: &AppState,
+    profile: &mut ProviderProfile,
+) -> Result<(), String> {
+    if profile.transport != ProviderTransport::GeminiInteractions || profile.api_key.is_some() {
+        return Ok(());
+    }
+    profile.api_key = state
+        .fallback_api_key
+        .clone()
+        .filter(|value| !value.trim().is_empty());
+    if profile.api_key.is_none() {
+        return Err("Bridge-managed Gemini credential is unavailable".to_string());
+    }
+    if profile.proxy_url.is_none() {
+        profile.client = current_gemini_transport(state)?.client;
+    }
+    Ok(())
 }
 
 fn select_initial_profile(profiles: &[ProviderProfile], state_path: &Path) -> String {
