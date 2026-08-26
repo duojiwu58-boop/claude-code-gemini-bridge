@@ -1,4 +1,5 @@
 fn provider_profile_json(profile: &ProviderProfile, active_file: &str) -> Value {
+    let public_proxy_url = profile.proxy_url.as_deref().map(redact_url_credentials);
     json!({
         "file": profile.file_name,
         "name": profile.display_name,
@@ -8,7 +9,7 @@ fn provider_profile_json(profile: &ProviderProfile, active_file: &str) -> Value 
         "upstream_identity": profile.upstream_identity,
         "identity_override": profile.identity_override,
         "base_url": profile.base_url,
-        "proxy": profile.proxy_url,
+        "proxy": public_proxy_url,
         "local_gemini": profile.local_gemini,
         "transport": profile.transport.as_str(),
         "capabilities": openai_capabilities_json(&profile.openai_capabilities),
@@ -104,12 +105,14 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Response {
                 .into_response();
         }
     };
+    let proxy_enabled = transport.proxy_url.is_some();
+    let public_proxy_url = transport.proxy_url.as_deref().map(redact_url_credentials);
     Json(json!({
         "status": "ok",
         "active_profile": active_profile,
         "profile_count": profile_count,
-        "gemini_proxy": transport.proxy_url,
-        "gemini_proxy_mode": if transport.proxy_url.is_some() { "proxy" } else { "direct" },
+        "gemini_proxy": public_proxy_url,
+        "gemini_proxy_mode": if proxy_enabled { "proxy" } else { "direct" },
         "listen_url": state.local_bridge_base_url,
         "providers_dir": state.providers_dir.to_string_lossy(),
         "profile_source": profile_source,
@@ -371,11 +374,8 @@ async fn admin_set_gemini_thinking_level(
         )
             .into_response();
     }
-    if let Err(message) = persist_gemini_thinking_level_async(
-        state.bridge_state_path.clone(),
-        level.clone(),
-    )
-    .await
+    if let Err(message) =
+        persist_gemini_thinking_level_async(state.bridge_state_path.clone(), level.clone()).await
     {
         error!("{message}");
         return (
@@ -453,13 +453,14 @@ async fn admin_set_gemini_proxy(
         proxy_url: proxy_url.clone(),
     };
     drop(transport);
+    let public_proxy_url = proxy_url.as_deref().map(redact_url_credentials);
     info!(
         "Gemini network route changed to {}",
-        proxy_url.as_deref().unwrap_or("direct connection")
+        public_proxy_url.as_deref().unwrap_or("direct connection")
     );
     Json(json!({
         "status": "ok",
-        "gemini_proxy": proxy_url,
+        "gemini_proxy": public_proxy_url,
         "gemini_proxy_mode": if proxy_url.is_some() { "proxy" } else { "direct" }
     }))
     .into_response()
@@ -523,10 +524,11 @@ async fn admin_test_gemini_proxy(
         )
             .into_response();
     }
+    let public_proxy_url = proxy_url.as_deref().map(redact_url_credentials);
     Json(json!({
         "status": "ok",
         "model": body.get("id").and_then(Value::as_str).unwrap_or(&state.model),
-        "gemini_proxy": proxy_url,
+        "gemini_proxy": public_proxy_url,
         "gemini_proxy_mode": if proxy_url.is_some() { "proxy" } else { "direct" }
     }))
     .into_response()

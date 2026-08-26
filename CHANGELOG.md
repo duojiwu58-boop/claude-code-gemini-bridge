@@ -7,6 +7,16 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 
 ## English
 
+## [Unreleased]
+
+### Local Security and Reliability Remediation
+
+- Enforced loopback-only binding and authenticated Messages, Responses, token-count, MCP, and admin routes with an installer-generated 256-bit local token. Claude settings, MCP registration, Model Center, and shutdown scripts now receive the token automatically; upgrades reuse a valid installed token, and local authentication is no longer reused as an upstream provider credential.
+- Removed the ten-minute whole-response deadline from streaming requests while retaining connection, idle, and non-streaming deadlines. Added cumulative 8 MiB streamed tool-argument bounds and preserved inline Gemini and object-shaped Responses arguments instead of silently replacing them with `{}`.
+- Made Vision Proxy fail closed on untranslatable media, bounded historical media work, and parallelized accepted jobs with ordered injection. Continuation recovery is now error-specific, cache eviction refreshes recency, and unknown Gemini stream events are observable without treating incomplete streams as successful.
+- Redacted proxy userinfo from public management output and logs, allowlisted Responses built-in/server-tool types, and accepted digit-only string forms for primary token-limit fields.
+- Made Windows JSON settings writes atomic, stopped unhealthy newly installed services, recorded a protected pre-install Claude environment snapshot, and restored unchanged bridge-managed values during uninstall.
+
 ## [v0.7.0] - 2026-08-26
 
 ### Gemini 3.7 Flash Six-Capability Completion
@@ -293,6 +303,16 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 ---
 
 ## 中文
+
+## [未发布]
+
+### 本地安全与可靠性修复
+
+- 强制只允许 loopback 监听，并用安装器生成的 256-bit 随机本地令牌保护 Messages、Responses、Token Count、MCP 与全部管理路由。Claude settings、MCP 注册、模型中心和停止脚本会自动取得令牌；升级会复用已有有效令牌，本地鉴权令牌也不再被误作上游 Provider 凭据。
+- 流式请求不再受 10 分钟整流总时限截断，同时保留连接、空闲和非流式超时。流式工具参数新增累计 8 MiB 上限；Gemini 内联参数与 Responses 对象参数不再被静默替换为 `{}`。
+- Vision Proxy 对无法转换的媒体改为明确失败，限制历史媒体任务数量，并在有界并发分析后按消息顺序注入。续接恢复改为错误特异判断，缓存淘汰会刷新最近使用顺序，未知 Gemini 流事件可观测但不会掩盖不完整流。
+- 管理输出与日志会脱敏代理 URL 的用户信息，Responses 内建/服务端工具类型改为 allowlist，并兼容主要 token 限制字段的纯数字字符串形式。
+- Windows JSON 配置改为原子写入；安装后健康检查失败会停止异常服务；安装器保存受保护的 Claude 环境变量安装前快照，卸载时只恢复仍保持桥接器安装值的项目。
 
 ## [v0.7.0] - 2026-08-26
 

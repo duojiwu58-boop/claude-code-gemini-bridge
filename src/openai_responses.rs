@@ -271,7 +271,7 @@ fn translate_anthropic_to_responses(
             body.insert("instructions".to_string(), json!(instructions));
         }
     }
-    if let Some(max_tokens) = request.get("max_tokens").and_then(Value::as_u64) {
+    if let Some(max_tokens) = request.get("max_tokens").and_then(value_as_u64) {
         body.insert("max_output_tokens".to_string(), json!(max_tokens));
     }
     if let Some(stop) = request.get("stop_sequences").and_then(Value::as_array) {
@@ -327,7 +327,10 @@ fn translate_anthropic_to_responses(
                 let effort = request
                     .pointer("/output_config/effort")
                     .and_then(Value::as_str)
-                    .or(profile.openai_capabilities.default_reasoning_effort.as_deref());
+                    .or(profile
+                        .openai_capabilities
+                        .default_reasoning_effort
+                        .as_deref());
                 if let Some(effort) = effort {
                     body.insert("reasoning".to_string(), json!({"effort": effort}));
                 }
@@ -444,7 +447,16 @@ fn log_qwen_usage(provider: &str, transport: &str, usage: &Value) {
 }
 
 fn is_responses_server_tool_item(item_type: &str) -> bool {
-    item_type.ends_with("_call") && !matches!(item_type, "function_call" | "custom_tool_call")
+    matches!(
+        item_type,
+        "web_search_call"
+            | "file_search_call"
+            | "computer_call"
+            | "code_interpreter_call"
+            | "image_generation_call"
+            | "mcp_call"
+            | "mcp_list_tools"
+    )
 }
 
 fn responses_server_tool_metadata(items: &[Value]) -> Option<Value> {
@@ -569,11 +581,17 @@ fn translate_openai_responses_response(
                     .and_then(Value::as_str)
                     .unwrap_or("unknown_function")
                     .to_string();
-                let arguments = item
-                    .get("arguments")
-                    .and_then(Value::as_str)
-                    .unwrap_or("{}");
-                let parsed = parse_tool_arguments(arguments)?;
+                let parsed = match item.get("arguments") {
+                    Some(Value::String(arguments)) => parse_tool_arguments(arguments)?,
+                    Some(Value::Object(arguments)) => Value::Object(arguments.clone()),
+                    Some(Value::Null) | None => json!({}),
+                    Some(_) => {
+                        return Err(
+                            "Responses function_call arguments must be a JSON string or object"
+                                .to_string(),
+                        )
+                    }
+                };
                 calls.push((id.clone(), name.clone()));
                 content.push(json!({"type": "tool_use", "id": id, "name": name, "input": parsed}));
             }
@@ -694,7 +712,7 @@ async fn forward_openai_responses_profile(
         if profile.openai_capabilities.responses_session_cache {
             upstream_request = upstream_request.header("x-dashscope-session-cache", "enable");
         }
-        upstream_request
+        apply_upstream_total_timeout(upstream_request, stream_requested)
     };
     let upstream = match send_with_rate_limit_retry(upstream_build, &profile.file_name).await {
         Ok(response) => response,
@@ -1099,7 +1117,7 @@ impl OpenAiResponsesStreamTranslator {
         if custom != *is_custom || delta.is_empty() {
             return Ok(Vec::new());
         }
-        arguments.push_str(delta);
+        append_streamed_tool_arguments(arguments, delta)?;
         // A custom tool carries raw text rather than JSON. Buffer it until the
         // item is complete so the Anthropic input_json_delta is one valid JSON
         // object instead of a concatenation of independently escaped chunks.
@@ -1324,8 +1342,8 @@ where
                 if ended {
                     return None;
                 }
-                match byte_stream.next().await {
-                    Some(Ok(bytes)) => match decoder.push_bytes(bytes.as_ref()) {
+                match tokio::time::timeout(UPSTREAM_STREAM_IDLE_TIMEOUT, byte_stream.next()).await {
+                    Ok(Some(Ok(bytes))) => match decoder.push_bytes(bytes.as_ref()) {
                         Ok(payloads) => {
                             for payload in payloads {
                                 if payload.trim() == "[DONE]" {
@@ -1352,13 +1370,13 @@ where
                             ended = true;
                         }
                     },
-                    Some(Err(err)) => {
+                    Ok(Some(Err(err))) => {
                         pending.push_back(anthropic_stream_error_event(&format!(
                             "Responses stream failed: {err}"
                         )));
                         ended = true;
                     }
-                    None => {
+                    Ok(None) => {
                         let mut failed = false;
                         match decoder.finish() {
                             Ok(payloads) => {
@@ -1390,6 +1408,12 @@ where
                                 }
                             }
                         }
+                        ended = true;
+                    }
+                    Err(_) => {
+                        pending.push_back(anthropic_stream_error_event(
+                            "Responses stream was idle for too long",
+                        ));
                         ended = true;
                     }
                 }

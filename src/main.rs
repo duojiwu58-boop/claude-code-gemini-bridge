@@ -21,11 +21,12 @@ use std::{
 
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Request, State},
     http::{
         header::{AUTHORIZATION, ORIGIN},
         HeaderMap, HeaderValue, StatusCode,
     },
+    middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
@@ -56,6 +57,8 @@ const BRIDGE_WARNING_HEADER: &str = "x-claude-bridge-warning";
 const GEMINI_COUNT_TOKENS_TIMEOUT: Duration = Duration::from_secs(20);
 const KIMI_COUNT_TOKENS_TIMEOUT: Duration = Duration::from_secs(20);
 const VISION_CACHE_CAPACITY: usize = 128;
+const MAX_VISION_JOBS: usize = 16;
+const MAX_CONCURRENT_VISION_JOBS: usize = 4;
 const VISION_PROXY_TIMEOUT: Duration = Duration::from_secs(90);
 const VISION_MAX_OUTPUT_TOKENS: u64 = 4096;
 const MAX_VISION_CONTEXT_CHARS: usize = 12_000;
@@ -65,8 +68,10 @@ const MAX_IMAGE_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_GENERATED_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_IMAGE_PROMPT_CHARS: usize = 20_000;
 const MAX_UPSTREAM_SSE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+const MAX_STREAMED_TOOL_ARGUMENT_BYTES: usize = 8 * 1024 * 1024;
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const UPSTREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const UPSTREAM_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 const BRIDGE_IDENTITY_MARKER: &str = "<bridge_runtime_identity>";
 const MAX_UPSTREAM_IDENTITY_CHARS: usize = 200;

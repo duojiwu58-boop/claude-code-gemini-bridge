@@ -6,12 +6,12 @@ The bridge is a single binary crate, but its implementation is split by responsi
 | --- | --- |
 | `main.rs` | Crate imports, shared constants, source-slice assembly, and the test-module entry |
 | `core.rs` | Shared provider, capability, routing-state, and application-state types |
-| `runtime.rs` | Console/service entry points, Axum router construction, and shutdown handling |
+| `runtime.rs` | Console/service entry points, loopback/authentication boundary, Axum router construction, and shutdown handling |
 | `provider.rs` | Provider discovery, profile parsing, endpoint inference, clients, and persisted state |
-| `mcp.rs` | MCP protocol handling, Kimi Formula tools, and image generation |
+| `mcp.rs` | Authenticated MCP protocol handling, Kimi Formula tools, and image generation |
 | `vision.rs` | Generic Vision Proxy collection, request construction, caching, and injection |
-| `admin.rs` | Health, model listing, profile switching/reload, proxy administration, and shutdown APIs |
-| `routing.rs` | Public Anthropic/Responses handlers and native Anthropic forwarding |
+| `admin.rs` | Health, model listing, authenticated profile switching/reload, redacted proxy administration, and shutdown APIs |
+| `routing.rs` | Authenticated Anthropic/Responses handlers, route selection, and native Anthropic forwarding |
 | `gemini_interactions.rs` | Gemini Interactions request/response translation and continuation state |
 | `openai_chat_forward.rs` | OpenAI Chat upstream forwarding and response handling |
 | `openai_responses.rs` | OpenAI Responses request/response translation and streaming |

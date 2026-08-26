@@ -49,6 +49,7 @@ type
   TMainForm = class(TForm)
   private
     FBridgeUrl: string;
+    FLocalAuthToken: string;
     FProfileFiles: TStringList;
     FActiveFile: string;
     FBridgeRoot: string;
@@ -119,6 +120,7 @@ type
     function JsonBool(AObject: TJSONObject; const AName: string): Boolean;
     function FindBridgeRoot: string;
     function ResolveBridgeUrl: string;
+    function ReadLocalAuthToken: string;
     function ReadStateListen(const AStatePath: string): string;
     function ReadServiceStateFilePath: string;
     function RunPowerShellScript(const AScriptPath: string): Cardinal;
@@ -175,6 +177,7 @@ begin
     FProfileFiles := TStringList.Create;
     FBridgeRoot := FindBridgeRoot;
     FBridgeUrl := ResolveBridgeUrl;
+    FLocalAuthToken := ReadLocalAuthToken;
 
     LStage := '创建界面控件';
     BuildUi;
@@ -600,10 +603,14 @@ end;
 
 function TMainForm.GetJsonWith(AClient: THTTPClient; const APath: string): TJSONObject;
 var
+  LHeaders: TNetHeaders;
   LResponse: IHTTPResponse;
   LValue: TJSONValue;
 begin
-  LResponse := AClient.Get(FBridgeUrl + APath);
+  SetLength(LHeaders, 1);
+  LHeaders[0].Name := 'Authorization';
+  LHeaders[0].Value := 'Bearer ' + FLocalAuthToken;
+  LResponse := AClient.Get(FBridgeUrl + APath, nil, LHeaders);
   if LResponse.StatusCode <> 200 then
     raise Exception.CreateFmt('HTTP %d: %s', [
       LResponse.StatusCode,
@@ -628,9 +635,11 @@ var
   LStream: TStringStream;
   LValue: TJSONValue;
 begin
-  SetLength(LHeaders, 1);
+  SetLength(LHeaders, 2);
   LHeaders[0].Name := 'Content-Type';
   LHeaders[0].Value := 'application/json';
+  LHeaders[1].Name := 'Authorization';
+  LHeaders[1].Value := 'Bearer ' + FLocalAuthToken;
   LStream := TStringStream.Create(AJson, TEncoding.UTF8);
   try
     LResponse := AClient.Post(
@@ -709,6 +718,25 @@ begin
   finally
     RegCloseKey(LKey);
   end;
+end;
+
+function TMainForm.ReadLocalAuthToken: string;
+var
+  LProgramData: string;
+  LTokenPath: string;
+begin
+  LProgramData := GetEnvironmentVariable('ProgramData');
+  if LProgramData = '' then
+    raise Exception.Create('无法定位 ProgramData，不能读取桥接器本地认证令牌');
+  LTokenPath := TPath.Combine(
+    TPath.Combine(LProgramData, 'ClaudeCodeBridge'),
+    'local-auth-token'
+  );
+  if not FileExists(LTokenPath) then
+    raise Exception.Create('找不到桥接器本地认证令牌，请重新运行安装程序');
+  Result := Trim(TFile.ReadAllText(LTokenPath, TEncoding.UTF8));
+  if Length(Result) < 32 then
+    raise Exception.Create('桥接器本地认证令牌无效，请重新运行安装程序');
 end;
 
 function TMainForm.ResolveBridgeUrl: string;

@@ -7,6 +7,17 @@ $ErrorActionPreference = 'Stop'
 $serviceName = 'ClaudeCodeBridge'
 $projectDir = Split-Path -Parent $PSScriptRoot
 $pidPath = Join-Path $projectDir 'target\bridge.pid'
+$localAuthToken = $env:GEMINI_BRIDGE_LOCAL_TOKEN
+if ([string]::IsNullOrWhiteSpace($localAuthToken)) {
+    $localTokenFile = Join-Path $env:ProgramData 'ClaudeCodeBridge\local-auth-token'
+    if (Test-Path -LiteralPath $localTokenFile -PathType Leaf) {
+        $localAuthToken = [System.IO.File]::ReadAllText($localTokenFile).Trim()
+    }
+}
+$shutdownHeaders = @{}
+if (-not [string]::IsNullOrWhiteSpace($localAuthToken)) {
+    $shutdownHeaders.Authorization = "Bearer $localAuthToken"
+}
 
 $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
 if ($null -ne $service) {
@@ -20,6 +31,7 @@ if ($null -ne $service) {
         $shutdownResponse = Invoke-RestMethod `
             -Uri "http://127.0.0.1:$Port/admin/shutdown" `
             -Method Post `
+            -Headers $shutdownHeaders `
             -TimeoutSec 5
         $shutdownRequested = $shutdownResponse.status -eq 'shutting_down'
     }
@@ -96,6 +108,7 @@ if ($null -ne $process) {
         $shutdownResponse = Invoke-RestMethod `
             -Uri "http://127.0.0.1:$Port/admin/shutdown" `
             -Method Post `
+            -Headers $shutdownHeaders `
             -TimeoutSec 5
         $shutdownRequested = $shutdownResponse.status -eq 'shutting_down'
     }

@@ -70,7 +70,9 @@ where
     F: FnOnce() -> Result<(), String>,
 {
     let fallback_api_key = resolve_fallback_api_key()?;
+    let local_auth_token = resolve_local_auth_token()?;
     let listen = env::var("GEMINI_BRIDGE_LISTEN").unwrap_or_else(|_| "127.0.0.1:18787".to_string());
+    let address = validate_loopback_listen(&listen)?;
     let upstream_url = env::var("GEMINI_BRIDGE_UPSTREAM").unwrap_or_else(|_| {
         "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions".to_string()
     });
@@ -140,6 +142,7 @@ where
         })),
         gemini_thinking_level: Arc::new(RwLock::new(gemini_thinking_level)),
         fallback_api_key,
+        local_auth_token,
         upstream_url,
         model,
         thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
@@ -161,9 +164,7 @@ where
         admin_state_lock: Arc::new(tokio::sync::Mutex::new(())),
     });
 
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/v1/models", get(models))
+    let protected_routes = Router::new()
         .route("/v1/responses", post(responses))
         .route("/v1/messages", post(anthropic_messages))
         .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
@@ -179,13 +180,19 @@ where
             post(admin_set_gemini_thinking_level),
         )
         .route("/admin/shutdown", post(admin_shutdown))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_local_auth,
+        ));
+
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/v1/models", get(models))
+        .merge(protected_routes)
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
 
-    let address: SocketAddr = listen
-        .parse()
-        .map_err(|err| format!("Invalid GEMINI_BRIDGE_LISTEN '{listen}': {err}"))?;
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .map_err(|err| format!("Cannot listen on {address}: {err}"))?;
@@ -206,6 +213,84 @@ where
         .with_graceful_shutdown(shutdown_signal(shutdown_rx, include_ctrl_c))
         .await
         .map_err(|err| format!("Server failed: {err}"))
+}
+
+fn validate_loopback_listen(listen: &str) -> Result<SocketAddr, String> {
+    let address: SocketAddr = listen
+        .parse()
+        .map_err(|err| format!("Invalid GEMINI_BRIDGE_LISTEN '{listen}': {err}"))?;
+    if !address.ip().is_loopback() {
+        return Err(format!(
+            "GEMINI_BRIDGE_LISTEN must use a loopback address; refusing non-local address '{address}'"
+        ));
+    }
+    Ok(address)
+}
+
+fn resolve_local_auth_token() -> Result<String, String> {
+    if let Some(token) = env::var("GEMINI_BRIDGE_LOCAL_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return validate_local_auth_token(token, "GEMINI_BRIDGE_LOCAL_TOKEN");
+    }
+
+    let token_path = env::var("GEMINI_BRIDGE_LOCAL_TOKEN_FILE").map_err(|_| {
+        "GEMINI_BRIDGE_LOCAL_TOKEN or GEMINI_BRIDGE_LOCAL_TOKEN_FILE is required".to_string()
+    })?;
+    let token = fs::read_to_string(&token_path)
+        .map_err(|err| format!("Cannot read local auth token file '{token_path}': {err}"))?;
+    validate_local_auth_token(token.trim().to_string(), &token_path)
+}
+
+fn validate_local_auth_token(token: String, source: &str) -> Result<String, String> {
+    if token.len() < 32 {
+        return Err(format!(
+            "Local auth token from '{source}' must contain at least 32 characters"
+        ));
+    }
+    Ok(token)
+}
+
+fn constant_time_token_eq(actual: &str, expected: &str) -> bool {
+    let actual = actual.as_bytes();
+    let expected = expected.as_bytes();
+    let mut different = actual.len() ^ expected.len();
+    let compared_len = actual.len().max(expected.len());
+    for index in 0..compared_len {
+        let actual_byte = actual.get(index).copied().unwrap_or_default();
+        let expected_byte = expected.get(index).copied().unwrap_or_default();
+        different |= usize::from(actual_byte ^ expected_byte);
+    }
+    different == 0
+}
+
+fn local_request_authorized(headers: &HeaderMap, expected_token: &str) -> bool {
+    bearer_token(headers)
+        .as_deref()
+        .is_some_and(|actual| constant_time_token_eq(actual, expected_token))
+}
+
+async fn require_local_auth(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if local_request_authorized(request.headers(), &state.local_auth_token) {
+        return next.run(request).await;
+    }
+
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "error": {
+                "type": "authentication_error",
+                "message": "Missing or invalid local bridge token"
+            }
+        })),
+    )
+        .into_response()
 }
 
 fn resolve_fallback_api_key() -> Result<Option<String>, String> {

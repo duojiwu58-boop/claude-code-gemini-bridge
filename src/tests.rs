@@ -1,5 +1,126 @@
 use super::*;
 
+#[test]
+fn local_auth_accepts_only_the_configured_token() {
+    let expected = "test-local-token-that-is-long-enough-1234567890";
+
+    let mut bearer_headers = HeaderMap::new();
+    bearer_headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_static("Bearer test-local-token-that-is-long-enough-1234567890"),
+    );
+    assert!(local_request_authorized(&bearer_headers, expected));
+
+    let mut api_key_headers = HeaderMap::new();
+    api_key_headers.insert(
+        "x-api-key",
+        HeaderValue::from_static("test-local-token-that-is-long-enough-1234567890"),
+    );
+    assert!(local_request_authorized(&api_key_headers, expected));
+
+    let mut wrong_headers = HeaderMap::new();
+    wrong_headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer wrong"));
+    assert!(!local_request_authorized(&wrong_headers, expected));
+    assert!(!local_request_authorized(&HeaderMap::new(), expected));
+}
+
+#[test]
+fn bridge_listen_address_must_be_loopback() {
+    assert!(validate_loopback_listen("127.0.0.1:18787").is_ok());
+    assert!(validate_loopback_listen("[::1]:18787").is_ok());
+    assert!(validate_loopback_listen("0.0.0.0:18787").is_err());
+    assert!(validate_loopback_listen("192.168.1.20:18787").is_err());
+}
+
+#[test]
+fn streaming_requests_have_no_total_deadline() {
+    assert_eq!(
+        upstream_total_timeout(false),
+        Some(UPSTREAM_REQUEST_TIMEOUT)
+    );
+    assert_eq!(upstream_total_timeout(true), None);
+}
+
+#[test]
+fn streamed_tool_arguments_are_bounded_cumulatively() {
+    let mut arguments = "1234".to_string();
+    assert!(append_bounded_text(&mut arguments, "56", 6, "tool arguments").is_ok());
+    assert!(append_bounded_text(&mut arguments, "7", 6, "tool arguments").is_err());
+    assert_eq!(arguments, "123456");
+}
+
+#[test]
+fn vision_proxy_rejects_untranslatable_media() {
+    let source = test_provider_profile(
+        Client::builder().build().unwrap(),
+        "https://example.invalid/v1/chat/completions".to_string(),
+    );
+    let job = VisionJob {
+        message_index: 0,
+        media: vec![json!({
+            "type": "document",
+            "source": {"type": "url", "url": "https://example.invalid/file.pdf"}
+        })],
+        context: String::new(),
+    };
+    assert!(openai_vision_request(&source, &job).is_err());
+}
+
+#[test]
+fn vision_proxy_bounds_history_jobs_explicitly() {
+    let jobs = (0..=MAX_VISION_JOBS)
+        .map(|message_index| VisionJob {
+            message_index,
+            media: vec![json!({"type": "image"})],
+            context: String::new(),
+        })
+        .collect::<Vec<_>>();
+    assert!(validate_vision_job_count(&jobs).is_err());
+}
+
+#[test]
+fn continuation_retry_is_error_specific() {
+    let request = json!({"previous_interaction_id": "interaction-old"});
+    assert!(is_interaction_continuation_unavailable(
+        400,
+        "previous_interaction_id is expired",
+        &request
+    ));
+    assert!(!is_interaction_continuation_unavailable(
+        400,
+        "generation_config is invalid",
+        &request
+    ));
+    assert!(!is_interaction_continuation_unavailable(
+        500,
+        "previous_interaction_id lookup failed",
+        &request
+    ));
+}
+
+#[test]
+fn url_credentials_are_redacted_from_public_values() {
+    let redacted = redact_url_credentials("http://alice:secret@127.0.0.1:7890");
+    assert!(!redacted.contains("alice"));
+    assert!(!redacted.contains("secret"));
+    assert!(redacted.contains("127.0.0.1:7890"));
+}
+
+#[test]
+fn numeric_strings_are_accepted_only_as_unsigned_integers() {
+    assert_eq!(value_as_u64(&json!(42)), Some(42));
+    assert_eq!(value_as_u64(&json!("42")), Some(42));
+    assert_eq!(value_as_u64(&json!("-1")), None);
+    assert_eq!(value_as_u64(&json!("4.2")), None);
+}
+
+#[test]
+fn responses_builtin_tool_names_are_allowlisted() {
+    assert!(is_supported_responses_builtin_tool("web_search"));
+    assert!(is_supported_responses_builtin_tool("file_search"));
+    assert!(!is_supported_responses_builtin_tool("arbitrary_call"));
+}
+
 async fn collect_translated_sse_from_mock(mock: Router) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -462,7 +583,7 @@ fn vision_proxy_removes_media_and_injects_untrusted_observation() {
     assert!(vision_job_is_cacheable(&jobs[0]));
     assert!(jobs[0].context.contains("What error is visible?"));
     assert_eq!(
-        openai_vision_request(&source, &jobs[0])["messages"][1]["content"]
+        openai_vision_request(&source, &jobs[0]).unwrap()["messages"][1]["content"]
             .as_array()
             .unwrap()
             .iter()
@@ -474,7 +595,7 @@ fn vision_proxy_removes_media_and_injects_untrusted_observation() {
     completion_tokens_source
         .openai_capabilities
         .max_tokens_field = MaxTokensField::MaxCompletionTokens;
-    let vision_request = openai_vision_request(&completion_tokens_source, &jobs[0]);
+    let vision_request = openai_vision_request(&completion_tokens_source, &jobs[0]).unwrap();
     assert!(vision_request.get("max_tokens").is_none());
     assert_eq!(
         vision_request["max_completion_tokens"],
@@ -609,6 +730,7 @@ async fn vision_proxy_calls_provider_once_and_reuses_base64_cache() {
         })),
         gemini_thinking_level: Arc::new(RwLock::new(None)),
         fallback_api_key: None,
+        local_auth_token: "test-local-token-that-is-long-enough-1234567890".to_string(),
         upstream_url: "https://example.invalid/gemini".to_string(),
         model: "fallback".to_string(),
         thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
@@ -695,6 +817,7 @@ async fn mcp_generate_image_calls_gemini_saves_file_and_returns_preview() {
         })),
         gemini_thinking_level: Arc::new(RwLock::new(None)),
         fallback_api_key: Some("image-secret".to_string()),
+        local_auth_token: "test-local-token-that-is-long-enough-1234567890".to_string(),
         upstream_url: "https://example.invalid/gemini".to_string(),
         model: "fallback".to_string(),
         thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
@@ -826,6 +949,7 @@ async fn configured_kimi_formula_is_exposed_and_executed_only_when_enabled() {
         })),
         gemini_thinking_level: Arc::new(RwLock::new(None)),
         fallback_api_key: Some("local-token".to_string()),
+        local_auth_token: "test-local-token-that-is-long-enough-1234567890".to_string(),
         upstream_url: "https://example.invalid".to_string(),
         model: "bridge-router".to_string(),
         thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
@@ -1295,6 +1419,7 @@ async fn admin_gemini_thinking_level_is_hot_persisted_and_profile_scoped() {
         })),
         gemini_thinking_level: Arc::new(RwLock::new(None)),
         fallback_api_key: Some("test-key".to_string()),
+        local_auth_token: "test-local-token-that-is-long-enough-1234567890".to_string(),
         upstream_url: "https://example.invalid".to_string(),
         model: "gemini-3.7-flash".to_string(),
         thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
@@ -4988,6 +5113,7 @@ async fn anthropic_count_tokens_uses_kimi_native_estimator() {
         })),
         gemini_thinking_level: Arc::new(RwLock::new(None)),
         fallback_api_key: Some("local-token".to_string()),
+        local_auth_token: "test-local-token-that-is-long-enough-1234567890".to_string(),
         upstream_url: "https://example.invalid".to_string(),
         model: "bridge-router".to_string(),
         thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
@@ -5079,6 +5205,7 @@ async fn anthropic_messages_uses_bridge_managed_gemini_credential() {
         })),
         gemini_thinking_level: Arc::new(RwLock::new(None)),
         fallback_api_key: Some("managed-google-key".to_string()),
+        local_auth_token: "test-local-token-that-is-long-enough-1234567890".to_string(),
         upstream_url: "https://example.invalid".to_string(),
         model: "gemini-3.7-flash".to_string(),
         thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
@@ -5152,6 +5279,7 @@ async fn anthropic_count_tokens_uses_google_native_endpoint() {
         })),
         gemini_thinking_level: Arc::new(RwLock::new(None)),
         fallback_api_key: Some("test-key".to_string()),
+        local_auth_token: "test-local-token-that-is-long-enough-1234567890".to_string(),
         upstream_url: "https://example.invalid".to_string(),
         model: "gemini-3.7-flash".to_string(),
         thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
@@ -6144,6 +6272,34 @@ fn translates_interactions_stream_and_remembers_tool_continuation() {
 }
 
 #[test]
+fn preserves_inline_gemini_stream_tool_arguments() {
+    let continuations = Arc::new(RwLock::new(InteractionContinuationCache::default()));
+    let request = json!({
+        "messages": [{"role": "user", "content": "Use lookup"}],
+        "stream": true
+    });
+    let mut translator = GeminiInteractionsStreamTranslator::new(
+        "gemini-3.7-flash".to_string(),
+        "gemini-interactions.json".to_string(),
+        request,
+        continuations,
+        10,
+        false,
+    );
+    translator.start_events().unwrap();
+    translator
+        .process_payload(
+            r#"{"type":"step.start","index":0,"step":{"type":"function_call","id":"call-inline","name":"lookup","arguments":{"key":"alpha"}}}"#,
+        )
+        .unwrap();
+    translator
+        .process_payload(r#"{"type":"step.stop","index":0}"#)
+        .unwrap();
+    assert_eq!(translator.assistant_content[0]["type"], "tool_use");
+    assert_eq!(translator.assistant_content[0]["input"]["key"], "alpha");
+}
+
+#[test]
 fn translates_gemini_37_rest_stream_schema_without_losing_content_or_usage() {
     let continuations = Arc::new(RwLock::new(InteractionContinuationCache::default()));
     let request = json!({
@@ -6661,6 +6817,26 @@ fn responses_fixture_maps_semantic_output_server_tools_and_detailed_usage() {
     assert_eq!(
         translated.message["provider_metadata"]["openai"]["responses_server_tools"][0]["type"],
         "web_search_call"
+    );
+}
+
+#[test]
+fn responses_function_call_accepts_object_arguments() {
+    let upstream = json!({
+        "id": "resp_object_args",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "call_id": "call_object_args",
+            "name": "read_file",
+            "arguments": {"path": "Cargo.toml"}
+        }],
+        "usage": {"input_tokens": 1, "output_tokens": 1}
+    });
+    let translated = translate_openai_responses_response(&upstream, "test-model", 1).unwrap();
+    assert_eq!(
+        translated.message["content"][0]["input"]["path"],
+        "Cargo.toml"
     );
 }
 

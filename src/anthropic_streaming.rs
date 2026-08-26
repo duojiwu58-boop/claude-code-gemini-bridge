@@ -478,7 +478,7 @@ impl AnthropicStreamTranslator {
                 self.stop_thinking_block(&mut events)?;
             }
             for tool_call in tool_calls {
-                self.accumulate_tool_call(tool_call);
+                self.accumulate_tool_call(tool_call)?;
             }
         }
         if let Some(function_call) = delta.get("function_call") {
@@ -486,7 +486,7 @@ impl AnthropicStreamTranslator {
             self.accumulate_tool_call(&json!({
                 "index": 0,
                 "function": function_call
-            }));
+            }))?;
         }
         Ok(events)
     }
@@ -675,7 +675,7 @@ impl AnthropicStreamTranslator {
         )
     }
 
-    fn accumulate_tool_call(&mut self, tool_call: &Value) {
+    fn accumulate_tool_call(&mut self, tool_call: &Value) -> Result<(), String> {
         let index = tool_call.get("index").and_then(Value::as_u64);
         let incoming_id = tool_call
             .get("id")
@@ -739,10 +739,12 @@ impl AnthropicStreamTranslator {
         }
         if let Some(arguments) = tool_call.pointer("/function/arguments") {
             match arguments {
-                Value::String(arguments) => entry.arguments.push_str(arguments),
+                Value::String(arguments) => {
+                    append_streamed_tool_arguments(&mut entry.arguments, arguments)?
+                }
                 Value::Null => {}
                 arguments if entry.arguments.is_empty() => {
-                    entry.arguments = arguments.to_string();
+                    append_streamed_tool_arguments(&mut entry.arguments, &arguments.to_string())?;
                 }
                 _ => {}
             }
@@ -753,6 +755,7 @@ impl AnthropicStreamTranslator {
         {
             entry.thought_signature = Some(signature.to_string());
         }
+        Ok(())
     }
 
     fn next_tool_key(&mut self) -> String {
@@ -915,8 +918,8 @@ where
                     return None;
                 }
 
-                match byte_stream.next().await {
-                    Some(Ok(bytes)) => match decoder.push_bytes(bytes.as_ref()) {
+                match tokio::time::timeout(UPSTREAM_STREAM_IDLE_TIMEOUT, byte_stream.next()).await {
+                    Ok(Some(Ok(bytes))) => match decoder.push_bytes(bytes.as_ref()) {
                         Ok(payloads) => {
                             for payload in payloads {
                                 if payload.trim() == "[DONE]" {
@@ -943,13 +946,13 @@ where
                             ended = true;
                         }
                     },
-                    Some(Err(err)) => {
+                    Ok(Some(Err(err))) => {
                         pending.push_back(anthropic_stream_error_event(&format!(
                             "OpenAI-compatible stream failed: {err}"
                         )));
                         ended = true;
                     }
-                    None => {
+                    Ok(None) => {
                         let mut saw_done = false;
                         let mut processing_failed = false;
                         match decoder.finish() {
@@ -993,6 +996,12 @@ where
                                 ));
                             }
                         }
+                        ended = true;
+                    }
+                    Err(_) => {
+                        pending.push_back(anthropic_stream_error_event(
+                            "OpenAI-compatible stream was idle for too long",
+                        ));
                         ended = true;
                     }
                 }

@@ -8,7 +8,7 @@ fn cap_openai_chat_output_tokens(
 ) -> Result<Option<(&'static str, u64, u64)>, String> {
     let Some(field) = ["max_tokens", "max_completion_tokens"]
         .into_iter()
-        .find(|field| request.get(*field).and_then(Value::as_u64).is_some())
+        .find(|field| request.get(*field).and_then(value_as_u64).is_some())
     else {
         return Ok(None);
     };
@@ -126,11 +126,12 @@ async fn forward_openai_profile(
     };
     let upstream_started = Instant::now();
     let upstream_build = || {
-        profile
+        let upstream_request = profile
             .client
             .post(&profile.upstream_url)
             .bearer_auth(credential)
-            .json(&chat_request)
+            .json(&chat_request);
+        apply_upstream_total_timeout(upstream_request, stream_requested)
     };
     let upstream = match send_with_rate_limit_retry(upstream_build, &profile.file_name).await {
         Ok(response) => response,

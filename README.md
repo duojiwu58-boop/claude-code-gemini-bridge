@@ -112,7 +112,9 @@ The installer listens on:
 http://127.0.0.1:18787
 ```
 
-The Windows service is named `ClaudeCodeBridge`. The installer backs up and updates Claude Code's `settings.json` so Claude Code always connects to this stable local endpoint. Restart any running Claude Code session after the first installation.
+The Windows service is named `ClaudeCodeBridge`. The installer backs up and updates Claude Code's `settings.json` so Claude Code always connects to this stable local endpoint. Restart any running Claude Code session after installation or upgrade so the process receives the current settings; a session started before the authentication upgrade can otherwise receive `401 Unauthorized`.
+
+The installer also generates a random 256-bit local bridge token, stores it in the access-controlled `C:\ProgramData\ClaudeCodeBridge\local-auth-token` file, and configures Claude Code, the Model Center, shutdown scripts, and the `gemini-image` MCP entry to send it automatically. A valid existing token is reused on upgrade. The runtime refuses every non-loopback listen address. `/health` and `/v1/models` remain public local diagnostics; Messages, Responses, token count, MCP, and every `/admin/*` route require the configured Bearer token. Source-only runs must set a token of at least 32 characters through `GEMINI_BRIDGE_LOCAL_TOKEN` or point `GEMINI_BRIDGE_LOCAL_TOKEN_FILE` at a protected file. This credential authenticates callers to the local bridge only and is never reused as a Gemini or provider API key.
 
 When a Gemini key is supplied, the installer creates a native `gemini-interactions` profile and keeps the real Google credential in the protected service credential file rather than duplicating it in provider JSON.
 
@@ -194,8 +196,18 @@ Server-side search, execution, Maps, configured File Search queries, Remote MCP,
 | Claude Code settings | `%USERPROFILE%\.claude\settings.json` |
 | Provider profiles | `%USERPROFILE%\.claude\bridge-providers\*.json` |
 | Health check | `GET /health` |
-| Provider list | `GET /admin/profiles` |
-| Reload providers | `POST /admin/reload-profiles` |
+| Provider list | Authenticated `GET /admin/profiles` |
+| Reload providers | Authenticated `POST /admin/reload-profiles` |
+
+Manual management calls can reuse the installer-managed token without printing it:
+
+```powershell
+$bridgeToken = [System.IO.File]::ReadAllText('C:\ProgramData\ClaudeCodeBridge\local-auth-token').Trim()
+$headers = @{ Authorization = "Bearer $bridgeToken" }
+Invoke-RestMethod -Uri 'http://127.0.0.1:18787/admin/status' -Headers $headers
+```
+
+Streaming requests retain the 15-second connection timeout but have no ten-minute whole-response deadline; a stream that produces no bytes for two minutes is terminated explicitly. Non-streaming requests keep the ten-minute deadline. Streamed tool arguments are cumulatively limited to 8 MiB. Vision Proxy fails the request if any media block cannot be represented, accepts at most 16 historical media messages, and analyzes up to four of them concurrently before restoring message order.
 
 Each native provider owns an independent HTTP client and does not automatically inherit the Windows system proxy or a legacy Gemini proxy setting. Configure a proxy in the relevant profile when needed:
 

@@ -12,7 +12,7 @@ Running `ClaudeCodeBridge-<version>-Setup.exe` directly is recommended.
 2. Follow the setup wizard to complete installation.
 3. Gemini setup is optional and unchecked by default; no API key is required if not using Gemini.
 4. If Gemini is desired, check "Configure Google Gemini" and enter your API Key. The installer automatically detects and prefills the Windows system proxy if present (editable; clear to use direct connection).
-5. After installation completes, restart any running Claude Code sessions.
+5. After installation or upgrade completes, restart any running Claude Code sessions. A session started before the authentication upgrade may otherwise receive 401 Unauthorized.
 
 The ZIP package is portable. To use it, extract the entire archive first, then double-click `Install.cmd`.
 
@@ -52,6 +52,9 @@ Bridge Provider configuration:
 %USERPROFILE%\.claude\bridge-providers
 
 The installer creates a timestamped backup before modifying `settings.json`.
+It also generates a random local bridge token at:
+C:\ProgramData\ClaudeCodeBridge\local-auth-token
+Claude Code, the Model Center, shutdown scripts, and the Gemini image MCP use it automatically. A valid existing token is reused on upgrade; it is never used as an upstream provider API key.
 
 4. Updating API Key
 
@@ -64,14 +67,18 @@ Uninstall via Windows "Installed apps" or the Start Menu shortcut.
 Portable ZIP users can double-click `Uninstall.cmd`.
 
 API keys, logs, and Claude settings are preserved by default to prevent accidental data loss.
+The uninstaller uses the protected pre-install snapshot to restore Claude environment variables. Values changed by the user after installation are not overwritten.
 To remove `C:\ProgramData\ClaudeCodeBridge`, delete it manually after confirming it is no longer needed.
 
 6. Important Notes
 
 1. Binaries are not digitally signed; Windows SmartScreen may show an "Unknown publisher" warning.
-2. Connects are accepted only from local 127.0.0.1; ports are not exposed to the local network.
-3. API Keys are stored in access-controlled configuration files, not in the service registry.
-4. Do not distribute configuration files containing your API keys to others.
+2. Connections are accepted only from local 127.0.0.1; ports are not exposed to the local network.
+3. Except for `/health` and `/v1/models`, Messages, Responses, Token Count, MCP, and management APIs require the local bridge token.
+4. API keys and the local bridge token are kept separately in access-controlled files, not in the service registry.
+5. Streaming requests have no ten-minute whole-response deadline, but a stream with no bytes for two minutes is terminated; non-streaming requests retain the ten-minute limit.
+6. Vision Proxy fails explicitly instead of silently dropping untranslatable media and processes at most 16 historical media messages per request.
+7. Do not distribute configuration files containing API keys or the local bridge token.
 
 
 ================================================
@@ -86,7 +93,7 @@ To remove `C:\ProgramData\ClaudeCodeBridge`, delete it manually after confirming
 2. 按安装向导完成安装。
 3. Gemini 是可选项，默认不勾选；不使用 Gemini 时无需输入 API Key。
 4. 如需 Gemini，勾选“配置 Google Gemini”，再输入 API Key。安装器会自动检测并预填 Windows 系统代理，用户可以修改；清空代理表示直连。
-5. 安装成功后，重新启动正在运行的 Claude Code 会话。
+5. 安装或升级成功后，重新启动正在运行的 Claude Code 会话。在启用本地鉴权之前启动的旧会话否则可能收到 401 Unauthorized。
 
 ZIP 是便携发布包，需要使用时请先完整解压，再双击 Install.cmd。
 
@@ -118,6 +125,10 @@ Claude Code 配置：
 %USERPROFILE%\.claude
 
 安装程序修改 settings.json 前会创建带时间戳的备份。
+安装程序还会生成随机本地桥接令牌，保存在：
+C:\ProgramData\ClaudeCodeBridge\local-auth-token
+Claude Code、模型中心、停止脚本和 Gemini 生图 MCP 会自动使用该令牌，无需手工复制。
+升级时会复用已有的有效令牌；该令牌绝不会被用作上游 Provider API Key。
 
 四、更新 API Key
 
@@ -130,11 +141,15 @@ Claude Code 配置：
 便携包用户可以双击 Uninstall.cmd。
 
 默认保留 API Key、日志和 Claude 配置，避免误删个人数据。
+卸载器会按受保护的安装前快照恢复 Claude 环境变量；安装后由用户自行修改过的值不会被覆盖。
 如需删除 C:\ProgramData\ClaudeCodeBridge，请在确认不再需要后手工删除。
 
 六、注意事项
 
 1. 本软件没有商业代码签名证书，Windows 可能显示“未知发布者”。
 2. 只接受来自本机 127.0.0.1 的连接，不对局域网开放端口。
-3. API Key 不写入服务注册表，单独存放在受访问控制保护的文件中。
-4. 请勿将自己已经填写 API Key 的配置文件转发给他人。
+3. 除 /health 和 /v1/models 外，Messages、Responses、Token Count、MCP 与管理 API 都需要本地桥接令牌。
+4. API Key 与本地桥接令牌不写入服务注册表，分别存放在受访问控制保护的文件中。
+5. 流式请求没有 10 分钟整流总时限，但连续两分钟无数据会终止；非流式请求仍保留 10 分钟上限。
+6. Vision Proxy 遇到无法转换的媒体会明确失败，不会静默丢图；单次请求最多处理 16 条历史媒体消息。
+7. 请勿将自己已经填写 API Key 的配置文件或本地桥接令牌转发给他人。

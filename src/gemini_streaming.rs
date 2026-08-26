@@ -148,7 +148,14 @@ impl GeminiInteractionsStreamTranslator {
             "step.start" => self.start_step(&event),
             "step.delta" => self.delta_step(&event),
             "step.stop" => self.stop_step(&event),
-            _ => Ok(Vec::new()),
+            _ => {
+                warn!(
+                    provider = %self.profile_file,
+                    event_type,
+                    "Ignoring unknown Gemini Interactions stream event"
+                );
+                Ok(Vec::new())
+            }
         }
     }
 
@@ -263,11 +270,19 @@ impl GeminiInteractionsStreamTranslator {
                     .and_then(Value::as_str)
                     .unwrap_or("unknown_function")
                     .to_string();
+                let initial_arguments = match step.get("arguments") {
+                    Some(Value::String(value)) => value.clone(),
+                    Some(Value::Object(value)) if value.is_empty() => String::new(),
+                    Some(Value::Null) | None => String::new(),
+                    Some(value) => value.to_string(),
+                };
+                let mut arguments = String::new();
+                append_streamed_tool_arguments(&mut arguments, &initial_arguments)?;
                 (
                     InteractionStreamingBlock::Tool {
                         id: id.clone(),
                         name: name.clone(),
-                        arguments: String::new(),
+                        arguments,
                     },
                     json!({"type": "tool_use", "id": id, "name": name, "input": {}}),
                 )
@@ -339,8 +354,7 @@ impl GeminiInteractionsStreamTranslator {
                     }
                 }
                 InteractionStreamingBlock::Text { text, annotations } => {
-                    let initial_text =
-                        value_to_text(step.get("content").unwrap_or(&Value::Null));
+                    let initial_text = value_to_text(step.get("content").unwrap_or(&Value::Null));
                     if !initial_text.is_empty() {
                         text.push_str(&initial_text);
                         push_anthropic_event(
@@ -358,7 +372,22 @@ impl GeminiInteractionsStreamTranslator {
                         step.get("content").unwrap_or(&Value::Null),
                     );
                 }
-                InteractionStreamingBlock::Tool { .. } => {}
+                InteractionStreamingBlock::Tool { arguments, .. } => {
+                    if !arguments.is_empty() {
+                        push_anthropic_event(
+                            &mut events,
+                            "content_block_delta",
+                            json!({
+                                "type": "content_block_delta",
+                                "index": active.anthropic_index,
+                                "delta": {
+                                    "type": "input_json_delta",
+                                    "partial_json": arguments
+                                }
+                            }),
+                        )?;
+                    }
+                }
             }
         }
         Ok(events)
@@ -457,7 +486,7 @@ impl GeminiInteractionsStreamTranslator {
                         .or_else(|| delta.get("partial_arguments"))
                         .and_then(Value::as_str)
                     {
-                        arguments.push_str(value);
+                        append_streamed_tool_arguments(arguments, value)?;
                         push_anthropic_event(
                             &mut events,
                             "content_block_delta",
@@ -678,8 +707,8 @@ where
                 if ended {
                     return None;
                 }
-                match byte_stream.next().await {
-                    Some(Ok(bytes)) => match decoder.push_bytes(bytes.as_ref()) {
+                match tokio::time::timeout(UPSTREAM_STREAM_IDLE_TIMEOUT, byte_stream.next()).await {
+                    Ok(Some(Ok(bytes))) => match decoder.push_bytes(bytes.as_ref()) {
                         Ok(payloads) => {
                             for payload in payloads {
                                 if payload.trim() == "[DONE]" {
@@ -706,13 +735,13 @@ where
                             ended = true;
                         }
                     },
-                    Some(Err(err)) => {
+                    Ok(Some(Err(err))) => {
                         pending.push_back(anthropic_stream_error_event(&format!(
                             "Gemini Interactions stream failed: {err}"
                         )));
                         ended = true;
                     }
-                    None => {
+                    Ok(None) => {
                         let mut processing_failed = false;
                         match decoder.finish() {
                             Ok(payloads) => {
@@ -744,6 +773,12 @@ where
                                 }
                             }
                         }
+                        ended = true;
+                    }
+                    Err(_) => {
+                        pending.push_back(anthropic_stream_error_event(
+                            "Gemini Interactions stream was idle for too long",
+                        ));
                         ended = true;
                     }
                 }

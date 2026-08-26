@@ -33,7 +33,12 @@ fn load_interaction_continuation_cache(state_path: &Path) -> InteractionContinua
         }
     };
     if let Some(calls) = value.get("calls").and_then(Value::as_array) {
-        for call in calls.iter().rev().take(INTERACTION_CONTINUATION_CAPACITY).rev() {
+        for call in calls
+            .iter()
+            .rev()
+            .take(INTERACTION_CONTINUATION_CAPACITY)
+            .rev()
+        {
             let Some(key) = call.get("key").and_then(Value::as_str) else {
                 continue;
             };
@@ -161,8 +166,10 @@ fn remember_interaction_calls(
         return;
     };
     for (call_id, name) in calls {
+        let key = interaction_call_cache_key(profile_file, call_id);
+        cache.calls.shift_remove(&key);
         cache.calls.insert(
-            interaction_call_cache_key(profile_file, call_id),
+            key,
             InteractionCallContinuation {
                 interaction_id: interaction_id.to_string(),
                 name: name.clone(),
@@ -198,12 +205,15 @@ fn remember_interaction_continuation(
         warn!("Cannot lock Gemini Interactions continuation cache for writing");
         return;
     };
+    cache.transcripts.shift_remove(&transcript_key);
     cache
         .transcripts
         .insert(transcript_key, interaction_id.to_string());
     for (call_id, name) in calls {
+        let key = interaction_call_cache_key(profile_file, call_id);
+        cache.calls.shift_remove(&key);
         cache.calls.insert(
-            interaction_call_cache_key(profile_file, call_id),
+            key,
             InteractionCallContinuation {
                 interaction_id: interaction_id.to_string(),
                 name: name.clone(),
@@ -304,9 +314,11 @@ fn interaction_tool_result_value(
             let bounded_text = bound_tool_result_text(combined_text.clone(), max_chars);
             if bounded_text != combined_text {
                 let mut bounded = vec![json!({"type": "text", "text": bounded_text})];
-                bounded.extend(translated.into_iter().filter(|part| {
-                    part.get("type").and_then(Value::as_str) != Some("text")
-                }));
+                bounded.extend(
+                    translated
+                        .into_iter()
+                        .filter(|part| part.get("type").and_then(Value::as_str) != Some("text")),
+                );
                 return InteractionToolResultTranslation {
                     result: Value::Array(bounded),
                     documents,
@@ -648,9 +660,10 @@ fn translated_interaction_tools(request: &Value, capabilities: &OpenAiCapabiliti
     }
     translated.extend(capabilities.gemini_builtin_tools.iter().cloned());
     if !capabilities.gemini_file_search_store_names.is_empty() {
-        if let Some(file_search) = translated.iter_mut().find(|tool| {
-            tool.get("type").and_then(Value::as_str) == Some("file_search")
-        }) {
+        if let Some(file_search) = translated
+            .iter_mut()
+            .find(|tool| tool.get("type").and_then(Value::as_str) == Some("file_search"))
+        {
             if file_search.get("file_search_store_names").is_none() {
                 file_search["file_search_store_names"] =
                     json!(capabilities.gemini_file_search_store_names);
@@ -692,12 +705,14 @@ fn interaction_thinking_level(
         return Some(level.to_string());
     }
     if request.pointer("/thinking/type").and_then(Value::as_str) == Some("disabled") {
-        return Some(if model.starts_with("gemini-3") {
-            "low"
-        } else {
-            "none"
-        }
-        .to_string());
+        return Some(
+            if model.starts_with("gemini-3") {
+                "low"
+            } else {
+                "none"
+            }
+            .to_string(),
+        );
     }
     request
         .pointer("/output_config/effort")
@@ -781,10 +796,7 @@ fn interaction_response_format(request: &Value) -> Result<Option<Value>, String>
     })))
 }
 
-fn interaction_service_tier(
-    request: &Value,
-    capabilities: &OpenAiCapabilities,
-) -> Option<String> {
+fn interaction_service_tier(request: &Value, capabilities: &OpenAiCapabilities) -> Option<String> {
     capabilities.gemini_service_tier.clone().or_else(|| {
         match request.get("service_tier").and_then(Value::as_str) {
             Some("standard_only") => Some("standard".to_string()),
@@ -857,9 +869,7 @@ fn repeated_interaction_tool_loop(messages: &[Value]) -> Option<RepeatedInteract
                 let calls = parts
                     .into_iter()
                     .flatten()
-                    .filter(|part| {
-                        part.get("type").and_then(Value::as_str) == Some("tool_use")
-                    })
+                    .filter(|part| part.get("type").and_then(Value::as_str) == Some("tool_use"))
                     .filter_map(|part| {
                         Some(PendingInteractionToolCall {
                             id: part.get("id")?.as_str()?.to_string(),
@@ -895,9 +905,7 @@ fn repeated_interaction_tool_loop(messages: &[Value]) -> Option<RepeatedInteract
                     .and_then(Value::as_array)
                     .into_iter()
                     .flatten()
-                    .filter(|part| {
-                        part.get("type").and_then(Value::as_str) == Some("tool_result")
-                    })
+                    .filter(|part| part.get("type").and_then(Value::as_str) == Some("tool_result"))
                     .filter_map(|part| {
                         Some((
                             part.get("tool_use_id")?.as_str()?.to_string(),
@@ -942,10 +950,7 @@ fn repeated_interaction_tool_loop(messages: &[Value]) -> Option<RepeatedInteract
                         })
                         .collect::<Vec<_>>();
                     let fingerprint = serde_json::to_vec(&cycle).ok()?;
-                    let names = pending_calls
-                        .iter()
-                        .map(|call| call.name.clone())
-                        .collect();
+                    let names = pending_calls.iter().map(|call| call.name.clone()).collect();
                     completed_cycles.push((fingerprint, names));
                     pending_calls.clear();
                     pending_results.clear();
@@ -1115,10 +1120,10 @@ fn anthropic_max_tokens_headroom_diagnostic(
     if !thinking_enabled {
         return None;
     }
-    let max_tokens = request.get("max_tokens").and_then(Value::as_u64)?;
+    let max_tokens = request.get("max_tokens").and_then(value_as_u64)?;
     let budget = request
         .pointer("/thinking/budget_tokens")
-        .and_then(Value::as_u64)?;
+        .and_then(value_as_u64)?;
     if max_tokens > budget {
         return None;
     }
@@ -1289,13 +1294,17 @@ fn openai_request_diagnostics(
         );
     }
     if transport == ProviderTransport::OpenAiChat {
-        if request.get("tools").and_then(Value::as_array).is_some_and(|tools| {
-            tools.iter().any(|tool| {
-                tool.get("type")
-                    .and_then(Value::as_str)
-                    .is_some_and(|kind| kind.starts_with("web_search_"))
+        if request
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| {
+                tools.iter().any(|tool| {
+                    tool.get("type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|kind| kind.starts_with("web_search_"))
+                })
             })
-        }) {
+        {
             add(
                 "Skipped Claude Code's server-side web_search tool: this OpenAI Chat transport cannot execute it natively; the provider's Anthropic transport performs server-side search"
                     .to_string(),
@@ -1451,16 +1460,15 @@ fn interaction_continuation_for_request(
             }
         }
     }
-    let cache = continuations.read().ok()?;
+    let mut cache = continuations.write().ok()?;
     if !result_ids.is_empty() {
         let mut interaction_id = None;
         let mut names = HashMap::new();
+        let mut matched_keys = Vec::new();
         let mut complete = true;
         for call_id in &result_ids {
-            let Some(continuation) = cache
-                .calls
-                .get(&interaction_call_cache_key(profile_file, call_id))
-            else {
+            let key = interaction_call_cache_key(profile_file, call_id);
+            let Some(continuation) = cache.calls.get(&key).cloned() else {
                 complete = false;
                 break;
             };
@@ -1473,9 +1481,15 @@ fn interaction_continuation_for_request(
             }
             interaction_id = Some(continuation.interaction_id.clone());
             names.insert(call_id.clone(), continuation.name.clone());
+            matched_keys.push(key);
         }
         if complete {
             if let Some(id) = interaction_id {
+                for key in matched_keys {
+                    if let Some(continuation) = cache.calls.shift_remove(&key) {
+                        cache.calls.insert(key, continuation);
+                    }
+                }
                 return Some(InteractionRequestContinuation {
                     previous_id: id,
                     tool_names: names,
@@ -1492,16 +1506,15 @@ fn interaction_continuation_for_request(
     let key =
         interaction_transcript_cache_key(profile_file, request.get("system"), previous_messages);
     let names = interaction_tool_names_from_messages(previous_messages);
-    let transcript = cache
-        .transcripts
-        .get(&key)
-        .cloned()
-        .map(|id| InteractionRequestContinuation {
+    let transcript = cache.transcripts.shift_remove(&key).map(|id| {
+        cache.transcripts.insert(key, id.clone());
+        InteractionRequestContinuation {
             previous_id: id,
             tool_names: names,
             input_start,
             kind: "transcript",
-        });
+        }
+    });
     if transcript.is_none() && !result_ids.is_empty() {
         let cached_results = result_ids
             .iter()
@@ -1545,10 +1558,10 @@ fn translate_gemini_interactions_request_with_continuation(
     }
     if display_model_name(&profile.model).starts_with("gemini-3")
         && messages
-        .last()
-        .and_then(|message| message.get("role"))
-        .and_then(Value::as_str)
-        == Some("assistant")
+            .last()
+            .and_then(|message| message.get("role"))
+            .and_then(Value::as_str)
+            == Some("assistant")
     {
         return Err(
             "Gemini 3.x does not support an assistant prefill; the final message must be user input or a tool result"
@@ -1685,9 +1698,7 @@ fn translate_gemini_interactions_request_with_continuation(
     if let Some(response_format) = interaction_response_format(request)? {
         body.insert("response_format".to_string(), response_format);
     }
-    if let Some(service_tier) =
-        interaction_service_tier(request, &profile.openai_capabilities)
-    {
+    if let Some(service_tier) = interaction_service_tier(request, &profile.openai_capabilities) {
         body.insert("service_tier".to_string(), json!(service_tier));
     }
     if !tools.is_empty() {
@@ -1705,9 +1716,10 @@ fn translate_gemini_interactions_request_with_continuation(
         );
     }
     let mut system = value_to_text(request.get("system").unwrap_or(&Value::Null));
-    for message in messages.iter().filter(|message| {
-        message.get("role").and_then(Value::as_str) == Some("system")
-    }) {
+    for message in messages
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+    {
         let message_text = value_to_text(message.get("content").unwrap_or(&Value::Null));
         if message_text.is_empty() {
             continue;
@@ -1773,8 +1785,29 @@ fn is_mixed_interaction_tools_error(status: u16, message: &str) -> bool {
         || (message.contains("built-in tool") && message.contains("function"))
 }
 
-fn is_interaction_continuation_unavailable(status: u16, request: &Value) -> bool {
-    matches!(status, 404 | 410 | 501) && request.get("previous_interaction_id").is_some()
+fn is_interaction_continuation_unavailable(status: u16, message: &str, request: &Value) -> bool {
+    if request.get("previous_interaction_id").is_none() {
+        return false;
+    }
+    if matches!(status, 404 | 410 | 501) {
+        return true;
+    }
+    if status != 400 {
+        return false;
+    }
+    let message = message.to_ascii_lowercase();
+    let names_previous_interaction =
+        message.contains("previous_interaction_id") || message.contains("previous interaction");
+    let describes_unavailable = [
+        "expired",
+        "not found",
+        "invalid",
+        "unavailable",
+        "no longer exists",
+    ]
+    .iter()
+    .any(|reason| message.contains(reason));
+    names_previous_interaction && describes_unavailable
 }
 
 struct InteractionResponseTranslation {
@@ -1903,7 +1936,11 @@ fn gemini_interaction_usage_to_anthropic(usage: &Value, fallback_input_tokens: u
     .unwrap_or(0);
     let thought_tokens = usage_token(
         usage,
-        &["total_thought_tokens", "total_reasoning_tokens", "reasoning_tokens"],
+        &[
+            "total_thought_tokens",
+            "total_reasoning_tokens",
+            "reasoning_tokens",
+        ],
     );
     let mut translated = json!({
         "input_tokens": input_tokens,
@@ -2109,11 +2146,12 @@ async fn forward_gemini_interactions_profile(
     let mut mixed_tools_fallback = false;
     let mut continuation_fallback = false;
     let upstream = loop {
-        let response = match profile
+        let upstream_request = profile
             .client
             .post(&profile.upstream_url)
             .header("x-goog-api-key", api_key)
-            .json(&interaction_request)
+            .json(&interaction_request);
+        let response = match apply_upstream_total_timeout(upstream_request, stream_requested)
             .send()
             .await
         {
@@ -2153,7 +2191,11 @@ async fn forward_gemini_interactions_profile(
         }
 
         if !continuation_fallback
-            && is_interaction_continuation_unavailable(status.as_u16(), &interaction_request)
+            && is_interaction_continuation_unavailable(
+                status.as_u16(),
+                &message,
+                &interaction_request,
+            )
         {
             interaction_request = match translate_gemini_interactions_request_with_continuation(
                 &request,

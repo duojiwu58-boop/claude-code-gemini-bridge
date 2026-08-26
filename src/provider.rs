@@ -303,6 +303,19 @@ fn capability_string_array(
     Ok(default)
 }
 
+fn is_supported_responses_builtin_tool(kind: &str) -> bool {
+    matches!(
+        kind,
+        "web_search"
+            | "web_search_preview"
+            | "file_search"
+            | "computer_use_preview"
+            | "code_interpreter"
+            | "image_generation"
+            | "mcp"
+    )
+}
+
 fn capability_gemini_builtin_tools(
     object: &Map<String, Value>,
     names: &[&str],
@@ -656,11 +669,8 @@ fn parse_openai_capabilities_with_defaults(
     if chat_dialect == OpenAiChatDialect::Kimi && default_reasoning_effort.is_none() {
         default_reasoning_effort = Some("max".to_string());
     }
-    let reasoning_effort_map = capability_reasoning_effort_map(
-        object,
-        defaults.reasoning_effort_map.clone(),
-        file_name,
-    )?;
+    let reasoning_effort_map =
+        capability_reasoning_effort_map(object, defaults.reasoning_effort_map.clone(), file_name)?;
     let legacy_reasoning_replay = capability_bool(
         object,
         &["reasoning_replay", "reasoningReplay"],
@@ -762,10 +772,7 @@ fn parse_openai_capabilities_with_defaults(
     )?;
     let gemini_remote_mcp_servers = capability_gemini_remote_mcp_servers(
         object,
-        &[
-            "gemini_remote_mcp_servers",
-            "geminiRemoteMcpServers",
-        ],
+        &["gemini_remote_mcp_servers", "geminiRemoteMcpServers"],
         defaults.gemini_remote_mcp_servers.clone(),
         file_name,
     )?;
@@ -774,19 +781,17 @@ fn parse_openai_capabilities_with_defaults(
         &["gemini_service_tier", "geminiServiceTier"],
         file_name,
     )?;
-    if gemini_service_tier.as_deref().is_some_and(|tier| {
-        !matches!(tier, "standard" | "priority" | "flex")
-    }) {
+    if gemini_service_tier
+        .as_deref()
+        .is_some_and(|tier| !matches!(tier, "standard" | "priority" | "flex"))
+    {
         return Err(format!(
             "Provider profile '{file_name}' capability 'gemini_service_tier' has an unsupported value (expected standard, priority, or flex)"
         ));
     }
     let gemini_tool_choice_override = capability_string(
         object,
-        &[
-            "gemini_tool_choice_override",
-            "geminiToolChoiceOverride",
-        ],
+        &["gemini_tool_choice_override", "geminiToolChoiceOverride"],
         file_name,
     )?;
     if gemini_tool_choice_override
@@ -803,6 +808,13 @@ fn parse_openai_capabilities_with_defaults(
         defaults.responses_builtin_tools.clone(),
         file_name,
     )?;
+    for tool in &responses_builtin_tools {
+        if !is_supported_responses_builtin_tool(tool) {
+            return Err(format!(
+                "Provider profile '{file_name}' capability 'responses_builtin_tools' contains unsupported tool '{tool}'"
+            ));
+        }
+    }
     let kimi_formula_tools = capability_string_array(
         object,
         &["kimi_formula_tools", "kimiFormulaTools"],
@@ -969,10 +981,19 @@ fn openai_capabilities_json(capabilities: &OpenAiCapabilities) -> Value {
     })
 }
 
+fn redact_url_credentials(value: &str) -> String {
+    let Ok(mut url) = url::Url::parse(value) else {
+        return "<invalid URL>".to_string();
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+    }
+    url.to_string()
+}
+
 fn build_provider_client(file_name: &str, proxy_url: Option<&str>) -> Result<Client, String> {
-    let mut client_builder = Client::builder()
-        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
-        .timeout(UPSTREAM_REQUEST_TIMEOUT);
+    let mut client_builder = Client::builder().connect_timeout(UPSTREAM_CONNECT_TIMEOUT);
     if let Some(proxy_url) = proxy_url {
         client_builder = client_builder.proxy(
             Proxy::all(proxy_url)
@@ -984,6 +1005,52 @@ fn build_provider_client(file_name: &str, proxy_url: Option<&str>) -> Result<Cli
     client_builder
         .build()
         .map_err(|err| format!("Cannot create HTTP client for '{file_name}': {err}"))
+}
+
+fn upstream_total_timeout(stream_requested: bool) -> Option<Duration> {
+    (!stream_requested).then_some(UPSTREAM_REQUEST_TIMEOUT)
+}
+
+fn apply_upstream_total_timeout(
+    request: reqwest::RequestBuilder,
+    stream_requested: bool,
+) -> reqwest::RequestBuilder {
+    match upstream_total_timeout(stream_requested) {
+        Some(timeout) => request.timeout(timeout),
+        None => request,
+    }
+}
+
+fn append_bounded_text(
+    target: &mut String,
+    fragment: &str,
+    limit: usize,
+    label: &str,
+) -> Result<(), String> {
+    if target
+        .len()
+        .checked_add(fragment.len())
+        .is_none_or(|length| length > limit)
+    {
+        return Err(format!("{label} exceed the {limit}-byte limit"));
+    }
+    target.push_str(fragment);
+    Ok(())
+}
+
+fn append_streamed_tool_arguments(target: &mut String, fragment: &str) -> Result<(), String> {
+    append_bounded_text(
+        target,
+        fragment,
+        MAX_STREAMED_TOOL_ARGUMENT_BYTES,
+        "Streamed tool arguments",
+    )
+}
+
+fn value_as_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|value| value.parse::<u64>().ok()))
 }
 
 fn load_native_provider_profiles(
@@ -1085,8 +1152,7 @@ fn load_native_provider_profiles(
         }
         if transport != ProviderTransport::LocalGemini
             && api_key.is_none()
-            && !(transport == ProviderTransport::GeminiInteractions
-                && bridge_managed_credentials)
+            && !(transport == ProviderTransport::GeminiInteractions && bridge_managed_credentials)
         {
             return Err(format!(
                 "Provider profile '{file_name}' has no API credential"
@@ -1409,14 +1475,17 @@ fn build_gemini_client(
     proxy_url: Option<&str>,
     timeout: Option<Duration>,
 ) -> Result<Client, String> {
-    let mut builder = Client::builder()
-        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
-        .timeout(timeout.unwrap_or(UPSTREAM_REQUEST_TIMEOUT));
+    let mut builder = Client::builder().connect_timeout(UPSTREAM_CONNECT_TIMEOUT);
+    if let Some(timeout) = timeout {
+        builder = builder.timeout(timeout);
+    }
     builder = match proxy_url.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(proxy_url) => builder.proxy(
-            Proxy::all(proxy_url)
-                .map_err(|err| format!("Invalid Gemini proxy '{proxy_url}': {err}"))?,
-        ),
+        Some(proxy_url) => builder.proxy(Proxy::all(proxy_url).map_err(|err| {
+            format!(
+                "Invalid Gemini proxy '{}': {err}",
+                redact_url_credentials(proxy_url)
+            )
+        })?),
         None => builder.no_proxy(),
     };
     builder

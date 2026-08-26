@@ -609,3 +609,12 @@ DashScope/百炼兼容层支持的 `enable_thinking`、`thinking_budget` 等字�
 注意：Claude Code 自己的 `%USERPROFILE%\.claude\settings.json` 仍需通过它所
 支持的 `ANTHROPIC_BASE_URL=http://127.0.0.1:18787` 连接本地桥接器。这是 Claude
 Code 客户端的入口设置，不是上游 Provider 配置，两者职责不同。
+
+新版 Windows 安装器会生成独立的 256-bit 本地桥接令牌，并自动把它写入 Claude Code
+入口使用的 `ANTHROPIC_AUTH_TOKEN`、HTTP MCP header、模型中心和停止脚本。该令牌只验证
+本机调用者，不会作为 Gemini 或其他上游 Provider 的 API Key 转发。升级时会复用
+`C:\ProgramData\ClaudeCodeBridge\local-auth-token` 中已有的有效令牌；升级后应重启正在运行的
+Claude Code 会话。直接从源码运行时，必须设置至少 32 字符的
+`GEMINI_BRIDGE_LOCAL_TOKEN`，或让 `GEMINI_BRIDGE_LOCAL_TOKEN_FILE` 指向受保护的令牌文件。
+除本机诊断用的 `/health` 和 `/v1/models` 外，Messages、Responses、Token Count、MCP 与
+全部 `/admin/*` 路由都需要 `Authorization: Bearer <local-token>`。

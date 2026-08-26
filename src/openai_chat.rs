@@ -352,8 +352,8 @@ fn translate_anthropic_request_with_capabilities(
                 .collect()
         })
         .unwrap_or_default();
-    let deepseek_request_has_tools = capabilities.chat_dialect == OpenAiChatDialect::DeepSeek
-        && !translated_tools.is_empty();
+    let deepseek_request_has_tools =
+        capabilities.chat_dialect == OpenAiChatDialect::DeepSeek && !translated_tools.is_empty();
 
     if let Some(system) = request.get("system") {
         let text = value_to_text(system);
@@ -371,9 +371,7 @@ fn translate_anthropic_request_with_capabilities(
     {
         source_messages.iter().rposition(|message| {
             message.get("role").and_then(Value::as_str) == Some("user")
-                && is_genuine_anthropic_user_task(
-                    message.get("content").unwrap_or(&Value::Null),
-                )
+                && is_genuine_anthropic_user_task(message.get("content").unwrap_or(&Value::Null))
         })
     } else {
         None
@@ -442,7 +440,7 @@ fn translate_anthropic_request_with_capabilities(
         body.insert("stream_options".to_string(), json!({"include_usage": true}));
     }
 
-    if let Some(max_tokens) = request.get("max_tokens").and_then(Value::as_u64) {
+    if let Some(max_tokens) = request.get("max_tokens").and_then(value_as_u64) {
         match capabilities.max_tokens_field {
             MaxTokensField::MaxTokens => {
                 body.insert("max_tokens".to_string(), json!(max_tokens));
@@ -805,11 +803,11 @@ fn ensure_anthropic_thinking_output_headroom(
     let Some(budget) = request
         .get("thinking")
         .and_then(|thinking| thinking.get("budget_tokens"))
-        .and_then(Value::as_u64)
+        .and_then(value_as_u64)
     else {
         return Ok(());
     };
-    let Some(max_tokens) = request.get("max_tokens").and_then(Value::as_u64) else {
+    let Some(max_tokens) = request.get("max_tokens").and_then(value_as_u64) else {
         return Ok(());
     };
     if max_tokens > budget {
@@ -1523,9 +1521,11 @@ fn translate_anthropic_tool_result_content(
             let bounded_text = bound_tool_result_text(combined_text.clone(), max_chars);
             if bounded_text != combined_text {
                 let mut bounded_parts = vec![json!({"type": "text", "text": bounded_text})];
-                bounded_parts.extend(translated_parts.into_iter().filter(|part| {
-                    part.get("type").and_then(Value::as_str) != Some("text")
-                }));
+                bounded_parts.extend(
+                    translated_parts
+                        .into_iter()
+                        .filter(|part| part.get("type").and_then(Value::as_str) != Some("text")),
+                );
                 return (Value::Array(bounded_parts), Vec::new());
             }
             if is_error {
@@ -1961,7 +1961,7 @@ fn translate_request(
     body.insert("messages".to_string(), Value::Array(messages));
     body.insert("stream".to_string(), Value::Bool(false));
 
-    if let Some(max_tokens) = request.get("max_output_tokens").and_then(Value::as_u64) {
+    if let Some(max_tokens) = request.get("max_output_tokens").and_then(value_as_u64) {
         body.insert("max_tokens".to_string(), json!(max_tokens));
     }
     if let Some(parallel) = request.get("parallel_tool_calls").and_then(Value::as_bool) {

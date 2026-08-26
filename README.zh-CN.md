@@ -111,7 +111,9 @@ Anthropic Messages · Agent · MCP · tools · thinking · media
 http://127.0.0.1:18787
 ```
 
-Windows 服务名为 `ClaudeCodeBridge`。安装器会备份并更新 Claude Code 的 `settings.json`，让 Claude Code 始终连接这个稳定的本地地址。首次安装后请重新启动正在运行的 Claude Code 会话。
+Windows 服务名为 `ClaudeCodeBridge`。安装器会备份并更新 Claude Code 的 `settings.json`，让 Claude Code 始终连接这个稳定的本地地址。安装或升级后请重新启动正在运行的 Claude Code 会话，让进程取得最新配置；在启用本地鉴权之前启动的旧会话否则可能收到 `401 Unauthorized`。
+
+安装器还会生成随机 256-bit 本地桥接令牌，将其保存在受访问控制保护的 `C:\ProgramData\ClaudeCodeBridge\local-auth-token`，并自动配置 Claude Code、模型中心、停止脚本和 `gemini-image` MCP 携带该令牌；升级时会复用已有的有效令牌。运行时硬性拒绝所有非 loopback 监听地址。`/health` 与 `/v1/models` 保持为本机公开诊断；Messages、Responses、Token Count、MCP 以及全部 `/admin/*` 路由都必须提供正确的 Bearer token。直接从源码运行时，需通过 `GEMINI_BRIDGE_LOCAL_TOKEN` 提供至少 32 字符令牌，或用 `GEMINI_BRIDGE_LOCAL_TOKEN_FILE` 指向受保护文件。该凭据只用于验证本机调用者，绝不会被复用为 Gemini 或其他 Provider 的 API Key。
 
 提供 Gemini Key 时，安装器会创建原生 `gemini-interactions` profile；真实 Google 凭据仅保存在受保护的服务凭据文件中，不会重复写入 Provider JSON。
 
@@ -193,8 +195,18 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:18787/health'
 | Claude Code 配置 | `%USERPROFILE%\.claude\settings.json` |
 | Provider 配置 | `%USERPROFILE%\.claude\bridge-providers\*.json` |
 | 健康检查 | `GET /health` |
-| 模型列表 | `GET /admin/profiles` |
-| 刷新 Provider | `POST /admin/reload-profiles` |
+| 模型列表 | 需鉴权的 `GET /admin/profiles` |
+| 刷新 Provider | 需鉴权的 `POST /admin/reload-profiles` |
+
+手工调用管理 API 时，可以读取安装器托管的令牌而不把它打印出来：
+
+```powershell
+$bridgeToken = [System.IO.File]::ReadAllText('C:\ProgramData\ClaudeCodeBridge\local-auth-token').Trim()
+$headers = @{ Authorization = "Bearer $bridgeToken" }
+Invoke-RestMethod -Uri 'http://127.0.0.1:18787/admin/status' -Headers $headers
+```
+
+流式请求保留 15 秒连接超时，但不再受 10 分钟整流总时限影响；连续两分钟没有任何字节才会明确终止。非流式请求继续保留 10 分钟上限。流式工具参数按累计 8 MiB 限制。Vision Proxy 遇到任何无法转换的媒体都会让请求明确失败，最多接受 16 条历史媒体消息，并最多并发分析 4 条后按原消息顺序注入。
 
 每个原生 Provider 使用独立 HTTP 客户端，不会自动继承 Windows 系统代理或 Gemini 的旧代理配置。需要代理时，在对应 profile 中设置：
 

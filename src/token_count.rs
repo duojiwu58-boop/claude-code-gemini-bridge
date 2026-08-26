@@ -259,20 +259,9 @@ fn anthropic_token_count_response(input_tokens: usize, source: &'static str) -> 
 
 async fn anthropic_count_tokens(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Json(mut request): Json<Value>,
 ) -> Response {
-    let has_api_key = bearer_token(&headers)
-        .or_else(|| state.fallback_api_key.clone())
-        .is_some_and(|value| !value.trim().is_empty());
-    if !has_api_key {
-        return anthropic_error(
-            StatusCode::UNAUTHORIZED,
-            "authentication_error",
-            "Missing API key",
-        );
-    }
-
     let active_profile = active_provider_profile(&state);
     if let Some(profile) = active_profile.as_ref() {
         if let Some(identity) = upstream_identity_label(profile, &state.model) {

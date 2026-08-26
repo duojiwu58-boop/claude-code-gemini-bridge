@@ -1,7 +1,7 @@
 {
   "env": {
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:18787",
-    "ANTHROPIC_AUTH_TOKEN": "local-bridge",
+    "ANTHROPIC_AUTH_TOKEN": "INSTALLER_GENERATES_A_RANDOM_LOCAL_TOKEN",
     "ANTHROPIC_API_KEY": "",
     "ANTHROPIC_MODEL": "bridge-router",
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "bridge-router",

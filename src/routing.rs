@@ -1,18 +1,19 @@
 async fn responses(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Json(request): Json<Value>,
 ) -> Response {
     // Legacy compatibility only. Codex is intentionally kept on its native GPT
     // provider and is not maintained through this bridge. Do not expand this
     // route unless the maintenance policy at the top of this file changes.
-    let api_key = bearer_token(&headers)
-        .or_else(|| state.fallback_api_key.clone())
+    let api_key = state
+        .fallback_api_key
+        .clone()
         .filter(|value| !value.trim().is_empty());
     let Some(api_key) = api_key else {
         return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": {"code": "authentication_error", "message": "Missing Bearer API key"}})),
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": {"code": "server_error", "message": "Legacy Responses requires GEMINI_API_KEY or GEMINI_BRIDGE_API_KEY_PROFILE"}})),
         )
             .into_response();
     };
@@ -43,6 +44,7 @@ async fn responses(
         .post(&state.upstream_url)
         .bearer_auth(api_key)
         .json(&chat_request)
+        .timeout(UPSTREAM_REQUEST_TIMEOUT)
         .send()
         .await
     {
@@ -110,22 +112,6 @@ async fn anthropic_messages(
     headers: HeaderMap,
     Json(mut request): Json<Value>,
 ) -> Response {
-    // Claude Code only requires a non-empty local gateway token. When the
-    // bridge was started with GEMINI_API_KEY, keep the real Google key inside
-    // the bridge process instead of duplicating it in Claude settings.
-    let api_key = state
-        .fallback_api_key
-        .clone()
-        .or_else(|| bearer_token(&headers))
-        .filter(|value| !value.trim().is_empty());
-    let Some(api_key) = api_key else {
-        return anthropic_error(
-            StatusCode::UNAUTHORIZED,
-            "authentication_error",
-            "Missing API key",
-        );
-    };
-
     let Some(active_profile) = active_provider_profile(&state) else {
         return anthropic_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -204,11 +190,7 @@ async fn anthropic_messages(
             if let Err(message) =
                 apply_bridge_managed_gemini_credentials(&state, &mut active_profile)
             {
-                return anthropic_error(
-                    StatusCode::UNAUTHORIZED,
-                    "authentication_error",
-                    &message,
-                );
+                return anthropic_error(StatusCode::UNAUTHORIZED, "authentication_error", &message);
             }
             let diagnostics = gemini_interaction_request_diagnostics(&request);
             let provider_file = active_profile.file_name.clone();
@@ -222,6 +204,23 @@ async fn anthropic_messages(
         }
         ProviderTransport::LocalGemini => {}
     }
+
+    let Some(api_key) = state
+        .fallback_api_key
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return anthropic_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "api_error",
+            "LocalGemini requires GEMINI_API_KEY or GEMINI_BRIDGE_API_KEY_PROFILE",
+        );
+    };
+
+    let stream_requested = request
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     let chat_request = match translate_anthropic_request_with_capabilities(
         &request,
@@ -241,11 +240,12 @@ async fn anthropic_messages(
         }
     };
 
-    let upstream = match transport
+    let upstream_request = transport
         .client
         .post(&state.upstream_url)
         .bearer_auth(api_key)
-        .json(&chat_request)
+        .json(&chat_request);
+    let upstream = match apply_upstream_total_timeout(upstream_request, stream_requested)
         .send()
         .await
     {
@@ -278,10 +278,6 @@ async fn anthropic_messages(
         );
     }
 
-    let stream_requested = request
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
     if stream_requested {
         let estimated_input_tokens =
             u64::try_from(estimate_anthropic_input_tokens(&request)).unwrap_or(u64::MAX);
@@ -424,10 +420,16 @@ async fn forward_anthropic_profile(
         );
     };
     request_object.insert("model".to_string(), Value::String(profile.model.clone()));
+    let stream_requested = request_object
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let upstream_url = profile.upstream_url.clone();
     let upstream_build = || {
         let upstream_request = profile.client.post(&upstream_url).json(&request);
-        apply_anthropic_forward_headers(upstream_request, &profile, client_headers)
+        let upstream_request =
+            apply_anthropic_forward_headers(upstream_request, &profile, client_headers);
+        apply_upstream_total_timeout(upstream_request, stream_requested)
     };
 
     let upstream_started = Instant::now();

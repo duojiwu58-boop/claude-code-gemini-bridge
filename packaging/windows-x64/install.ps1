@@ -119,6 +119,8 @@ $guiExe = Join-Path $installDir 'ClaudeBridgeManager.exe'
 $scriptsDir = Join-Path $installDir 'scripts'
 $logDir = Join-Path $programDataDir 'logs'
 $keyFile = Join-Path $programDataDir 'gemini-api-key.toml'
+$localTokenFile = Join-Path $programDataDir 'local-auth-token'
+$installMetadataFile = Join-Path $programDataDir 'install-metadata.json'
 $stateFile = Join-Path $programDataDir 'bridge-state.json'
 $claudeDir = if ([string]::IsNullOrWhiteSpace($ClaudeSettingsDir)) {
     Join-Path $env:USERPROFILE '.claude'
@@ -175,6 +177,35 @@ function Grant-ServicePathAccess {
     )
     $acl.SetAccessRule($rule)
     Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function New-LocalAuthToken {
+    $bytes = [byte[]]::new(32)
+    $random = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $random.GetBytes($bytes)
+    }
+    finally {
+        $random.Dispose()
+    }
+    return [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+}
+
+function Write-Utf8TextAtomically {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+        [Parameter(Mandatory)]
+        [string]$Contents
+    )
+    $temporaryPath = "$Path.tmp-$PID-$([Guid]::NewGuid().ToString('N'))"
+    try {
+        [System.IO.File]::WriteAllText($temporaryPath, $Contents, $utf8NoBom)
+        Move-Item -LiteralPath $temporaryPath -Destination $Path -Force
+    }
+    finally {
+        Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 if ($Port -ne 18787) {
@@ -345,6 +376,19 @@ New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 New-Item -ItemType Directory -Path $imageDir -Force | Out-Null
 New-Item -ItemType Directory -Path $claudeDir -Force | Out-Null
 
+$localAuthToken = if (Test-Path -LiteralPath $localTokenFile -PathType Leaf) {
+    [System.IO.File]::ReadAllText($localTokenFile).Trim()
+}
+else {
+    ''
+}
+if ($localAuthToken.Length -lt 32) {
+    $localAuthToken = New-LocalAuthToken
+    Write-Utf8TextAtomically `
+        -Path $localTokenFile `
+        -Contents "$localAuthToken`r`n"
+}
+
 Copy-FileIfNeeded -Source $packageExe -Destination $serviceExe
 Copy-FileIfNeeded -Source $packageGui -Destination $guiExe
 Copy-FileIfNeeded `
@@ -357,11 +401,9 @@ Copy-FileIfNeeded `
 $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
 if ($configureGemini) {
     $escapedApiKey = $apiKey.Replace('\', '\\').Replace('"', '\"')
-    [System.IO.File]::WriteAllText(
-        $keyFile,
-        "experimental_bearer_token = `"$escapedApiKey`"`r`n",
-        $utf8NoBom
-    )
+    Write-Utf8TextAtomically `
+        -Path $keyFile `
+        -Contents "experimental_bearer_token = `"$escapedApiKey`"`r`n"
     $apiKey = $null
 
     $keyAcl = [Security.AccessControl.FileSecurity]::new()
@@ -392,6 +434,7 @@ if ($configureGemini) {
 }
 
 $template = [System.IO.File]::ReadAllText($bridgeSettingsTemplate) | ConvertFrom-Json
+$template.env.ANTHROPIC_AUTH_TOKEN = $localAuthToken
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 if ($configureGemini) {
     $geminiTemplate = [ordered]@{
@@ -415,11 +458,9 @@ if ($configureGemini) {
             -Destination "$geminiProfile.backup-$timestamp" `
             -Force
     }
-    [System.IO.File]::WriteAllText(
-        $geminiProfile,
-        ($geminiTemplate | ConvertTo-Json -Depth 8),
-        $utf8NoBom
-    )
+    Write-Utf8TextAtomically `
+        -Path $geminiProfile `
+        -Contents ($geminiTemplate | ConvertTo-Json -Depth 8)
 }
 
 if (Test-Path -LiteralPath $claudeSettings -PathType Leaf) {
@@ -438,6 +479,31 @@ if ($null -eq $settings.PSObject.Properties['env']) {
 elseif ($null -eq $settings.env) {
     $settings.env = [pscustomobject]@{}
 }
+$previousEnv = $null
+if (Test-Path -LiteralPath $installMetadataFile -PathType Leaf) {
+    try {
+        $existingInstallMetadata = [System.IO.File]::ReadAllText($installMetadataFile) |
+            ConvertFrom-Json
+        if ($null -ne $existingInstallMetadata.PSObject.Properties['previous_env']) {
+            $previousEnv = @($existingInstallMetadata.previous_env)
+        }
+    }
+    catch {
+        Write-Warning "无法读取旧安装元数据，将从当前 Claude 设置建立新的恢复点：$($_.Exception.Message)"
+    }
+}
+if ($null -eq $previousEnv) {
+    $previousEnv = @(
+        foreach ($property in $template.env.PSObject.Properties) {
+            $existingProperty = $settings.env.PSObject.Properties[$property.Name]
+            [pscustomobject]@{
+                name = $property.Name
+                existed = $null -ne $existingProperty
+                value = if ($null -ne $existingProperty) { $existingProperty.Value } else { $null }
+            }
+        }
+    )
+}
 foreach ($property in $template.env.PSObject.Properties) {
     $existingProperty = $settings.env.PSObject.Properties[$property.Name]
     if ($null -eq $existingProperty) {
@@ -450,11 +516,23 @@ foreach ($property in $template.env.PSObject.Properties) {
         $existingProperty.Value = $property.Value
     }
 }
-[System.IO.File]::WriteAllText(
-    $claudeSettings,
-    ($settings | ConvertTo-Json -Depth 100),
-    $utf8NoBom
+Write-Utf8TextAtomically `
+    -Path $claudeSettings `
+    -Contents ($settings | ConvertTo-Json -Depth 100)
+$installedEnv = @(
+    foreach ($property in $template.env.PSObject.Properties) {
+        [pscustomobject]@{ name = $property.Name; value = $property.Value }
+    }
 )
+$installMetadata = [pscustomobject]@{
+    version = 1
+    claude_settings = $claudeSettings
+    previous_env = $previousEnv
+    installed_env = $installedEnv
+}
+Write-Utf8TextAtomically `
+    -Path $installMetadataFile `
+    -Contents ($installMetadata | ConvertTo-Json -Depth 20)
 
 try {
     if (Test-Path -LiteralPath $claudeUserConfig -PathType Leaf) {
@@ -480,6 +558,9 @@ try {
     $imageMcp = [pscustomobject]@{
         type = 'http'
         url = "http://127.0.0.1:$Port/mcp"
+        headers = [pscustomobject]@{
+            Authorization = "Bearer $localAuthToken"
+        }
     }
     $existingImageMcp = $claudeUser.mcpServers.PSObject.Properties['gemini-image']
     if ($null -eq $existingImageMcp) {
@@ -491,11 +572,9 @@ try {
     else {
         $existingImageMcp.Value = $imageMcp
     }
-    [System.IO.File]::WriteAllText(
-        $claudeUserConfig,
-        ($claudeUser | ConvertTo-Json -Depth 100),
-        $utf8NoBom
-    )
+    Write-Utf8TextAtomically `
+        -Path $claudeUserConfig `
+        -Contents ($claudeUser | ConvertTo-Json -Depth 100)
 }
 catch {
     Write-Warning "无法自动注册 Gemini 生图工具：$($_.Exception.Message)"
@@ -572,6 +651,7 @@ if (-not $serviceSddl.Contains(";;;$currentUserSid)")) {
 
 $serviceEnvironment = @(
     "GEMINI_BRIDGE_LISTEN=127.0.0.1:$Port"
+    "GEMINI_BRIDGE_LOCAL_TOKEN_FILE=$localTokenFile"
     "GEMINI_BRIDGE_STATE_FILE=$stateFile"
     "GEMINI_BRIDGE_LOG_DIR=$logDir"
     "GEMINI_BRIDGE_IMAGE_DIR=$imageDir"
@@ -632,11 +712,36 @@ if ($null -eq $bridgeState.PSObject.Properties['gemini_proxy']) {
 else {
     $bridgeState.gemini_proxy = $ProxyUrl
 }
-[System.IO.File]::WriteAllText(
-    $stateFile,
-    ($bridgeState | ConvertTo-Json -Depth 8 -Compress),
-    $utf8NoBom
+Write-Utf8TextAtomically `
+    -Path $stateFile `
+    -Contents ($bridgeState | ConvertTo-Json -Depth 8 -Compress)
+
+$localTokenAcl = [Security.AccessControl.FileSecurity]::new()
+$localTokenAcl.SetAccessRuleProtection($true, $false)
+$localTokenPrincipals = @(
+    @{
+        Identity = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+        Rights = [Security.AccessControl.FileSystemRights]::FullControl
+    }
+    @{
+        Identity = $currentIdentity.User
+        Rights = [Security.AccessControl.FileSystemRights]::FullControl
+    }
+    @{
+        Identity = $serviceAccount
+        Rights = [Security.AccessControl.FileSystemRights]::Read
+    }
 )
+foreach ($principalEntry in $localTokenPrincipals) {
+    $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+        $principalEntry.Identity,
+        $principalEntry.Rights,
+        [Security.AccessControl.AccessControlType]::Allow
+    )
+    $localTokenAcl.AddAccessRule($rule)
+}
+Set-Acl -LiteralPath $localTokenFile -AclObject $localTokenAcl
+Set-Acl -LiteralPath $installMetadataFile -AclObject $localTokenAcl
 
 Grant-ServicePathAccess `
     -Path $installDir `
@@ -644,6 +749,9 @@ Grant-ServicePathAccess `
 Grant-ServicePathAccess `
     -Path $programDataDir `
     -Rights ([Security.AccessControl.FileSystemRights]::Modify)
+Grant-ServicePathAccess `
+    -Path $localTokenFile `
+    -Rights ([Security.AccessControl.FileSystemRights]::Read)
 Grant-ServicePathAccess `
     -Path $imageDir `
     -Rights ([Security.AccessControl.FileSystemRights]::Modify)
@@ -697,6 +805,7 @@ while ([DateTime]::UtcNow -lt $deadline) {
     Start-Sleep -Milliseconds 250
 }
 if (-not $healthy) {
+    Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
     throw "服务已经启动，但健康检查失败：$healthUrl"
 }
 

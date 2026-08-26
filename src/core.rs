@@ -381,6 +381,7 @@ struct AppState {
     gemini_transport: Arc<RwLock<GeminiTransport>>,
     gemini_thinking_level: Arc<RwLock<Option<String>>>,
     fallback_api_key: Option<String>,
+    local_auth_token: String,
     upstream_url: String,
     model: String,
     thought_signatures: Arc<ThoughtSignatureCache>,
@@ -418,7 +419,9 @@ fn rate_limit_retry_delay(
         return None;
     }
     if let Some(secs) = retry_after_secs {
-        return Some(Duration::from_secs(secs.min(RATE_LIMIT_RETRY_AFTER_CAP_SECS)));
+        return Some(Duration::from_secs(
+            secs.min(RATE_LIMIT_RETRY_AFTER_CAP_SECS),
+        ));
     }
     Some(Duration::from_millis(
         RATE_LIMIT_RETRY_BACKOFF_MILLIS[attempt as usize],
@@ -437,11 +440,9 @@ async fn send_with_rate_limit_retry(
             .get("retry-after")
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<u64>().ok());
-        let Some(delay) = rate_limit_retry_delay(
-            attempt,
-            response.status().as_u16(),
-            retry_after_secs,
-        ) else {
+        let Some(delay) =
+            rate_limit_retry_delay(attempt, response.status().as_u16(), retry_after_secs)
+        else {
             return Ok(response);
         };
         warn!(
