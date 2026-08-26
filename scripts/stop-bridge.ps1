@@ -7,16 +7,13 @@ $ErrorActionPreference = 'Stop'
 $serviceName = 'ClaudeCodeBridge'
 $projectDir = Split-Path -Parent $PSScriptRoot
 $pidPath = Join-Path $projectDir 'target\bridge.pid'
-$localAuthToken = $env:GEMINI_BRIDGE_LOCAL_TOKEN
-if ([string]::IsNullOrWhiteSpace($localAuthToken)) {
-    $localTokenFile = Join-Path $env:ProgramData 'ClaudeCodeBridge\local-auth-token'
-    if (Test-Path -LiteralPath $localTokenFile -PathType Leaf) {
-        $localAuthToken = [System.IO.File]::ReadAllText($localTokenFile).Trim()
-    }
+. (Join-Path $PSScriptRoot 'local-auth.ps1')
+$shutdownHeaders = try {
+    $localAuthToken = Get-BridgeLocalAuthToken -ProjectDir $projectDir
+    New-BridgeAuthorizationHeaders -Token $localAuthToken
 }
-$shutdownHeaders = @{}
-if (-not [string]::IsNullOrWhiteSpace($localAuthToken)) {
-    $shutdownHeaders.Authorization = "Bearer $localAuthToken"
+catch {
+    @{}
 }
 
 $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue

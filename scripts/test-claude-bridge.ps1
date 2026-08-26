@@ -1,12 +1,21 @@
 param(
     [int]$Port = 18787,
-    [string]$ProfileFile = 'settings - gemini3.6 bridge.json'
+    [string]$ProfileFile = 'settings - gemini3.6 bridge.json',
+    [string]$LocalTokenFile
 )
 
 $ErrorActionPreference = 'Stop'
-
+$projectDir = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'local-auth.ps1')
+$localAuthToken = Get-BridgeLocalAuthToken `
+    -ProjectDir $projectDir `
+    -TokenFile $LocalTokenFile
+$adminHeaders = New-BridgeAuthorizationHeaders -Token $localAuthToken
 $baseUrl = "http://127.0.0.1:$Port"
-$status = Invoke-RestMethod -Uri "$baseUrl/admin/status" -TimeoutSec 5
+$status = Invoke-RestMethod `
+    -Uri "$baseUrl/admin/status" `
+    -Headers $adminHeaders `
+    -TimeoutSec 5
 $originalProfile = $status.active_profile.file
 $switchBody = @{
     file = $ProfileFile
@@ -14,13 +23,14 @@ $switchBody = @{
 Invoke-RestMethod `
     -Uri "$baseUrl/admin/active-profile" `
     -Method Post `
+    -Headers $adminHeaders `
     -ContentType 'application/json' `
     -Body $switchBody `
     -TimeoutSec 5 | Out-Null
 
 try {
 $headers = @{
-    Authorization = 'Bearer local-gemini-bridge'
+    Authorization = "Bearer $localAuthToken"
     'Content-Type' = 'application/json'
     'anthropic-version' = '2023-06-01'
 }
@@ -137,6 +147,7 @@ finally {
     Invoke-RestMethod `
         -Uri "$baseUrl/admin/active-profile" `
         -Method Post `
+        -Headers $adminHeaders `
         -ContentType 'application/json' `
         -Body $restoreBody `
         -TimeoutSec 5 | Out-Null

@@ -192,7 +192,13 @@ async fn anthropic_messages(
             {
                 return anthropic_error(StatusCode::UNAUTHORIZED, "authentication_error", &message);
             }
-            let diagnostics = gemini_interaction_request_diagnostics(&request);
+            let mut diagnostics = gemini_interaction_request_diagnostics(&request);
+            if let Some(diagnostic) = gemini_interaction_pdf_tool_diagnostic(
+                &request,
+                &active_profile.openai_capabilities,
+            ) {
+                diagnostics.push(diagnostic);
+            }
             let provider_file = active_profile.file_name.clone();
             let response = forward_gemini_interactions_profile(
                 active_profile,
@@ -349,11 +355,11 @@ async fn forward_anthropic_profile(
                 policy_source = policy.source,
                 thinking_budget_tokens = request
                     .pointer("/thinking/budget_tokens")
-                    .and_then(|value| value.as_u64())
+                    .and_then(value_as_u64)
                     .unwrap_or(0),
                 max_tokens = request
                     .get("max_tokens")
-                    .and_then(|value| value.as_u64())
+                    .and_then(value_as_u64)
                     .unwrap_or(0),
                 reasoning_replay_messages = replay_messages,
                 reasoning_replay_estimated_tokens = replay_tokens,
@@ -403,7 +409,7 @@ async fn forward_anthropic_profile(
                 thinking_enabled = policy.thinking_enabled,
                 reasoning_effort = policy.effort.unwrap_or("omitted"),
                 thinking_budget_tokens = policy.budget_tokens.unwrap_or(0),
-                max_tokens = request.get("max_tokens").and_then(|value| value.as_u64()).unwrap_or(0),
+                max_tokens = request.get("max_tokens").and_then(value_as_u64).unwrap_or(0),
                 policy_source = policy.source,
                 estimated_input_tokens = estimate_anthropic_input_tokens(&request),
                 message_count = request.get("messages").and_then(|value| value.as_array()).map(Vec::len).unwrap_or(0),

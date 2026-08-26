@@ -152,6 +152,30 @@ fn evict_interaction_cache(cache: &mut InteractionContinuationCache) {
     }
 }
 
+fn read_interaction_continuation_cache(
+    continuations: &InteractionContinuationState,
+) -> std::sync::RwLockReadGuard<'_, InteractionContinuationCache> {
+    match continuations.read() {
+        Ok(cache) => cache,
+        Err(poisoned) => {
+            warn!("Gemini Interactions continuation cache read lock was poisoned; recovering cached state");
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn write_interaction_continuation_cache(
+    continuations: &InteractionContinuationState,
+) -> std::sync::RwLockWriteGuard<'_, InteractionContinuationCache> {
+    match continuations.write() {
+        Ok(cache) => cache,
+        Err(poisoned) => {
+            warn!("Gemini Interactions continuation cache write lock was poisoned; recovering cached state");
+            poisoned.into_inner()
+        }
+    }
+}
+
 fn remember_interaction_calls(
     continuations: &InteractionContinuationState,
     profile_file: &str,
@@ -161,10 +185,7 @@ fn remember_interaction_calls(
     if interaction_id.is_empty() || calls.is_empty() {
         return;
     }
-    let Ok(mut cache) = continuations.write() else {
-        warn!("Cannot lock Gemini Interactions continuation cache for writing");
-        return;
-    };
+    let mut cache = write_interaction_continuation_cache(continuations);
     for (call_id, name) in calls {
         let key = interaction_call_cache_key(profile_file, call_id);
         cache.calls.shift_remove(&key);
@@ -201,10 +222,7 @@ fn remember_interaction_continuation(
     }));
     let transcript_key =
         interaction_transcript_cache_key(profile_file, request.get("system"), &messages);
-    let Ok(mut cache) = continuations.write() else {
-        warn!("Cannot lock Gemini Interactions continuation cache for writing");
-        return;
-    };
+    let mut cache = write_interaction_continuation_cache(continuations);
     cache.transcripts.shift_remove(&transcript_key);
     cache
         .transcripts
@@ -633,6 +651,48 @@ fn interaction_steps_from_messages(
     steps
 }
 
+fn interaction_value_contains_pdf_document(value: &Value) -> bool {
+    match value {
+        Value::Array(values) => values.iter().any(interaction_value_contains_pdf_document),
+        Value::Object(object) => {
+            let is_pdf_document = object.get("type").and_then(Value::as_str) == Some("document")
+                && object.get("source").and_then(Value::as_object).is_some_and(|source| {
+                    source
+                        .get("media_type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|mime| mime.eq_ignore_ascii_case("application/pdf"))
+                        || (source.get("type").and_then(Value::as_str) == Some("url")
+                            && source.get("media_type").is_none_or(Value::is_null))
+                });
+            is_pdf_document
+                || object
+                    .values()
+                    .any(interaction_value_contains_pdf_document)
+        }
+        _ => false,
+    }
+}
+
+fn interaction_request_contains_pdf(request: &Value) -> bool {
+    request
+        .get("messages")
+        .is_some_and(interaction_value_contains_pdf_document)
+}
+
+fn gemini_interaction_pdf_tool_diagnostic(
+    request: &Value,
+    capabilities: &OpenAiCapabilities,
+) -> Option<String> {
+    (interaction_request_contains_pdf(request)
+        && capabilities.gemini_builtin_tools.iter().any(|tool| {
+            tool.get("type").and_then(Value::as_str) == Some("code_execution")
+        }))
+    .then(|| {
+        "Omitted Gemini Code Execution because Gemini rejects code_execution with application/pdf input"
+            .to_string()
+    })
+}
+
 fn translated_interaction_tools(request: &Value, capabilities: &OpenAiCapabilities) -> Vec<Value> {
     let mut translated = Vec::new();
     if let Some(tools) = request.get("tools").and_then(Value::as_array) {
@@ -658,7 +718,17 @@ fn translated_interaction_tools(request: &Value, capabilities: &OpenAiCapabiliti
             translated.push(translated_tool);
         }
     }
-    translated.extend(capabilities.gemini_builtin_tools.iter().cloned());
+    let omit_code_execution = interaction_request_contains_pdf(request);
+    translated.extend(
+        capabilities
+            .gemini_builtin_tools
+            .iter()
+            .filter(|tool| {
+                !(omit_code_execution
+                    && tool.get("type").and_then(Value::as_str) == Some("code_execution"))
+            })
+            .cloned(),
+    );
     if !capabilities.gemini_file_search_store_names.is_empty() {
         if let Some(file_search) = translated
             .iter_mut()
@@ -1460,43 +1530,50 @@ fn interaction_continuation_for_request(
             }
         }
     }
-    let mut cache = continuations.write().ok()?;
     if !result_ids.is_empty() {
-        let mut interaction_id = None;
-        let mut names = HashMap::new();
-        let mut matched_keys = Vec::new();
-        let mut complete = true;
-        for call_id in &result_ids {
-            let key = interaction_call_cache_key(profile_file, call_id);
-            let Some(continuation) = cache.calls.get(&key).cloned() else {
-                complete = false;
-                break;
-            };
-            if interaction_id
-                .as_ref()
-                .is_some_and(|existing| existing != &continuation.interaction_id)
-            {
-                complete = false;
-                break;
+        let matched = {
+            let cache = read_interaction_continuation_cache(continuations);
+            let mut interaction_id = None;
+            let mut names = HashMap::new();
+            let mut matched_keys = Vec::new();
+            let mut complete = true;
+            for call_id in &result_ids {
+                let key = interaction_call_cache_key(profile_file, call_id);
+                let Some(continuation) = cache.calls.get(&key) else {
+                    complete = false;
+                    break;
+                };
+                if interaction_id
+                    .as_ref()
+                    .is_some_and(|existing| existing != &continuation.interaction_id)
+                {
+                    complete = false;
+                    break;
+                }
+                interaction_id = Some(continuation.interaction_id.clone());
+                names.insert(call_id.clone(), continuation.name.clone());
+                matched_keys.push(key);
             }
-            interaction_id = Some(continuation.interaction_id.clone());
-            names.insert(call_id.clone(), continuation.name.clone());
-            matched_keys.push(key);
-        }
-        if complete {
-            if let Some(id) = interaction_id {
+            complete
+                .then_some(interaction_id)
+                .flatten()
+                .map(|id| (id, names, matched_keys))
+        };
+        if let Some((id, names, matched_keys)) = matched {
+            {
+                let mut cache = write_interaction_continuation_cache(continuations);
                 for key in matched_keys {
                     if let Some(continuation) = cache.calls.shift_remove(&key) {
                         cache.calls.insert(key, continuation);
                     }
                 }
-                return Some(InteractionRequestContinuation {
-                    previous_id: id,
-                    tool_names: names,
-                    input_start,
-                    kind: "tool_call_id",
-                });
             }
+            return Some(InteractionRequestContinuation {
+                previous_id: id,
+                tool_names: names,
+                input_start,
+                kind: "tool_call_id",
+            });
         }
     }
     if input_start == 0 {
@@ -1506,24 +1583,34 @@ fn interaction_continuation_for_request(
     let key =
         interaction_transcript_cache_key(profile_file, request.get("system"), previous_messages);
     let names = interaction_tool_names_from_messages(previous_messages);
-    let transcript = cache.transcripts.shift_remove(&key).map(|id| {
-        cache.transcripts.insert(key, id.clone());
-        InteractionRequestContinuation {
+    let transcript_id = {
+        let cache = read_interaction_continuation_cache(continuations);
+        cache.transcripts.get(&key).cloned()
+    };
+    if let Some(id) = transcript_id {
+        let mut cache = write_interaction_continuation_cache(continuations);
+        if let Some(current_id) = cache.transcripts.shift_remove(&key) {
+            cache.transcripts.insert(key, current_id);
+        }
+        return Some(InteractionRequestContinuation {
             previous_id: id,
             tool_names: names,
             input_start,
             kind: "transcript",
-        }
-    });
-    if transcript.is_none() && !result_ids.is_empty() {
-        let cached_results = result_ids
-            .iter()
-            .filter(|call_id| {
-                cache
-                    .calls
-                    .contains_key(&interaction_call_cache_key(profile_file, call_id))
-            })
-            .count();
+        });
+    }
+    if !result_ids.is_empty() {
+        let cached_results = {
+            let cache = read_interaction_continuation_cache(continuations);
+            result_ids
+                .iter()
+                .filter(|call_id| {
+                    cache
+                        .calls
+                        .contains_key(&interaction_call_cache_key(profile_file, call_id))
+                })
+                .count()
+        };
         warn!(
             provider = profile_file,
             result_count = result_ids.len(),
@@ -1532,7 +1619,7 @@ fn interaction_continuation_for_request(
             "Could not select a stored interaction for trailing tool results"
         );
     }
-    transcript
+    None
 }
 
 fn translate_gemini_interactions_request(
@@ -1860,6 +1947,9 @@ impl InteractionServerToolTrace {
             self.steps[index] = summary;
             return;
         }
+        if self.steps.len() >= INTERACTION_SERVER_TOOL_TRACE_CAPACITY {
+            return;
+        }
         if step_type == "google_search_call" {
             self.web_search_requests = self.web_search_requests.saturating_add(1);
         } else if step_type == "url_context_call" {
@@ -1920,7 +2010,39 @@ fn interaction_server_tool_trace_key(step: &Value) -> Option<String> {
 }
 
 fn interaction_server_tool_summary(step: &Value) -> Value {
-    step.clone()
+    let mut summary = Map::new();
+    for field in [
+        "type",
+        "id",
+        "call_id",
+        "name",
+        "server_name",
+        "status",
+        "is_error",
+        "search_type",
+    ] {
+        if let Some(value) = step.get(field) {
+            summary.insert(field.to_string(), value.clone());
+        }
+    }
+    for field in ["arguments", "action", "result", "results", "signature"] {
+        if let Some(value) = step.get(field) {
+            summary.insert(field.to_string(), bounded_interaction_trace_value(value));
+        }
+    }
+    Value::Object(summary)
+}
+
+fn bounded_interaction_trace_value(value: &Value) -> Value {
+    let serialized = serde_json::to_string(value).unwrap_or_default();
+    if serialized.chars().count() <= INTERACTION_SERVER_TOOL_TRACE_VALUE_CHARS {
+        return value.clone();
+    }
+    let preview = serialized
+        .chars()
+        .take(INTERACTION_SERVER_TOOL_TRACE_VALUE_CHARS)
+        .collect::<String>();
+    json!({"truncated": true, "preview": preview})
 }
 
 fn gemini_interaction_usage_to_anthropic(usage: &Value, fallback_input_tokens: u64) -> Value {

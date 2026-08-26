@@ -209,10 +209,37 @@ where
         env::var("GEMINI_BRIDGE_MODEL").unwrap_or_else(|_| DEFAULT_GEMINI_MODEL.into())
     );
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(shutdown_rx, include_ctrl_c))
-        .await
-        .map_err(|err| format!("Server failed: {err}"))
+    let (graceful_tx, graceful_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = std::future::IntoFuture::into_future(
+        axum::serve(listener, app).with_graceful_shutdown(async {
+            let _ = graceful_rx.await;
+        }),
+    );
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result.map_err(|err| format!("Server failed: {err}")),
+        _ = shutdown_signal(shutdown_rx, include_ctrl_c) => {
+            let _ = graceful_tx.send(());
+            finish_server_with_timeout(server.as_mut(), GRACEFUL_SHUTDOWN_TIMEOUT).await
+        }
+    }
+}
+
+async fn finish_server_with_timeout<F, E>(
+    server: std::pin::Pin<&mut F>,
+    timeout: Duration,
+) -> Result<(), String>
+where
+    F: std::future::Future<Output = Result<(), E>>,
+    E: std::fmt::Display,
+{
+    match tokio::time::timeout(timeout, server).await {
+        Ok(result) => result.map_err(|err| format!("Server failed: {err}")),
+        Err(_) => Err(format!(
+            "Server graceful shutdown timed out after {} seconds",
+            timeout.as_secs()
+        )),
+    }
 }
 
 fn validate_loopback_listen(listen: &str) -> Result<SocketAddr, String> {
@@ -340,6 +367,9 @@ async fn shutdown_signal(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     include_ctrl_c: bool,
 ) {
+    if *shutdown_rx.borrow() {
+        return;
+    }
     if include_ctrl_c {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}

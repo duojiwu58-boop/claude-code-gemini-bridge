@@ -3,13 +3,15 @@ param(
     [int]$Port = 18787,
     [string]$ApiKeyProfile = (
         Join-Path $env:USERPROFILE '.codex\gemini35flash-aistudio.config.toml'
-    )
+    ),
+    [string]$LocalTokenFile
 )
 
 $ErrorActionPreference = 'Stop'
 
 $serviceName = 'ClaudeCodeBridge'
 $projectDir = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'local-auth.ps1')
 $exePath = Join-Path $projectDir 'target\x86_64-pc-windows-msvc\release\claude-bridge.exe'
 $stdoutPath = Join-Path $projectDir 'target\bridge.stdout.log'
 $stderrPath = Join-Path $projectDir 'target\bridge.stderr.log'
@@ -72,6 +74,10 @@ if (-not $keyMatch.Success) {
 $env:GEMINI_BRIDGE_LISTEN = "127.0.0.1:$Port"
 $env:GEMINI_BRIDGE_PROXY = $ProxyUrl
 $env:GEMINI_API_KEY = $keyMatch.Groups[1].Value
+$env:GEMINI_BRIDGE_LOCAL_TOKEN = Get-BridgeLocalAuthToken `
+    -ProjectDir $projectDir `
+    -TokenFile $LocalTokenFile `
+    -CreateDevelopmentToken
 
 $process = Start-Process `
     -FilePath $exePath `

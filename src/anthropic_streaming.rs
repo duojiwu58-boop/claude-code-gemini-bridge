@@ -270,7 +270,7 @@ fn tool_arguments_text(value: Option<&Value>) -> String {
 fn usage_token(usage: &Value, fields: &[&str]) -> Option<u64> {
     fields
         .iter()
-        .find_map(|field| usage.get(*field).and_then(Value::as_u64))
+        .find_map(|field| usage.get(*field).and_then(value_as_u64))
 }
 
 fn safety_refusal_text(block_reason: &str) -> String {
@@ -421,18 +421,18 @@ impl AnthropicStreamTranslator {
             self.cache_read_input_tokens = usage
                 .pointer("/prompt_tokens_details/cached_tokens")
                 .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
-                .and_then(Value::as_u64)
-                .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(Value::as_u64))
-                .or_else(|| usage.get("cached_tokens").and_then(Value::as_u64))
+                .and_then(value_as_u64)
+                .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(value_as_u64))
+                .or_else(|| usage.get("cached_tokens").and_then(value_as_u64))
                 .or(self.cache_read_input_tokens);
             self.cache_creation_input_tokens = usage
                 .get("cache_creation_input_tokens")
-                .and_then(Value::as_u64)
+                .and_then(value_as_u64)
                 .or(self.cache_creation_input_tokens);
             self.reasoning_tokens = usage
                 .pointer("/completion_tokens_details/reasoning_tokens")
                 .or_else(|| usage.pointer("/output_tokens_details/reasoning_tokens"))
-                .and_then(Value::as_u64)
+                .and_then(value_as_u64)
                 .or(self.reasoning_tokens);
         }
 

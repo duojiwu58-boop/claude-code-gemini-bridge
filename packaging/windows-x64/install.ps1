@@ -8,7 +8,11 @@
     [string]$ClaudeSettingsDir,
     [string]$ProviderConfigDir,
     [switch]$NonInteractive,
-    [switch]$SkipShortcuts
+    [switch]$SkipShortcuts,
+    [string]$ElevationUserProfile,
+    [string]$ElevationUserPictures,
+    [string]$ElevationUserDesktop,
+    [string]$ElevationUserSid
 )
 
 $ErrorActionPreference = 'Stop'
@@ -30,8 +34,23 @@ if (-not (Test-IsAdministrator)) {
     if ($PSBoundParameters.Count -gt 0) {
         throw '使用命令行参数安装时，请先打开“管理员 PowerShell”。'
     }
+    $unelevatedIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $unelevatedProfile = [System.IO.Path]::GetFullPath($env:USERPROFILE)
+    $unelevatedPictures = [Environment]::GetFolderPath(
+        [Environment+SpecialFolder]::MyPictures
+    )
+    $unelevatedDesktop = [Environment]::GetFolderPath('DesktopDirectory')
     $elevationArguments = (
-        '-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $PSCommandPath
+        (
+            '-NoProfile -ExecutionPolicy Bypass -File "{0}" ' +
+            '-ElevationUserProfile "{1}" -ElevationUserPictures "{2}" ' +
+            '-ElevationUserDesktop "{3}" -ElevationUserSid "{4}"'
+        ) -f
+        $PSCommandPath,
+        $unelevatedProfile,
+        $unelevatedPictures,
+        $unelevatedDesktop,
+        $unelevatedIdentity.User.Value
     )
     $elevated = Start-Process `
         -FilePath 'powershell.exe' `
@@ -122,21 +141,42 @@ $keyFile = Join-Path $programDataDir 'gemini-api-key.toml'
 $localTokenFile = Join-Path $programDataDir 'local-auth-token'
 $installMetadataFile = Join-Path $programDataDir 'install-metadata.json'
 $stateFile = Join-Path $programDataDir 'bridge-state.json'
+$targetUserProfile = if ([string]::IsNullOrWhiteSpace($ElevationUserProfile)) {
+    [System.IO.Path]::GetFullPath($env:USERPROFILE)
+}
+else {
+    [System.IO.Path]::GetFullPath($ElevationUserProfile)
+}
 $claudeDir = if ([string]::IsNullOrWhiteSpace($ClaudeSettingsDir)) {
-    Join-Path $env:USERPROFILE '.claude'
+    Join-Path $targetUserProfile '.claude'
 }
 else {
     [System.IO.Path]::GetFullPath($ClaudeSettingsDir)
 }
 $claudeSettings = Join-Path $claudeDir 'settings.json'
 $claudeUserConfig = Join-Path (Split-Path -Parent $claudeDir) '.claude.json'
-$picturesDir = [Environment]::GetFolderPath(
-    [Environment+SpecialFolder]::MyPictures
-)
+$picturesDir = if ([string]::IsNullOrWhiteSpace($ElevationUserPictures)) {
+    [Environment]::GetFolderPath([Environment+SpecialFolder]::MyPictures)
+}
+else {
+    [System.IO.Path]::GetFullPath($ElevationUserPictures)
+}
 if ([string]::IsNullOrWhiteSpace($picturesDir)) {
     $picturesDir = Join-Path (Split-Path -Parent $claudeDir) 'Pictures'
 }
 $imageDir = Join-Path $picturesDir 'ClaudeCodeBridge'
+$desktopDir = if ([string]::IsNullOrWhiteSpace($ElevationUserDesktop)) {
+    [Environment]::GetFolderPath('DesktopDirectory')
+}
+else {
+    [System.IO.Path]::GetFullPath($ElevationUserDesktop)
+}
+$shortcutPath = if ([string]::IsNullOrWhiteSpace($desktopDir)) {
+    $null
+}
+else {
+    Join-Path $desktopDir 'Claude Code 模型切换器.lnk'
+}
 $providersDir = if ([string]::IsNullOrWhiteSpace($ProviderConfigDir)) {
     Join-Path $claudeDir 'bridge-providers'
 }
@@ -176,6 +216,42 @@ function Grant-ServicePathAccess {
         [Security.AccessControl.AccessControlType]::Allow
     )
     $acl.SetAccessRule($rule)
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Grant-ServiceDirectoryBrowseAccess {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        return
+    }
+    $acl = Get-Acl -LiteralPath $Path
+    $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+        $serviceAccount,
+        [Security.AccessControl.FileSystemRights]::ReadAndExecute,
+        [Security.AccessControl.InheritanceFlags]::None,
+        [Security.AccessControl.PropagationFlags]::None,
+        [Security.AccessControl.AccessControlType]::Allow
+    )
+    $acl.SetAccessRule($rule)
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Remove-ServicePathAccess {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+    $acl = Get-Acl -LiteralPath $Path
+    $serviceIdentity = [Security.Principal.NTAccount]::new($serviceAccount)
+    $acl.PurgeAccessRules($serviceIdentity)
     Set-Acl -LiteralPath $Path -AclObject $acl
 }
 
@@ -399,6 +475,12 @@ Copy-FileIfNeeded `
     -Destination (Join-Path $scriptsDir 'stop-bridge.ps1')
 
 $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$installUserSid = if ([string]::IsNullOrWhiteSpace($ElevationUserSid)) {
+    $currentIdentity.User
+}
+else {
+    [Security.Principal.SecurityIdentifier]::new($ElevationUserSid)
+}
 if ($configureGemini) {
     $escapedApiKey = $apiKey.Replace('\', '\\').Replace('"', '\"')
     Write-Utf8TextAtomically `
@@ -418,7 +500,7 @@ if ($configureGemini) {
             Rights = [Security.AccessControl.FileSystemRights]::FullControl
         }
         @{
-            Sid = $currentIdentity.User
+            Sid = $installUserSid
             Rights = [Security.AccessControl.FileSystemRights]::FullControl
         }
     )
@@ -633,7 +715,7 @@ $serviceSddl = $serviceSddlOutput |
 if ([string]::IsNullOrWhiteSpace($serviceSddl)) {
     throw 'Windows 返回了空的服务安全描述符。'
 }
-$currentUserSid = $currentIdentity.User.Value
+$currentUserSid = $installUserSid.Value
 if (-not $serviceSddl.Contains(";;;$currentUserSid)")) {
     $userControlAce = "(A;;LCRPWPLO;;;$currentUserSid)"
     $saclIndex = $serviceSddl.IndexOf('S:')
@@ -724,7 +806,7 @@ $localTokenPrincipals = @(
         Rights = [Security.AccessControl.FileSystemRights]::FullControl
     }
     @{
-        Identity = $currentIdentity.User
+        Identity = $installUserSid
         Rights = [Security.AccessControl.FileSystemRights]::FullControl
     }
     @{
@@ -755,12 +837,20 @@ Grant-ServicePathAccess `
 Grant-ServicePathAccess `
     -Path $imageDir `
     -Rights ([Security.AccessControl.FileSystemRights]::Modify)
+Remove-ServicePathAccess -Path $claudeDir
+Grant-ServiceDirectoryBrowseAccess -Path $claudeDir
 Grant-ServicePathAccess `
-    -Path $claudeDir `
-    -Rights ([Security.AccessControl.FileSystemRights]::ReadAndExecute)
+    -Path $claudeSettings `
+    -Rights ([Security.AccessControl.FileSystemRights]::Read)
 Grant-ServicePathAccess `
     -Path $providersDir `
     -Rights ([Security.AccessControl.FileSystemRights]::ReadAndExecute)
+Get-ChildItem -LiteralPath $claudeDir -File -Filter 'settings - *.json' |
+    ForEach-Object {
+        Grant-ServicePathAccess `
+            -Path $_.FullName `
+            -Rights ([Security.AccessControl.FileSystemRights]::Read)
+    }
 if (-not [string]::IsNullOrWhiteSpace($keyProfileEntry)) {
     $serviceKeyProfile = ($keyProfileEntry -split '=', 2)[1]
     Grant-ServicePathAccess `
@@ -769,9 +859,7 @@ if (-not [string]::IsNullOrWhiteSpace($keyProfileEntry)) {
 }
 
 if (-not $SkipShortcuts) {
-    $desktop = [Environment]::GetFolderPath('DesktopDirectory')
-    if (-not [string]::IsNullOrWhiteSpace($desktop)) {
-        $shortcutPath = Join-Path $desktop 'Claude Code 模型切换器.lnk'
+    if (-not [string]::IsNullOrWhiteSpace($shortcutPath)) {
         $shell = New-Object -ComObject WScript.Shell
         $shortcut = $shell.CreateShortcut($shortcutPath)
         $shortcut.TargetPath = $guiExe

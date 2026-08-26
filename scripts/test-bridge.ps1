@@ -1,25 +1,16 @@
 param(
-    [string]$ProfilePath = (
-        Join-Path $env:USERPROFILE '.codex\gemini35flash-aistudio.config.toml'
-    )
+    [int]$Port = 18787,
+    [string]$LocalTokenFile
 )
 
 $ErrorActionPreference = 'Stop'
-
-$profileText = [System.IO.File]::ReadAllText($ProfilePath)
-$keyMatch = [regex]::Match(
-    $profileText,
-    '(?m)^experimental_bearer_token\s*=\s*"([^"]+)"\s*$'
-)
-
-if (-not $keyMatch.Success) {
-    throw "API key not found in $ProfilePath"
-}
-
-$headers = @{
-    Authorization = "Bearer $($keyMatch.Groups[1].Value)"
-    'Content-Type' = 'application/json'
-}
+$projectDir = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'local-auth.ps1')
+$localAuthToken = Get-BridgeLocalAuthToken `
+    -ProjectDir $projectDir `
+    -TokenFile $LocalTokenFile
+$headers = New-BridgeAuthorizationHeaders -Token $localAuthToken
+$headers['Content-Type'] = 'application/json'
 
 $body = @{
     model = 'gemini-3.7-flash'
@@ -31,7 +22,7 @@ $body = @{
 } | ConvertTo-Json -Depth 8
 
 $response = Invoke-WebRequest `
-    -Uri 'http://127.0.0.1:18787/v1/responses' `
+    -Uri "http://127.0.0.1:$Port/v1/responses" `
     -Method Post `
     -Headers $headers `
     -Body $body `

@@ -1,6 +1,8 @@
 ﻿param(
     [switch]$RemoveConfiguration,
-    [switch]$KeepProgramFiles
+    [switch]$KeepProgramFiles,
+    [string]$ElevationUserProfile,
+    [string]$ElevationUserDesktop
 )
 
 $ErrorActionPreference = 'Stop'
@@ -17,8 +19,16 @@ if (-not (Test-IsAdministrator)) {
     if ($PSBoundParameters.Count -gt 0) {
         throw '使用命令行参数卸载时，请先打开“管理员 PowerShell”。'
     }
+    $unelevatedProfile = [System.IO.Path]::GetFullPath($env:USERPROFILE)
+    $unelevatedDesktop = [Environment]::GetFolderPath('DesktopDirectory')
     $elevationArguments = (
-        '-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $PSCommandPath
+        (
+            '-NoProfile -ExecutionPolicy Bypass -File "{0}" ' +
+            '-ElevationUserProfile "{1}" -ElevationUserDesktop "{2}"'
+        ) -f
+        $PSCommandPath,
+        $unelevatedProfile,
+        $unelevatedDesktop
     )
     $elevated = Start-Process `
         -FilePath 'powershell.exe' `
@@ -33,9 +43,20 @@ $serviceName = 'ClaudeCodeBridge'
 $installDir = Join-Path $env:ProgramFiles 'ClaudeCodeBridge'
 $programDataDir = Join-Path $env:ProgramData 'ClaudeCodeBridge'
 $installMetadataFile = Join-Path $programDataDir 'install-metadata.json'
-$desktop = [Environment]::GetFolderPath('DesktopDirectory')
+$targetUserProfile = if ([string]::IsNullOrWhiteSpace($ElevationUserProfile)) {
+    [System.IO.Path]::GetFullPath($env:USERPROFILE)
+}
+else {
+    [System.IO.Path]::GetFullPath($ElevationUserProfile)
+}
+$desktop = if ([string]::IsNullOrWhiteSpace($ElevationUserDesktop)) {
+    [Environment]::GetFolderPath('DesktopDirectory')
+}
+else {
+    [System.IO.Path]::GetFullPath($ElevationUserDesktop)
+}
 $shortcutPath = Join-Path $desktop 'Claude Code 模型切换器.lnk'
-$claudeUserConfig = Join-Path $env:USERPROFILE '.claude.json'
+$claudeUserConfig = Join-Path $targetUserProfile '.claude.json'
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 
 function Write-Utf8TextAtomically {

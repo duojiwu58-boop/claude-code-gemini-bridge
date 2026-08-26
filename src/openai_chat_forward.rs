@@ -105,7 +105,7 @@ async fn forward_openai_profile(
             provider = %profile.file_name,
             thinking_enabled = policy.thinking_enabled,
             reasoning_effort = policy.effort.unwrap_or("omitted"),
-            thinking_budget_tokens = chat_request.get("thinking_budget").and_then(|value| value.as_u64()).unwrap_or(0),
+            thinking_budget_tokens = chat_request.get("thinking_budget").and_then(value_as_u64).unwrap_or(0),
             policy_source = policy.source,
             estimated_input_tokens = estimate_anthropic_input_tokens(&request),
             reasoning_replay_messages = replay_messages,

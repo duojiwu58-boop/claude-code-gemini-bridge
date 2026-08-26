@@ -23,6 +23,7 @@ $projectReleaseExe = Join-Path $projectDir 'target\x86_64-pc-windows-msvc\releas
 $legacyExe = Join-Path $projectDir 'target\x86_64-pc-windows-msvc\release\codex-gemini-bridge.exe'
 $serviceDir = Join-Path $projectDir 'service'
 $serviceExe = Join-Path $serviceDir 'claude-bridge.exe'
+$localTokenFile = Join-Path $serviceDir 'local-auth-token'
 $legacyServiceExe = Join-Path $serviceDir 'codex-gemini-bridge.exe'
 $logDir = Join-Path $serviceDir 'logs'
 $picturesDir = [Environment]::GetFolderPath(
@@ -35,6 +36,7 @@ $imageDir = Join-Path $picturesDir 'ClaudeCodeBridge'
 $stateFile = Join-Path $projectDir 'bridge-state.json'
 $legacyPidFile = Join-Path $projectDir 'target\bridge.pid'
 $registryPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$serviceName"
+. (Join-Path $PSScriptRoot 'local-auth.ps1')
 
 function Grant-ServicePathAccess {
     param(
@@ -64,6 +66,42 @@ function Grant-ServicePathAccess {
         [Security.AccessControl.AccessControlType]::Allow
     )
     $acl.SetAccessRule($rule)
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Grant-ServiceDirectoryBrowseAccess {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        return
+    }
+    $acl = Get-Acl -LiteralPath $Path
+    $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+        $serviceAccount,
+        [Security.AccessControl.FileSystemRights]::ReadAndExecute,
+        [Security.AccessControl.InheritanceFlags]::None,
+        [Security.AccessControl.PropagationFlags]::None,
+        [Security.AccessControl.AccessControlType]::Allow
+    )
+    $acl.SetAccessRule($rule)
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Remove-ServicePathAccess {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+    $acl = Get-Acl -LiteralPath $Path
+    $serviceIdentity = [Security.Principal.NTAccount]::new($serviceAccount)
+    $acl.PurgeAccessRules($serviceIdentity)
     Set-Acl -LiteralPath $Path -AclObject $acl
 }
 
@@ -161,9 +199,17 @@ foreach ($listener in $listeners) {
     }
 
     try {
+        $shutdownHeaders = @{}
+        try {
+            $existingLocalAuthToken = Get-BridgeLocalAuthToken -ProjectDir $projectDir
+            $shutdownHeaders = New-BridgeAuthorizationHeaders -Token $existingLocalAuthToken
+        }
+        catch {
+        }
         Invoke-RestMethod `
             -Uri "http://127.0.0.1:$Port/admin/shutdown" `
             -Method Post `
+            -Headers $shutdownHeaders `
             -TimeoutSec 5 | Out-Null
     }
     catch {
@@ -188,6 +234,10 @@ if (Test-Path -LiteralPath $legacyPidFile -PathType Leaf) {
 
 New-Item -ItemType Directory -Path $serviceDir -Force | Out-Null
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+$localAuthToken = Get-BridgeLocalAuthToken `
+    -ProjectDir $projectDir `
+    -TokenFile $localTokenFile `
+    -CreateDevelopmentToken
 Copy-Item -LiteralPath $releaseExe -Destination $serviceExe -Force
 
 $binaryPath = "`"$serviceExe`" --windows-service"
@@ -264,6 +314,7 @@ if (-not $serviceSddl.Contains(";;;$currentUserSid)")) {
 
 $serviceEnvironment = @(
     "GEMINI_BRIDGE_LISTEN=127.0.0.1:$Port"
+    "GEMINI_BRIDGE_LOCAL_TOKEN_FILE=$localTokenFile"
     "GEMINI_BRIDGE_PROXY=$ProxyUrl"
     "GEMINI_BRIDGE_API_KEY_PROFILE=$ApiKeyProfile"
     "GEMINI_BRIDGE_STATE_FILE=$stateFile"
@@ -296,14 +347,25 @@ Grant-ServicePathAccess `
 Grant-ServicePathAccess `
     -Path $imageDir `
     -Rights ([Security.AccessControl.FileSystemRights]::Modify)
+Remove-ServicePathAccess -Path $ClaudeSettingsDir
+Grant-ServiceDirectoryBrowseAccess -Path $ClaudeSettingsDir
 Grant-ServicePathAccess `
-    -Path $ClaudeSettingsDir `
-    -Rights ([Security.AccessControl.FileSystemRights]::ReadAndExecute)
+    -Path (Join-Path $ClaudeSettingsDir 'settings.json') `
+    -Rights ([Security.AccessControl.FileSystemRights]::Read)
 Grant-ServicePathAccess `
     -Path $resolvedProviderConfigDir `
     -Rights ([Security.AccessControl.FileSystemRights]::ReadAndExecute)
+Get-ChildItem -LiteralPath $ClaudeSettingsDir -File -Filter 'settings - *.json' |
+    ForEach-Object {
+        Grant-ServicePathAccess `
+            -Path $_.FullName `
+            -Rights ([Security.AccessControl.FileSystemRights]::Read)
+    }
 Grant-ServicePathAccess `
     -Path $ApiKeyProfile `
+    -Rights ([Security.AccessControl.FileSystemRights]::Read)
+Grant-ServicePathAccess `
+    -Path $localTokenFile `
     -Rights ([Security.AccessControl.FileSystemRights]::Read)
 Grant-ServicePathAccess `
     -Path $stateFile `

@@ -1,12 +1,22 @@
 param(
     [string]$ProfileFile = 'settings - ds4.json',
     [int]$Port = 18787,
-    [switch]$OmitAnthropicVersion
+    [switch]$OmitAnthropicVersion,
+    [string]$LocalTokenFile
 )
 
 $ErrorActionPreference = 'Stop'
+$projectDir = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'local-auth.ps1')
+$localAuthToken = Get-BridgeLocalAuthToken `
+    -ProjectDir $projectDir `
+    -TokenFile $LocalTokenFile
+$adminHeaders = New-BridgeAuthorizationHeaders -Token $localAuthToken
 $baseUrl = "http://127.0.0.1:$Port"
-$status = Invoke-RestMethod -Uri "$baseUrl/admin/status" -TimeoutSec 5
+$status = Invoke-RestMethod `
+    -Uri "$baseUrl/admin/status" `
+    -Headers $adminHeaders `
+    -TimeoutSec 5
 $originalProfile = $status.active_profile.file
 
 try {
@@ -16,12 +26,13 @@ try {
     Invoke-RestMethod `
         -Uri "$baseUrl/admin/active-profile" `
         -Method Post `
+        -Headers $adminHeaders `
         -ContentType 'application/json' `
         -Body $switchBody `
         -TimeoutSec 5 | Out-Null
 
     $headers = @{
-        Authorization = 'Bearer local-gemini-bridge'
+        Authorization = "Bearer $localAuthToken"
     }
     if (-not $OmitAnthropicVersion) {
         $headers['anthropic-version'] = '2023-06-01'
@@ -64,6 +75,7 @@ finally {
     Invoke-RestMethod `
         -Uri "$baseUrl/admin/active-profile" `
         -Method Post `
+        -Headers $adminHeaders `
         -ContentType 'application/json' `
         -Body $restoreBody `
         -TimeoutSec 5 | Out-Null

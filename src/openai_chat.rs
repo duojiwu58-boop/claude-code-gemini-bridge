@@ -2092,6 +2092,11 @@ fn value_to_text(value: &Value) -> String {
             })
             .collect::<Vec<_>>()
             .join("\n"),
+        Value::Object(object) => object
+            .get("text")
+            .or_else(|| object.get("content"))
+            .map(value_to_text)
+            .unwrap_or_else(|| value.to_string()),
         Value::Null => String::new(),
         other => other.to_string(),
     }

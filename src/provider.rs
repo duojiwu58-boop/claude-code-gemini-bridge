@@ -1781,7 +1781,13 @@ fn select_initial_profile(profiles: &[ProviderProfile], state_path: &Path) -> St
 }
 
 fn active_provider_profile(state: &AppState) -> Option<ProviderProfile> {
-    let routing = state.routing.read().ok()?;
+    let routing = match state.routing.read() {
+        Ok(routing) => routing,
+        Err(poisoned) => {
+            error!("Provider routing read lock was poisoned; recovering current state");
+            poisoned.into_inner()
+        }
+    };
     routing
         .profiles
         .iter()

@@ -41,6 +41,16 @@ fn streaming_requests_have_no_total_deadline() {
     assert_eq!(upstream_total_timeout(true), None);
 }
 
+#[tokio::test]
+async fn graceful_shutdown_timeout_bounds_pending_server_completion() {
+    let pending = std::future::pending::<Result<(), &'static str>>();
+    tokio::pin!(pending);
+    let error = finish_server_with_timeout(pending.as_mut(), Duration::from_millis(1))
+        .await
+        .unwrap_err();
+    assert!(error.contains("graceful shutdown timed out"));
+}
+
 #[test]
 fn streamed_tool_arguments_are_bounded_cumulatively() {
     let mut arguments = "1234".to_string();
@@ -4663,6 +4673,80 @@ fn accepts_native_gemini_builtin_tool_options_without_flattening_them() {
 }
 
 #[test]
+fn omits_only_native_code_execution_when_interaction_contains_pdf() {
+    let profile = interactions_test_profile("gemini-pdf-tools.json");
+    let pdf_request = json!({
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Read the attached report"},
+                {
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": "cGRm"
+                    }
+                }
+            ]
+        }],
+        "tools": [{
+            "name": "record_finding",
+            "description": "Record one finding",
+            "input_schema": {
+                "type": "object",
+                "properties": {"finding": {"type": "string"}}
+            }
+        }]
+    });
+
+    let translated_pdf = translate_gemini_interactions_request(
+        &pdf_request,
+        &profile,
+        &RwLock::new(InteractionContinuationCache::default()),
+    )
+    .unwrap();
+    let pdf_tools = translated_pdf["tools"].as_array().unwrap();
+    assert_eq!(
+        pdf_tools
+            .iter()
+            .filter_map(|tool| tool.get("type").and_then(Value::as_str))
+            .collect::<Vec<_>>(),
+        vec!["function", "google_search", "url_context"]
+    );
+    assert_eq!(pdf_tools[0]["name"], "record_finding");
+    assert_eq!(
+        gemini_interaction_pdf_tool_diagnostic(
+            &pdf_request,
+            &profile.openai_capabilities
+        )
+        .as_deref(),
+        Some(
+            "Omitted Gemini Code Execution because Gemini rejects code_execution with application/pdf input"
+        )
+    );
+
+    let text_request = json!({
+        "messages": [{"role": "user", "content": "Calculate a digest with Python"}]
+    });
+    let translated_text = translate_gemini_interactions_request(
+        &text_request,
+        &profile,
+        &RwLock::new(InteractionContinuationCache::default()),
+    )
+    .unwrap();
+    assert!(translated_text["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| { tool.get("type").and_then(Value::as_str) == Some("code_execution") }));
+    assert!(
+        gemini_interaction_pdf_tool_diagnostic(&text_request, &profile.openai_capabilities)
+            .is_none()
+    );
+}
+
+#[test]
 fn detects_and_removes_only_mixed_interaction_server_tools() {
     let mut request = json!({
         "tools": [
@@ -5369,6 +5453,66 @@ fn returns_bounded_gemini_server_tool_metadata_and_standard_usage_counts() {
         translated.message["provider_metadata"]["google"]["interaction_server_tools"][4]["type"],
         "mcp_server_tool_call"
     );
+}
+
+#[test]
+fn caps_and_truncates_gemini_server_tool_trace_values() {
+    let mut steps = (0..40)
+        .map(|index| {
+            json!({
+                "type": "mcp_server_tool_result",
+                "call_id": format!("mcp-{index}"),
+                "result": if index == 0 {
+                    json!({"output": "x".repeat(4_196)})
+                } else {
+                    json!({"output": index})
+                },
+                "unbounded_internal_detail": "must not be exposed"
+            })
+        })
+        .collect::<Vec<_>>();
+    steps.push(json!({
+        "type": "model_output",
+        "content": [{"type": "text", "text": "Done."}]
+    }));
+    let upstream = json!({
+        "id": "interaction-bounded-tools",
+        "status": "completed",
+        "steps": steps,
+        "usage": {"total_input_tokens": 1, "total_output_tokens": 1}
+    });
+
+    let translated = translate_gemini_interactions_response(&upstream, "gemini-3.7-flash").unwrap();
+    let trace = translated.message["provider_metadata"]["google"]["interaction_server_tools"]
+        .as_array()
+        .unwrap();
+    assert_eq!(trace.len(), INTERACTION_SERVER_TOOL_TRACE_CAPACITY);
+    assert!(trace[0].get("unbounded_internal_detail").is_none());
+    assert_eq!(trace[0]["result"]["truncated"], true);
+    assert_eq!(
+        trace[0]["result"]["preview"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .count(),
+        4_096
+    );
+}
+
+#[test]
+fn extracts_text_from_object_shaped_interactions_thought_summary() {
+    let upstream = json!({
+        "id": "interaction-object-summary",
+        "status": "completed",
+        "steps": [
+            {"type": "thought", "summary": {"type": "text", "text": "Checking."}, "signature": "sig"},
+            {"type": "model_output", "content": [{"type": "text", "text": "Done."}]}
+        ],
+        "usage": {"total_input_tokens": 1, "total_output_tokens": 1}
+    });
+
+    let translated = translate_gemini_interactions_response(&upstream, "gemini-3.7-flash").unwrap();
+    assert_eq!(translated.message["content"][0]["thinking"], "Checking.");
 }
 
 #[test]
@@ -6156,6 +6300,52 @@ fn continues_interactions_tool_result_from_matching_transcript() {
 }
 
 #[test]
+fn recovers_poisoned_interaction_continuation_cache() {
+    let profile = interactions_test_profile("gemini-interactions.json");
+    let continuations = RwLock::new(InteractionContinuationCache::default());
+    let first = json!({
+        "messages": [{"role": "user", "content": "Read Cargo.toml"}]
+    });
+    let assistant_content = vec![json!({
+        "type": "tool_use",
+        "id": "call-poisoned-1",
+        "name": "read_file",
+        "input": {"path": "Cargo.toml"}
+    })];
+    remember_interaction_continuation(
+        &continuations,
+        &profile.file_name,
+        &first,
+        "interaction-poisoned-1",
+        &assistant_content,
+        &[("call-poisoned-1".to_string(), "read_file".to_string())],
+    );
+    let poison_result = std::panic::catch_unwind(|| {
+        let _guard = continuations.write().unwrap();
+        panic!("poison interaction continuation cache");
+    });
+    assert!(poison_result.is_err());
+
+    let result_request = json!({
+        "messages": [
+            {"role": "user", "content": "Read Cargo.toml"},
+            {"role": "assistant", "content": assistant_content},
+            {"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "call-poisoned-1",
+                "content": "package data"
+            }]}
+        ]
+    });
+    let translated =
+        translate_gemini_interactions_request(&result_request, &profile, &continuations).unwrap();
+    assert_eq!(
+        translated["previous_interaction_id"],
+        "interaction-poisoned-1"
+    );
+}
+
+#[test]
 fn textifies_interactions_tool_history_when_continuation_is_unavailable() {
     let profile = interactions_test_profile("gemini-interactions.json");
     let continuations = RwLock::new(InteractionContinuationCache::default());
@@ -6297,6 +6487,47 @@ fn preserves_inline_gemini_stream_tool_arguments() {
         .unwrap();
     assert_eq!(translator.assistant_content[0]["type"], "tool_use");
     assert_eq!(translator.assistant_content[0]["input"]["key"], "alpha");
+}
+
+#[test]
+fn preserves_gemini_stream_tool_arguments_only_present_on_stop() {
+    let continuations = Arc::new(RwLock::new(InteractionContinuationCache::default()));
+    let request = json!({
+        "messages": [{"role": "user", "content": "Use lookup"}],
+        "stream": true
+    });
+    let mut translator = GeminiInteractionsStreamTranslator::new(
+        "gemini-3.7-flash".to_string(),
+        "gemini-interactions.json".to_string(),
+        request,
+        continuations,
+        10,
+        false,
+    );
+    translator.start_events().unwrap();
+    translator
+        .process_payload(
+            r#"{"type":"step.start","index":0,"step":{"type":"function_call","id":"call-stop-inline","name":"lookup","arguments":{}}}"#,
+        )
+        .unwrap();
+    let stop_events = translator
+        .process_payload(
+            r#"{"type":"step.stop","index":0,"step":{"type":"function_call","id":"call-stop-inline","name":"lookup","arguments":{"key":"omega"}}}"#,
+        )
+        .unwrap();
+    assert_eq!(stop_events.len(), 2);
+    let event_debug = format!("{stop_events:?}");
+    let delta = event_debug
+        .find("content_block_delta")
+        .expect("stop-only arguments must be sent to the SSE client");
+    assert!(event_debug.contains("input_json_delta"));
+    assert!(event_debug.contains(r#"{\\\"key\\\":\\\"omega\\\"}"#));
+    let stop = event_debug
+        .find("content_block_stop")
+        .expect("tool block must be stopped");
+    assert!(delta < stop);
+    assert_eq!(translator.assistant_content[0]["type"], "tool_use");
+    assert_eq!(translator.assistant_content[0]["input"]["key"], "omega");
 }
 
 #[test]
@@ -6593,6 +6824,37 @@ fn deepseek_responses_fixture_preserves_reasoning_custom_tools_and_stateless_his
 }
 
 #[test]
+fn responses_request_drops_anthropic_web_search_tools_without_removing_native_builtins() {
+    let mut profile = responses_test_profile(
+        "deepseek-responses.json",
+        "https://api.deepseek.com/v1",
+        "deepseek-v4-flash",
+    );
+    profile.openai_capabilities.responses_builtin_tools = vec!["web_search".to_string()];
+    let continuations = RwLock::new(InteractionContinuationCache::default());
+    let request = json!({
+        "messages": [{"role": "user", "content": "Search, then inspect the file"}],
+        "tools": [
+            {"type": "web_search_20250305", "name": "web_search", "max_uses": 3},
+            {"name": "read_file", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}}
+        ]
+    });
+
+    let translated = translate_anthropic_to_responses(&request, &profile, &continuations).unwrap();
+    let tools = translated["tools"].as_array().unwrap();
+    assert!(tools.iter().any(|tool| tool["type"] == "web_search"));
+    assert!(tools
+        .iter()
+        .any(|tool| tool["type"] == "function" && tool["name"] == "read_file"));
+    assert!(!tools
+        .iter()
+        .any(|tool| tool["type"] == "function" && tool["name"] == "web_search"));
+    assert!(!serde_json::to_string(tools)
+        .unwrap()
+        .contains("web_search_20250305"));
+}
+
+#[test]
 fn deepseek_responses_maps_disabled_thinking_and_default_effort() {
     let profile = responses_test_profile(
         "deepseek-responses.json",
@@ -6868,6 +7130,40 @@ fn chat_usage_fixture_maps_cache_creation_cache_read_and_reasoning_tokens() {
     assert_eq!(translated["usage"]["cache_read_input_tokens"], 30);
     assert_eq!(translated["usage"]["cache_creation_input_tokens"], 10);
     assert_eq!(translated["usage"]["reasoning_tokens"], 11);
+}
+
+#[test]
+fn numeric_string_usage_maps_across_chat_streaming_and_responses() {
+    let responses_usage = openai_usage_to_anthropic(
+        &json!({
+            "input_tokens": "100",
+            "input_tokens_details": {"cached_tokens": "40"},
+            "output_tokens": "20",
+            "output_tokens_details": {"reasoning_tokens": "12"},
+            "cache_creation_input_tokens": "10"
+        }),
+        1,
+    );
+    assert_eq!(responses_usage["input_tokens"], 100);
+    assert_eq!(responses_usage["output_tokens"], 20);
+    assert_eq!(responses_usage["cache_read_input_tokens"], 40);
+    assert_eq!(responses_usage["cache_creation_input_tokens"], 10);
+    assert_eq!(responses_usage["reasoning_tokens"], 12);
+
+    let signatures = Arc::new(RwLock::new(IndexMap::new()));
+    let mut stream =
+        AnthropicStreamTranslator::new("numeric-string-usage-model".to_string(), signatures, 1);
+    stream.start_events().unwrap();
+    stream
+        .process_payload(
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":"90","completion_tokens":"18","prompt_tokens_details":{"cached_tokens":"30"},"cache_creation_input_tokens":"10","completion_tokens_details":{"reasoning_tokens":"11"}}}"#,
+        )
+        .unwrap();
+    assert_eq!(stream.input_tokens, 90);
+    assert_eq!(stream.output_tokens, 18);
+    assert_eq!(stream.cache_read_input_tokens, Some(30));
+    assert_eq!(stream.cache_creation_input_tokens, Some(10));
+    assert_eq!(stream.reasoning_tokens, Some(11));
 }
 
 #[test]

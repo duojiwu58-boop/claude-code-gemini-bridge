@@ -524,6 +524,7 @@ impl GeminiInteractionsStreamTranslator {
         let Some(active) = self.active_blocks.shift_remove(&index) else {
             return Ok(Vec::new());
         };
+        let mut events = Vec::new();
         match active.block {
             InteractionStreamingBlock::Thought {
                 thinking,
@@ -548,13 +549,36 @@ impl GeminiInteractionsStreamTranslator {
             InteractionStreamingBlock::Tool {
                 id,
                 name,
-                arguments,
+                mut arguments,
             } => {
+                let stop_only_arguments = arguments.is_empty();
+                if arguments.is_empty() {
+                    let inline_arguments = match event.pointer("/step/arguments") {
+                        Some(Value::String(value)) => value.clone(),
+                        Some(Value::Null) | None => String::new(),
+                        Some(value) => value.to_string(),
+                    };
+                    append_streamed_tool_arguments(&mut arguments, &inline_arguments)?;
+                }
                 let input = parse_tool_arguments(if arguments.is_empty() {
                     "{}"
                 } else {
                     &arguments
                 })?;
+                if stop_only_arguments && !arguments.is_empty() {
+                    push_anthropic_event(
+                        &mut events,
+                        "content_block_delta",
+                        json!({
+                            "type": "content_block_delta",
+                            "index": active.anthropic_index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": input.to_string()
+                            }
+                        }),
+                    )?;
+                }
                 let call = (id.clone(), name.clone());
                 self.calls.push(call.clone());
                 if self.store_interactions {
@@ -575,7 +599,6 @@ impl GeminiInteractionsStreamTranslator {
                 }));
             }
         }
-        let mut events = Vec::new();
         push_anthropic_event(
             &mut events,
             "content_block_stop",

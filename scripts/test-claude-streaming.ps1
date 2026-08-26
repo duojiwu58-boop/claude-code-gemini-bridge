@@ -1,9 +1,15 @@
 param(
-    [int]$Port = 18787
+    [int]$Port = 18787,
+    [string]$LocalTokenFile
 )
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Net.Http
+$projectDir = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'local-auth.ps1')
+$localAuthToken = Get-BridgeLocalAuthToken `
+    -ProjectDir $projectDir `
+    -TokenFile $LocalTokenFile
 
 $body = @{
     model = 'gemini-3.7-flash'
@@ -24,7 +30,7 @@ $request = New-Object System.Net.Http.HttpRequestMessage(
     [System.Net.Http.HttpMethod]::Post,
     "http://127.0.0.1:$Port/v1/messages"
 )
-$request.Headers.TryAddWithoutValidation('Authorization', 'Bearer local-gemini-bridge') | Out-Null
+$request.Headers.TryAddWithoutValidation('Authorization', "Bearer $localAuthToken") | Out-Null
 $request.Headers.TryAddWithoutValidation('anthropic-version', '2023-06-01') | Out-Null
 $request.Content = New-Object System.Net.Http.StringContent(
     $body,

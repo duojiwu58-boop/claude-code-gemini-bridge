@@ -129,6 +129,14 @@ fn responses_tools_from_anthropic(
     let mut tools = Vec::new();
     if let Some(source) = request.get("tools").and_then(Value::as_array) {
         for tool in source {
+            if tool
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.starts_with("web_search_"))
+            {
+                warn!("Skipping Anthropic server-side web search tool for Responses upstream");
+                continue;
+            }
             let Some(name) = tool.get("name").and_then(Value::as_str) else {
                 continue;
             };
@@ -379,16 +387,16 @@ fn openai_usage_to_anthropic(usage: &Value, estimated_input_tokens: u64) -> Valu
     let cache_read = usage
         .pointer("/input_tokens_details/cached_tokens")
         .or_else(|| usage.pointer("/prompt_tokens_details/cached_tokens"))
-        .and_then(Value::as_u64)
-        .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(Value::as_u64))
-        .or_else(|| usage.get("cached_tokens").and_then(Value::as_u64));
+        .and_then(value_as_u64)
+        .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(value_as_u64))
+        .or_else(|| usage.get("cached_tokens").and_then(value_as_u64));
     let cache_creation = usage
         .get("cache_creation_input_tokens")
-        .and_then(Value::as_u64);
+        .and_then(value_as_u64);
     let reasoning_tokens = usage
         .pointer("/output_tokens_details/reasoning_tokens")
         .or_else(|| usage.pointer("/completion_tokens_details/reasoning_tokens"))
-        .and_then(Value::as_u64);
+        .and_then(value_as_u64);
     let mut translated = json!({
         "input_tokens": input_tokens,
         "output_tokens": output_tokens
@@ -422,17 +430,17 @@ fn log_qwen_usage(provider: &str, transport: &str, usage: &Value) {
         .or_else(|| usage.pointer("/prompt_tokens_details/cached_tokens"))
         .or_else(|| usage.get("prompt_cache_hit_tokens"))
         .or_else(|| usage.get("cached_tokens"))
-        .and_then(Value::as_u64)
+        .and_then(value_as_u64)
         .unwrap_or(0);
     let cache_creation_tokens = usage
         .get("cache_creation_input_tokens")
-        .and_then(Value::as_u64)
+        .and_then(value_as_u64)
         .unwrap_or(0);
     let reasoning_tokens = usage
         .get("reasoning_tokens")
         .or_else(|| usage.pointer("/output_tokens_details/reasoning_tokens"))
         .or_else(|| usage.pointer("/completion_tokens_details/reasoning_tokens"))
-        .and_then(Value::as_u64)
+        .and_then(value_as_u64)
         .unwrap_or(0);
     info!(
         provider,
@@ -906,14 +914,15 @@ impl OpenAiResponsesStreamTranslator {
 
     fn capture_server_tool(&mut self, item: &Value) {
         let key = interaction_server_tool_trace_key(item);
+        let summary = interaction_server_tool_summary(item);
         if let Some(index) = key.as_ref().and_then(|key| {
             self.server_tool_items.iter().position(|existing| {
                 interaction_server_tool_trace_key(existing).as_ref() == Some(key)
             })
         }) {
-            self.server_tool_items[index] = item.clone();
+            self.server_tool_items[index] = summary;
         } else if self.server_tool_items.len() < INTERACTION_SERVER_TOOL_TRACE_CAPACITY {
-            self.server_tool_items.push(item.clone());
+            self.server_tool_items.push(summary);
         }
     }
 
