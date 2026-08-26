@@ -1236,7 +1236,7 @@ fn provider_reasoning_effort_override_wins_across_supported_transports() {
     profile.openai_capabilities.reasoning_effort_override = Some("high".to_string());
     let original = json!({
         "messages": [{"role": "user", "content": "Inspect this project"}],
-        "thinking": {"type": "adaptive"},
+        "thinking": {"type": "disabled"},
         "output_config": {
             "effort": "max",
             "format": {"type": "json_schema", "schema": {"type": "object"}}
@@ -1246,9 +1246,14 @@ fn provider_reasoning_effort_override_wins_across_supported_transports() {
     let mut native_request = original.clone();
     let diagnostics = apply_provider_request_overrides(&profile, &mut native_request).unwrap();
     assert_eq!(native_request["output_config"]["effort"], "high");
+    assert_eq!(native_request["thinking"]["type"], "adaptive");
     assert!(native_request["output_config"].get("format").is_some());
-    assert_eq!(diagnostics.len(), 1);
-    assert!(diagnostics[0].contains("from 'max' to 'high'"));
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.contains("from 'max' to 'high'")));
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.contains("thinking.type 'disabled'")));
 
     let signatures = RwLock::new(IndexMap::new());
     let chat = translate_anthropic_request_with_capabilities(
@@ -1644,7 +1649,7 @@ fn produces_completed_response_event() {
     let signatures = RwLock::new(IndexMap::new());
     let events =
         translate_response_events(&request, &upstream, "gemini-3.6-flash", &signatures).unwrap();
-    assert!(!events.is_empty());
+    assert!(format!("{events:?}").contains("response.completed"));
 }
 
 #[test]
@@ -3921,12 +3926,17 @@ fn streams_prompt_feedback_as_anthropic_refusal() {
     let mut translator = AnthropicStreamTranslator::new("gemini".to_string(), signatures, 0);
 
     let events = translator
-        .process_payload(r#"{"promptFeedback":{"blockReason":"SAFETY"},"choices":[]}"#)
+        .process_payload(
+            r#"{"promptFeedback":{"blockReason":"SAFETY"},"usage":{"prompt_tokens":11,"completion_tokens":7},"choices":[]}"#,
+        )
         .unwrap();
     let finish = translator.finish().unwrap();
 
     assert!(format!("{events:?}").contains("Gemini Safety Intercept"));
-    assert!(format!("{finish:?}").contains("refusal"));
+    let finish = format!("{finish:?}");
+    assert!(finish.contains("refusal"));
+    assert!(finish.contains("input_tokens\\\":11"));
+    assert!(finish.contains("output_tokens\\\":7"));
 }
 
 #[test]
@@ -4435,6 +4445,44 @@ fn anthropic_forwarding_preserves_safe_native_and_openrouter_headers() {
             headers.get(name).and_then(|value| value.to_str().ok()),
             "{name}"
         );
+    }
+}
+
+#[test]
+fn anthropic_forwarding_does_not_send_openrouter_headers_to_other_hosts() {
+    let client = Client::builder().build().unwrap();
+    let mut profile = test_provider_profile(
+        client.clone(),
+        "https://api.anthropic.com/v1/messages".to_string(),
+    );
+    profile.base_url = "https://api.anthropic.com".to_string();
+    profile.transport = ProviderTransport::Anthropic;
+    let mut headers = HeaderMap::new();
+    headers.insert("anthropic-beta", "test-beta".parse().unwrap());
+    headers.insert("anthropic-user-profile-id", "profile-123".parse().unwrap());
+    headers.insert("x-openrouter-metadata", "enabled".parse().unwrap());
+    headers.insert("http-referer", "https://bridge.example".parse().unwrap());
+    headers.insert("x-openrouter-title", "Claude Bridge".parse().unwrap());
+
+    let request = apply_anthropic_forward_headers(
+        client.post("https://api.anthropic.com/v1/messages"),
+        &profile,
+        &headers,
+    )
+    .build()
+    .unwrap();
+
+    assert_eq!(
+        request.headers().get("anthropic-beta").unwrap(),
+        "test-beta"
+    );
+    for name in [
+        "anthropic-user-profile-id",
+        "x-openrouter-metadata",
+        "http-referer",
+        "x-openrouter-title",
+    ] {
+        assert!(!request.headers().contains_key(name), "{name}");
     }
 }
 
@@ -5877,6 +5925,77 @@ fn caps_and_truncates_gemini_server_tool_trace_values() {
 }
 
 #[test]
+fn counts_server_tool_usage_beyond_the_diagnostic_trace_cap() {
+    let mut steps = (0..40)
+        .map(|index| {
+            json!({
+                "type": "google_search_call",
+                "id": format!("search-{index}"),
+                "arguments": {"query": index.to_string()}
+            })
+        })
+        .collect::<Vec<_>>();
+    steps.push(json!({
+        "type": "model_output",
+        "content": [{"type": "text", "text": "Done."}]
+    }));
+    let upstream = json!({
+        "id": "interaction-many-searches",
+        "status": "completed",
+        "steps": steps,
+        "usage": {"total_input_tokens": 1, "total_output_tokens": 1}
+    });
+
+    let translated = translate_gemini_interactions_response(&upstream, "gemini-3.7-flash").unwrap();
+    assert_eq!(
+        translated.message["provider_metadata"]["google"]["interaction_server_tools"]
+            .as_array()
+            .unwrap()
+            .len(),
+        INTERACTION_SERVER_TOOL_TRACE_CAPACITY
+    );
+    assert_eq!(
+        translated.message["usage"]["server_tool_use"]["web_search_requests"],
+        40
+    );
+}
+
+#[test]
+fn ignored_extension_diagnostics_do_not_scan_tool_schema_property_names() {
+    let schema_only = json!({
+        "messages": [{"role": "user", "content": "Use the tool"}],
+        "tools": [{
+            "name": "inspect",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "citations": {"type": "string"},
+                    "cache_control": {"type": "boolean"}
+                }
+            }
+        }]
+    });
+    let diagnostics = gemini_interaction_request_diagnostics(&schema_only);
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("citations")
+                || diagnostic.contains("cache_control"))
+    );
+
+    let actual_extension = json!({
+        "messages": [{"role": "user", "content": [{
+            "type": "text",
+            "text": "cached",
+            "cache_control": {"type": "ephemeral"}
+        }]}]
+    });
+    assert!(gemini_interaction_request_diagnostics(&actual_extension)
+        .iter()
+        .any(|diagnostic| diagnostic.contains("cache_control")));
+}
+
+#[test]
 fn extracts_text_from_object_shaped_interactions_thought_summary() {
     let upstream = json!({
         "id": "interaction-object-summary",
@@ -6962,6 +7081,28 @@ fn translates_gemini_37_rest_stream_schema_without_losing_content_or_usage() {
 }
 
 #[test]
+fn rejects_failed_or_cancelled_gemini_interaction_streams() {
+    for status in ["failed", "cancelled"] {
+        let continuations = Arc::new(RwLock::new(InteractionContinuationCache::default()));
+        let mut translator = GeminiInteractionsStreamTranslator::new(
+            "gemini-3.7-flash".to_string(),
+            "gemini-interactions.json".to_string(),
+            json!({"messages": [{"role": "user", "content": "Hello"}]}),
+            continuations,
+            1,
+            false,
+        );
+        translator
+            .process_payload(&format!(
+                r#"{{"type":"interaction.completed","interaction":{{"id":"interaction-terminal","status":"{status}"}}}}"#
+            ))
+            .unwrap();
+        let error = translator.finish().unwrap_err();
+        assert!(error.contains(status), "{error}");
+    }
+}
+
+#[test]
 fn preserves_streamed_server_tool_deltas_annotations_and_service_tier() {
     let continuations = Arc::new(RwLock::new(InteractionContinuationCache::default()));
     let mut translator = GeminiInteractionsStreamTranslator::new(
@@ -7418,6 +7559,41 @@ fn qwen_responses_preserves_native_effort_levels_and_uses_safe_default() {
         "output_config": {"effort": "max"}
     }));
     assert_eq!(disabled["reasoning"]["effort"], "none");
+}
+
+#[test]
+fn kimi_responses_normalizes_anthropic_effort_levels() {
+    let mut profile = responses_test_profile(
+        "kimi-responses.json",
+        "https://api.moonshot.ai/v1",
+        "kimi-k3",
+    );
+    profile.openai_capabilities.chat_dialect = OpenAiChatDialect::Kimi;
+    let continuations = RwLock::new(InteractionContinuationCache::default());
+
+    for (source, expected) in [("minimal", "low"), ("medium", "high"), ("xhigh", "max")] {
+        let translated = translate_anthropic_to_responses(
+            &json!({
+                "messages": [{"role": "user", "content": "Inspect"}],
+                "output_config": {"effort": source}
+            }),
+            &profile,
+            &continuations,
+        )
+        .unwrap();
+        assert_eq!(translated["reasoning"]["effort"], expected, "{source}");
+    }
+}
+
+#[test]
+fn chat_plain_text_output_format_is_a_noop() {
+    let request = json!({"output_config": {"format": {"type": "text"}}});
+    assert!(openai_chat_response_format(&request, false)
+        .unwrap()
+        .is_none());
+    assert!(openai_chat_response_format(&request, true)
+        .unwrap()
+        .is_none());
 }
 
 #[test]

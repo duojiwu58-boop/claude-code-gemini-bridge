@@ -57,6 +57,7 @@ const INTERACTION_SERVER_TOOL_TRACE_VALUE_CHARS: usize = 4096;
 const BRIDGE_WARNING_HEADER: &str = "x-claude-bridge-warning";
 const GEMINI_COUNT_TOKENS_TIMEOUT: Duration = Duration::from_secs(20);
 const KIMI_COUNT_TOKENS_TIMEOUT: Duration = Duration::from_secs(20);
+const KIMI_FORMULA_TIMEOUT: Duration = Duration::from_secs(60);
 const VISION_CACHE_CAPACITY: usize = 128;
 const MAX_VISION_JOBS: usize = 16;
 const MAX_CONCURRENT_VISION_JOBS: usize = 4;

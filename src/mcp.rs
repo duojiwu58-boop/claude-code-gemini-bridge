@@ -109,17 +109,28 @@ async fn configured_kimi_formula_tools(state: &AppState) -> Result<Vec<KimiFormu
     let mut names = HashSet::new();
     for formula in &profile.openai_capabilities.kimi_formula_tools {
         let url = kimi_formula_url(&profile, formula, "tools")?;
-        let response = profile
-            .client
-            .get(url)
-            .bearer_auth(credential)
-            .send()
+        let operation = async {
+            let response = profile
+                .client
+                .get(url)
+                .bearer_auth(credential)
+                .send()
+                .await
+                .map_err(|error| format!("Cannot load Kimi formula '{formula}': {error}"))?;
+            let status = response.status();
+            let body = read_response_json_limited(response)
+                .await
+                .map_err(|error| format!("Cannot read Kimi formula '{formula}': {error}"))?;
+            Ok::<_, String>((status, body))
+        };
+        let (status, body) = tokio::time::timeout(KIMI_FORMULA_TIMEOUT, operation)
             .await
-            .map_err(|error| format!("Cannot load Kimi formula '{formula}': {error}"))?;
-        let status = response.status();
-        let body = read_response_json_limited(response)
-            .await
-            .map_err(|error| format!("Cannot read Kimi formula '{formula}': {error}"))?;
+            .map_err(|_| {
+                format!(
+                    "Loading Kimi formula '{formula}' timed out after {} seconds",
+                    KIMI_FORMULA_TIMEOUT.as_secs()
+                )
+            })??;
         if !status.is_success() {
             return Err(format!(
                 "Kimi formula '{formula}' returned HTTP {status}: {}",
@@ -186,18 +197,29 @@ async fn execute_kimi_formula(
     let url = kimi_formula_url(&profile, &tool.formula, "fibers")?;
     let arguments = serde_json::to_string(arguments.unwrap_or(&Value::Object(Map::new())))
         .map_err(|error| format!("Cannot serialize Kimi formula arguments: {error}"))?;
-    let response = profile
-        .client
-        .post(url)
-        .bearer_auth(credential)
-        .json(&json!({"name": name, "arguments": arguments}))
-        .send()
+    let operation = async {
+        let response = profile
+            .client
+            .post(url)
+            .bearer_auth(credential)
+            .json(&json!({"name": name, "arguments": arguments}))
+            .send()
+            .await
+            .map_err(|error| format!("Kimi formula '{name}' failed: {error}"))?;
+        let status = response.status();
+        let body = read_response_json_limited(response)
+            .await
+            .map_err(|error| format!("Cannot read Kimi formula '{name}' response: {error}"))?;
+        Ok::<_, String>((status, body))
+    };
+    let (status, body) = tokio::time::timeout(KIMI_FORMULA_TIMEOUT, operation)
         .await
-        .map_err(|error| format!("Kimi formula '{name}' failed: {error}"))?;
-    let status = response.status();
-    let body = read_response_json_limited(response)
-        .await
-        .map_err(|error| format!("Cannot read Kimi formula '{name}' response: {error}"))?;
+        .map_err(|_| {
+            format!(
+                "Kimi formula '{name}' timed out after {} seconds",
+                KIMI_FORMULA_TIMEOUT.as_secs()
+            )
+        })??;
     if !status.is_success() {
         return Err(format!(
             "Kimi formula '{name}' returned HTTP {status}: {}",

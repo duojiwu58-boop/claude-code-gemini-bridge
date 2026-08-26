@@ -121,29 +121,57 @@ fn apply_provider_request_overrides(
     let request = request
         .as_object_mut()
         .ok_or_else(|| "Anthropic request body must be a JSON object".to_string())?;
-    let output_config = request
-        .entry("output_config".to_string())
-        .or_insert_with(|| json!({}));
-    let output_config = output_config
-        .as_object_mut()
-        .ok_or_else(|| "Anthropic field 'output_config' must be an object".to_string())?;
-    let previous = output_config
-        .get("effort")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    if previous.as_deref() == Some(effort) {
-        return Ok(Vec::new());
-    }
-    output_config.insert("effort".to_string(), json!(effort));
-    let diagnostic = match previous {
-        Some(previous) => format!(
-            "Provider profile overrode Anthropic output_config.effort from '{previous}' to '{effort}'"
-        ),
-        None => format!(
-            "Provider profile set Anthropic output_config.effort to '{effort}'"
-        ),
+    let previous = {
+        let output_config = request
+            .entry("output_config".to_string())
+            .or_insert_with(|| json!({}));
+        let output_config = output_config
+            .as_object_mut()
+            .ok_or_else(|| "Anthropic field 'output_config' must be an object".to_string())?;
+        let previous = output_config
+            .get("effort")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        output_config.insert("effort".to_string(), json!(effort));
+        previous
     };
-    Ok(vec![diagnostic])
+
+    let mut diagnostics = Vec::new();
+    if previous.as_deref() != Some(effort) {
+        diagnostics.push(match previous {
+            Some(previous) => format!(
+                "Provider profile overrode Anthropic output_config.effort from '{previous}' to '{effort}'"
+            ),
+            None => format!("Provider profile set Anthropic output_config.effort to '{effort}'"),
+        });
+    }
+
+    let thinking = request
+        .entry("thinking".to_string())
+        .or_insert_with(|| json!({}));
+    let thinking = thinking
+        .as_object_mut()
+        .ok_or_else(|| "Anthropic field 'thinking' must be an object".to_string())?;
+    let thinking_type = thinking.get("type").and_then(Value::as_str);
+    if effort == "none" {
+        if thinking_type != Some("disabled") {
+            thinking.insert("type".to_string(), json!("disabled"));
+            thinking.remove("budget_tokens");
+            diagnostics.push(
+                "Provider profile reasoning_effort 'none' disabled Anthropic thinking".to_string(),
+            );
+        }
+    } else if thinking_type == Some("disabled") {
+        thinking.insert("type".to_string(), json!("adaptive"));
+        thinking.remove("budget_tokens");
+        diagnostics.push(format!(
+            "Provider profile reasoning_effort '{effort}' overrode Anthropic thinking.type 'disabled' with 'adaptive'"
+        ));
+    }
+    if thinking.is_empty() {
+        request.remove("thinking");
+    }
+    Ok(diagnostics)
 }
 
 async fn anthropic_messages(
@@ -696,14 +724,16 @@ fn apply_anthropic_forward_headers(
     {
         upstream_request = upstream_request.header("anthropic-beta", value);
     }
-    for name in [
-        "anthropic-user-profile-id",
-        "x-openrouter-metadata",
-        "http-referer",
-        "x-openrouter-title",
-    ] {
-        if let Some(value) = client_headers.get(name).and_then(|value| value.to_str().ok()) {
-            upstream_request = upstream_request.header(name, value);
+    if is_openrouter_profile(profile) {
+        for name in [
+            "anthropic-user-profile-id",
+            "x-openrouter-metadata",
+            "http-referer",
+            "x-openrouter-title",
+        ] {
+            if let Some(value) = client_headers.get(name).and_then(|value| value.to_str().ok()) {
+                upstream_request = upstream_request.header(name, value);
+            }
         }
     }
     if profile.openai_capabilities.responses_session_cache {

@@ -4,6 +4,7 @@ struct InteractionCallContinuation {
     name: String,
 }
 
+#[derive(Clone)]
 struct InteractionContinuationCache {
     calls: IndexMap<String, InteractionCallContinuation>,
     transcripts: IndexMap<String, String>,

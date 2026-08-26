@@ -187,14 +187,6 @@ impl GeminiInteractionsStreamTranslator {
             }
         }
         self.completed |= completed;
-        if let Some(interaction_id) = self.interaction_id.as_deref() {
-            remember_interaction_calls(
-                &self.continuations,
-                &self.profile_file,
-                interaction_id,
-                &self.calls,
-            );
-        }
     }
 
     fn capture_completed_annotations(&mut self, step_index: usize, step: &Value) {
@@ -583,7 +575,7 @@ impl GeminiInteractionsStreamTranslator {
                 self.calls.push(call.clone());
                 if self.store_interactions {
                     if let Some(interaction_id) = self.interaction_id.as_deref() {
-                        remember_interaction_calls(
+                        remember_interaction_calls_in_memory(
                             &self.continuations,
                             &self.profile_file,
                             interaction_id,
@@ -624,6 +616,12 @@ impl GeminiInteractionsStreamTranslator {
                 "Gemini Interactions stream ended with an unfinished server-tool step".to_string(),
             );
         }
+        let status = self.status.as_deref().unwrap_or("completed");
+        if matches!(status, "failed" | "cancelled") {
+            return Err(format!(
+                "Gemini Interactions stream finished with status '{status}'"
+            ));
+        }
         let interaction_id = self.interaction_id.as_deref().ok_or_else(|| {
             "Gemini Interactions stream completed without an interaction id".to_string()
         })?;
@@ -637,7 +635,6 @@ impl GeminiInteractionsStreamTranslator {
                 &self.calls,
             );
         }
-        let status = self.status.as_deref().unwrap_or("completed");
         let stop_reason = interaction_stop_reason(status, !self.calls.is_empty());
         self.finished = true;
         let mut events = Vec::new();

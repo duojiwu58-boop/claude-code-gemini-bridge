@@ -1340,6 +1340,7 @@ fn openai_chat_response_format(
     })?;
 
     match format_type {
+        "text" => Ok(None),
         "json_object" => Ok(Some(json!({"type": "json_object"}))),
         "json_schema" if json_schema_as_json_object => Ok(Some(json!({"type": "json_object"}))),
         "json_schema" => {

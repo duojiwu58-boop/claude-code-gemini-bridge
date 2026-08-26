@@ -72,20 +72,24 @@ Opus 5 使用同一配置，只需把 `name` 和 `model` 分别改为 `OpenRoute
 `CLAUDE_CODE_EFFORT_LEVEL=max` 所产生的请求值，只影响切换到这个 profile 后的新请求；删除该字段
 则继续采用 Claude Code 请求值。它不同于 `capabilities.default_reasoning_effort`：后者只在请求没有
 指定 effort 时兜底。也不同于布尔值 `capabilities.reasoning_effort`：后者用于关闭上游 effort 字段；
-两者不能同时配置为“顶层有值、能力关闭”。
+两者不能同时配置为“顶层有值、能力关闭”。顶层值为 `none` 时会强制写入
+`thinking:{"type":"disabled"}` 并移除 budget；顶层值非 `none` 时，即使客户端显式发送
+`thinking:{"type":"disabled"}`，也会改为 adaptive thinking，使 profile 强制值保持最高优先级。
 
-桥接器会按 OpenRouter 文档使用 Bearer 鉴权，并保留 `anthropic-version`、`anthropic-beta`、
-`anthropic-user-profile-id`、`X-OpenRouter-Metadata`、`HTTP-Referer` 与
-`X-OpenRouter-Title` 等安全请求头；`retry-after`、Anthropic/OpenRouter 限流与追踪响应头也会
-返回给本地客户端。`/v1/models` 使用活动 profile 的真实模型 ID；Sonnet 5 和 Opus 5 在
+桥接器会按 OpenRouter 文档使用 Bearer 鉴权。`anthropic-version` 与 `anthropic-beta` 会继续发往
+Anthropic 兼容上游；`anthropic-user-profile-id`、`X-OpenRouter-Metadata`、`HTTP-Referer` 与
+`X-OpenRouter-Title` 只在目标 profile 的主机属于 OpenRouter 时转发，避免把归属元数据泄露给
+其他 Anthropic 兼容服务。`retry-after`、Anthropic/OpenRouter 限流与追踪响应头也会返回给本地客户端。
+`/v1/models` 使用活动 profile 的真实模型 ID；Sonnet 5 和 Opus 5 在
 profile 未写 `context_window` 时仍会报告官方 1,000,000-token 上下文和 128,000-token 最大输出。
 
 Sonnet 5 和 Opus 5 已移除 `thinking:{"type":"enabled","budget_tokens":...}`。桥接器仅在
 OpenRouter 的这两个精确模型 ID 上将旧配置改为 `thinking:{"type":"adaptive"}`；已有
 `display` 会保留，未提供时则设为 `summarized`，避免旧客户端丢失可见的 thinking 摘要。
 `temperature != 1.0`、`top_p < 0.99` 和任意 `top_k` 也会被省略。Opus 5 还有一条独立约束：
-显式 `thinking:{"type":"disabled"}` 时，`xhigh`/`max` effort 会降为 `high`；Sonnet 5 不应用
-这项限制。所有兼容修正都会通过 `x-claude-bridge-warning` 报告；已接受的默认值及其他模型保持原样。
+显式 `thinking:{"type":"disabled"}` 且没有顶层 profile 强制值替换该设置时，`xhigh`/`max` effort
+会降为 `high`；Sonnet 5 不应用这项限制。所有兼容修正都会通过
+`x-claude-bridge-warning` 报告；已接受的默认值及其他模型保持原样。
 
 实测可用的核心能力包括文本/流式输出、带签名的 adaptive thinking、严格与并行客户端工具、
 工具结果续接、结构化输出、图片/PDF、显式提示缓存、Web Search/Web Fetch，以及 context
@@ -496,8 +500,9 @@ Google 文本 annotations 则原样保存在
 - `context_window`：可选正整数，记录上游上下文窗口并通过管理 API 与 `/v1/models` 暴露。
 - `reasoning_effort`：可选的 profile 级强制推理档位，可取 `none`、`minimal`、`low`、`medium`、
   `high`、`xhigh` 或 `max`。它覆盖 Claude 请求和 Gemini GUI 的档位，并复用各 transport 的既有
-  映射；省略时严格保持原行为。该字段只控制发给上游的推理强度，不能覆盖 Claude Code 客户端的
-  上下文窗口、自动压缩阈值或代理编排。管理 API 会在 profile 顶层返回有效值。
+  映射；`none` 会关闭 thinking 并移除 budget，非 `none` 值会把客户端的 disabled thinking 改为
+  adaptive thinking；省略时严格保持原行为。该字段只控制发给上游的推理强度，不能覆盖 Claude Code
+  客户端的上下文窗口、自动压缩阈值或代理编排。管理 API 会在 profile 顶层返回有效值。
 - `proxy`：可选，仅用于这个 Provider；省略表示直连。
 - `enabled`：可选，默认 `true`。设为 `false` 后保留文件但不显示该配置。
 - `vision`：可选，默认 `{"mode":"native"}`，即图片仍由当前 Provider 原生处理。

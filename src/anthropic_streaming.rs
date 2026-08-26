@@ -398,20 +398,6 @@ impl AnthropicStreamTranslator {
             return Err(safe_error_message(&chunk));
         }
 
-        if let Some(block_reason) = chunk
-            .pointer("/promptFeedback/blockReason")
-            .and_then(Value::as_str)
-        {
-            self.refusal_seen = true;
-            if self.safety_block_seen {
-                return Ok(Vec::new());
-            }
-            self.safety_block_seen = true;
-            let mut events = Vec::new();
-            self.emit_text_delta(&mut events, &safety_refusal_text(block_reason))?;
-            return Ok(events);
-        }
-
         let usage_seen = chunk.get("usage").is_some();
         if let Some(usage) = chunk.get("usage") {
             self.input_tokens =
@@ -434,6 +420,20 @@ impl AnthropicStreamTranslator {
                 .or_else(|| usage.pointer("/output_tokens_details/reasoning_tokens"))
                 .and_then(value_as_u64)
                 .or(self.reasoning_tokens);
+        }
+
+        if let Some(block_reason) = chunk
+            .pointer("/promptFeedback/blockReason")
+            .and_then(Value::as_str)
+        {
+            self.refusal_seen = true;
+            if self.safety_block_seen {
+                return Ok(Vec::new());
+            }
+            self.safety_block_seen = true;
+            let mut events = Vec::new();
+            self.emit_text_delta(&mut events, &safety_refusal_text(block_reason))?;
+            return Ok(events);
         }
 
         let Some(choice) = chunk.pointer("/choices/0") else {

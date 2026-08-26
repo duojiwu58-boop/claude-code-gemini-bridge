@@ -176,7 +176,7 @@ fn write_interaction_continuation_cache(
     }
 }
 
-fn remember_interaction_calls(
+fn remember_interaction_calls_in_memory(
     continuations: &InteractionContinuationState,
     profile_file: &str,
     interaction_id: &str,
@@ -198,7 +198,6 @@ fn remember_interaction_calls(
         );
     }
     evict_interaction_cache(&mut cache);
-    persist_interaction_continuation_cache(&cache);
 }
 
 fn remember_interaction_continuation(
@@ -222,24 +221,27 @@ fn remember_interaction_continuation(
     }));
     let transcript_key =
         interaction_transcript_cache_key(profile_file, request.get("system"), &messages);
-    let mut cache = write_interaction_continuation_cache(continuations);
-    cache.transcripts.shift_remove(&transcript_key);
-    cache
-        .transcripts
-        .insert(transcript_key, interaction_id.to_string());
-    for (call_id, name) in calls {
-        let key = interaction_call_cache_key(profile_file, call_id);
-        cache.calls.shift_remove(&key);
-        cache.calls.insert(
-            key,
-            InteractionCallContinuation {
-                interaction_id: interaction_id.to_string(),
-                name: name.clone(),
-            },
-        );
-    }
-    evict_interaction_cache(&mut cache);
-    persist_interaction_continuation_cache(&cache);
+    let snapshot = {
+        let mut cache = write_interaction_continuation_cache(continuations);
+        cache.transcripts.shift_remove(&transcript_key);
+        cache
+            .transcripts
+            .insert(transcript_key, interaction_id.to_string());
+        for (call_id, name) in calls {
+            let key = interaction_call_cache_key(profile_file, call_id);
+            cache.calls.shift_remove(&key);
+            cache.calls.insert(
+                key,
+                InteractionCallContinuation {
+                    interaction_id: interaction_id.to_string(),
+                    name: name.clone(),
+                },
+            );
+        }
+        evict_interaction_cache(&mut cache);
+        cache.clone()
+    };
+    persist_interaction_continuation_cache(&snapshot);
 }
 
 fn interaction_content_from_anthropic(part: &Value) -> Option<Value> {
@@ -875,14 +877,40 @@ fn interaction_service_tier(request: &Value, capabilities: &OpenAiCapabilities) 
     })
 }
 
-fn json_contains_key(value: &Value, key: &str) -> bool {
-    match value {
-        Value::Array(values) => values.iter().any(|value| json_contains_key(value, key)),
-        Value::Object(object) => {
-            object.contains_key(key) || object.values().any(|value| json_contains_key(value, key))
+fn anthropic_request_uses_extension(request: &Value, key: &str) -> bool {
+    fn content_uses_extension(content: &Value, key: &str) -> bool {
+        match content {
+            Value::Array(blocks) => blocks
+                .iter()
+                .any(|block| content_uses_extension(block, key)),
+            Value::Object(block) => {
+                block.contains_key(key)
+                    || block
+                        .get("content")
+                        .is_some_and(|content| content_uses_extension(content, key))
+            }
+            _ => false,
         }
-        _ => false,
     }
+
+    request.get(key).is_some()
+        || request
+            .get("system")
+            .is_some_and(|system| content_uses_extension(system, key))
+        || request
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| tools.iter().any(|tool| tool.get(key).is_some()))
+        || request
+            .get("messages")
+            .and_then(Value::as_array)
+            .is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message
+                        .get("content")
+                        .is_some_and(|content| content_uses_extension(content, key))
+                })
+            })
 }
 
 #[derive(Clone)]
@@ -1121,7 +1149,7 @@ fn gemini_interaction_request_diagnostics(request: &Value) -> Vec<String> {
         "allowed_callers",
         "eager_input_streaming",
     ] {
-        if json_contains_key(request, field) {
+        if anthropic_request_uses_extension(request, field) {
             add(&format!(
                 "Ignored Anthropic extension '{field}' while translating to Gemini Interactions"
             ));
@@ -1319,10 +1347,10 @@ fn openai_request_diagnostics(
             ));
         }
     }
-    if json_contains_key(request, "cache_control") {
+    if anthropic_request_uses_extension(request, "cache_control") {
         add("Ignored Anthropic cache_control blocks: provider caching is reported when available but cache placement is not controllable through this transport".to_string());
     }
-    if json_contains_key(request, "citations") {
+    if anthropic_request_uses_extension(request, "citations") {
         add("Ignored Anthropic citations controls: this transport cannot preserve the Anthropic citation contract".to_string());
     }
     for field in [
@@ -1331,7 +1359,7 @@ fn openai_request_diagnostics(
         "allowed_callers",
         "eager_input_streaming",
     ] {
-        if json_contains_key(request, field) {
+        if anthropic_request_uses_extension(request, field) {
             add(format!(
                 "Ignored Anthropic extension '{field}' while translating to {}",
                 transport.as_str()
@@ -1947,13 +1975,13 @@ impl InteractionServerToolTrace {
             self.steps[index] = summary;
             return;
         }
-        if self.steps.len() >= INTERACTION_SERVER_TOOL_TRACE_CAPACITY {
-            return;
-        }
         if step_type == "google_search_call" {
             self.web_search_requests = self.web_search_requests.saturating_add(1);
         } else if step_type == "url_context_call" {
             self.web_fetch_requests = self.web_fetch_requests.saturating_add(1);
+        }
+        if self.steps.len() >= INTERACTION_SERVER_TOOL_TRACE_CAPACITY {
+            return;
         }
         self.steps.push(summary);
     }

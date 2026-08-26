@@ -71,11 +71,13 @@ Anthropic Messages · Agent · MCP · tools · thinking · media
 
 供应商可能调整模型 ID、区域域名和 API 行为。仓库模板保存本项目实际验证过的配置；更新前请同时查看 [Provider 配置指南](PROVIDER_CONFIG.md) 与 [CHANGELOG](CHANGELOG.md)。
 
-通过 OpenRouter 调用 `anthropic/claude-sonnet-5` 或 `anthropic/claude-opus-5` 时，桥接器会保持成功的 Anthropic Messages 响应字节流直通，只修复文档已明确的不兼容请求：已移除的手动 thinking 会转为 adaptive thinking；旧请求未指定显示模式时会保留为摘要显示；不兼容的非默认采样字段会被省略。仅对 Opus 5，显式关闭 thinking 后仍请求 `xhigh`/`max` effort 时会降为 `high`。每项修正都会通过 `x-claude-bridge-warning` 明确报告。Anthropic/OpenRouter 归属请求头以及上游限流/追踪响应头会继续透传。OpenRouter 当前没有公开 Anthropic Token Count、Files 或 Message Batches 端点，因此 Token Count 会明确标记为 `estimated`，缺失的 API 也不会被伪造。
+通过 OpenRouter 调用 `anthropic/claude-sonnet-5` 或 `anthropic/claude-opus-5` 时，桥接器会保持成功的 Anthropic Messages 响应字节流直通，只修复文档已明确的不兼容请求：已移除的手动 thinking 会转为 adaptive thinking；旧请求未指定显示模式时会保留为摘要显示；不兼容的非默认采样字段会被省略。仅对 Opus 5，在没有 profile 强制值替换客户端设置时，显式关闭 thinking 后仍请求 `xhigh`/`max` effort 才会降为 `high`。每项修正都会通过 `x-claude-bridge-warning` 明确报告。通用 Anthropic version/beta 请求头会发往 Anthropic 兼容上游；用户 profile 与 OpenRouter 归属请求头仅发往 OpenRouter 主机；上游限流/追踪响应头会返回客户端。OpenRouter 当前没有公开 Anthropic Token Count、Files 或 Message Batches 端点，因此 Token Count 会明确标记为 `estimated`，缺失的 API 也不会被伪造。
 
 需要让某个模型覆盖 Claude Code 的进程级 effort 时，可在对应 `bridge-providers\*.json` 顶层设置
 `"reasoning_effort": "high"`（也支持 `none/minimal/low/medium/xhigh/max`）。profile 强制值优先于
-Claude 请求以及 Gemini GUI 档位；省略时保持原有行为。`capabilities.default_reasoning_effort` 仍只负责
+Claude 请求以及 Gemini GUI 档位；省略时保持原有行为。`none` 会强制关闭 thinking 并移除 budget；
+任何非 `none` 强制值也会把客户端的 `thinking.disabled` 改为 adaptive thinking，避免配置的 effort 被静默抵消。
+`capabilities.default_reasoning_effort` 仍只负责
 请求未指定档位时的默认值，`capabilities.reasoning_effort` 仍是是否发送 effort 的布尔能力开关。
 
 ### Gemini 3.7 Flash 用于本地项目开发
@@ -87,6 +89,8 @@ Claude 请求以及 Gemini GUI 档位；省略时保持原有行为。`capabilit
 本项目对 Gemini 的支持范围明确以 Interactions 和本地开发为先：不实现传统 `generateContent` transport，也不实现依赖它的显式 `cachedContents` 生命周期，而是使用 Interactions 原生有状态续接与隐式缓存。File Search store 创建、本地目录云同步、独立 Files/Batch 管理 API、Live API 会话、后台 Interaction 管理以及 Computer Use 执行器目前也不在支持范围。已经实现的 Maps、已配置 store 的 File Search 查询、Remote MCP、Flex 和 Priority 仍可通过 profile 显式启用，但它们默认关闭，也不属于本地开发核心链路的验收承诺。
 
 Gemini 隐式缓存由 Google 管理；即使重复前缀满足条件，也**不保证**每个请求都会命中。桥接器会保持有状态 `previous_interaction_id` 续接及稳定的 interaction 级配置，把上游命中数映射到 Anthropic `usage.cache_read_input_tokens`，并在 `provider_metadata.google.interaction_usage.total_cached_tokens` 保留 Google 原始计数。数值为 0 只表示 Google 没有为该请求报告命中，不能单独据此判断桥接器故障。较大的稳定前缀在较短时间内重复请求可以提高命中概率；可确定创建的显式缓存仍不属于 Interactions transport。
+
+Gemini Interactions 的 `failed` 与 `cancelled` 终态会作为错误返回，不会伪装成成功的 `end_turn`。Google Search 与 URL Context 的 Usage 统计覆盖完整 interaction，即使有界诊断 trace 只保留前 32 个不同的服务端工具步骤也不会漏计。工具调用续接映射会立即对快速客户端可见，并在终态统一持久化；磁盘 I/O 不占用全局续接锁。
 
 ### Qwen3.8 Max 推理注意事项
 
@@ -123,7 +127,9 @@ http://127.0.0.1:18787
 
 Windows 服务名为 `ClaudeCodeBridge`。安装器会备份并更新 Claude Code 的 `settings.json`，让 Claude Code 始终连接这个稳定的本地地址。安装或升级后请重新启动正在运行的 Claude Code 会话，让进程取得最新配置；在启用本地鉴权之前启动的旧会话否则可能收到 `401 Unauthorized`。
 
-安装器还会生成随机 256-bit 本地桥接令牌，将其保存在受访问控制保护的 `C:\ProgramData\ClaudeCodeBridge\local-auth-token`，并自动配置 Claude Code、模型中心、停止脚本和 `gemini-image` MCP 携带该令牌；升级时会复用已有的有效令牌。运行时硬性拒绝所有非 loopback 监听地址。`/health` 与 `/v1/models` 保持为本机公开诊断；Messages、Responses、Token Count、MCP 以及全部 `/admin/*` 路由都必须提供正确的 Bearer token。该凭据只用于验证本机调用者，绝不会被复用为 Gemini 或其他 Provider 的 API Key。
+升级时，安装器会先保存现有服务的账户、命令行、启动模式、描述、安全描述符、环境、恢复策略和运行状态。后续步骤若失败，会恢复这些服务配置；若服务是本轮失败安装新建的，则会删除该服务后再报告错误。GUI 安装还会通过 UAC 前的用户令牌取得原用户的 profile、图片、桌面和 SID，避免把 Claude 配置与快捷方式写入另一个管理员账户。只有 Setup 本身已经从提升权限的进程启动时，Inno Setup 才无法恢复原始用户令牌。
+
+安装器还会生成随机 256-bit 本地桥接令牌，将其保存在受访问控制保护的 `C:\ProgramData\ClaudeCodeBridge\local-auth-token`，并自动配置 Claude Code、模型中心、停止脚本和 `gemini-image` MCP 携带该令牌；升级时会复用已有的有效令牌。新建本地令牌、Gemini Key 与安装元数据文件时，会先设置受限 ACL，再写入密钥字节，最后原子发布。运行时硬性拒绝所有非 loopback 监听地址。`/health` 与 `/v1/models` 保持为本机公开诊断；Messages、Responses、Token Count、MCP 以及全部 `/admin/*` 路由都必须提供正确的 Bearer token。该凭据只用于验证本机调用者，绝不会被复用为 Gemini 或其他 Provider 的 API Key。
 
 源码开发时，`scripts\start-bridge.ps1` 会依次复用显式令牌、已安装的 `C:\ProgramData\ClaudeCodeBridge\local-auth-token` 或已有开发令牌；都不存在时，会原子创建 ACL 受保护的 `target\local-auth-token`。随附的停止和测试脚本会自动解析同一令牌。只有直接启动可执行文件时，才必须通过 `GEMINI_BRIDGE_LOCAL_TOKEN` 提供至少 32 字符令牌，或用 `GEMINI_BRIDGE_LOCAL_TOKEN_FILE` 指向受保护文件；需要其他开发令牌路径时可向启动脚本传入 `-LocalTokenFile`。
 

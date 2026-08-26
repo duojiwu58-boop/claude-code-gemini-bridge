@@ -14,6 +14,8 @@ Running `ClaudeCodeBridge-<version>-Setup.exe` directly is recommended.
 4. If Gemini is desired, check "Configure Google Gemini" and enter your API Key. The installer automatically detects and prefills the Windows system proxy if present (editable; clear to use direct connection).
 5. After installation or upgrade completes, restart any running Claude Code sessions. A session started before the authentication upgrade may otherwise receive 401 Unauthorized.
 
+Upgrades snapshot the existing Windows service configuration and running state. If a later installation step fails, the installer restores that snapshot; a service created by the failed attempt is removed. GUI Setup also uses the pre-UAC user's profile, Pictures, Desktop, and SID for Claude configuration, generated images, and shortcuts. If Setup itself was launched from an already elevated process, Windows cannot provide that original-user token.
+
 The ZIP package is portable. To use it, extract the entire archive first, then double-click `Install.cmd`.
 
 Service listens on:
@@ -55,6 +57,7 @@ The installer creates a timestamped backup before modifying `settings.json`.
 It also generates a random local bridge token at:
 C:\ProgramData\ClaudeCodeBridge\local-auth-token
 Claude Code, the Model Center, shutdown scripts, and the Gemini image MCP use it automatically. A valid existing token is reused on upgrade; it is never used as an upstream provider API key.
+New local-token, Gemini-key, and install-metadata files receive restrictive ACLs before secret bytes are written, then are atomically published.
 
 For source development, `scripts\start-bridge.ps1` reuses the installed token, an explicitly configured token, or an existing development token. If none exists, it securely creates `target\local-auth-token`; bundled stop and test scripts resolve the same token automatically. A direct executable launch must set `GEMINI_BRIDGE_LOCAL_TOKEN` or `GEMINI_BRIDGE_LOCAL_TOKEN_FILE`.
 
@@ -99,6 +102,8 @@ To remove `C:\ProgramData\ClaudeCodeBridge`, delete it manually after confirming
 4. 如需 Gemini，勾选“配置 Google Gemini”，再输入 API Key。安装器会自动检测并预填 Windows 系统代理，用户可以修改；清空代理表示直连。
 5. 安装或升级成功后，重新启动正在运行的 Claude Code 会话。在启用本地鉴权之前启动的旧会话否则可能收到 401 Unauthorized。
 
+升级前会保存现有 Windows 服务配置与运行状态；后续步骤若失败，安装器会恢复该快照，本轮失败安装新建的服务则会被删除。GUI 安装还会使用 UAC 前用户的 profile、图片、桌面与 SID 来定位 Claude 配置、生成图片和快捷方式。若 Setup 本身从已经提升权限的进程启动，Windows 无法再提供该原始用户令牌。
+
 ZIP 是便携发布包，需要使用时请先完整解压，再双击 Install.cmd。
 
 服务会监听：
@@ -133,6 +138,7 @@ Claude Code 配置：
 C:\ProgramData\ClaudeCodeBridge\local-auth-token
 Claude Code、模型中心、停止脚本和 Gemini 生图 MCP 会自动使用该令牌，无需手工复制。
 升级时会复用已有的有效令牌；该令牌绝不会被用作上游 Provider API Key。
+新建本地令牌、Gemini Key 与安装元数据文件时，会先设置受限 ACL，再写入密钥字节，最后原子发布。
 
 源码开发时，`scripts\start-bridge.ps1` 会复用安装令牌、显式配置的令牌或已有开发令牌；都不存在时，会安全创建 `target\local-auth-token`。随附的停止和测试脚本会自动解析同一令牌。若直接启动可执行文件，则必须设置 `GEMINI_BRIDGE_LOCAL_TOKEN` 或 `GEMINI_BRIDGE_LOCAL_TOKEN_FILE`。
 

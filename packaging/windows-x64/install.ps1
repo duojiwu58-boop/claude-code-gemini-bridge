@@ -284,6 +284,126 @@ function Write-Utf8TextAtomically {
     }
 }
 
+function Write-ProtectedUtf8TextAtomically {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+        [Parameter(Mandatory)]
+        [string]$Contents,
+        [Parameter(Mandatory)]
+        [Security.AccessControl.FileSecurity]$Acl
+    )
+    $temporaryPath = "$Path.tmp-$PID-$([Guid]::NewGuid().ToString('N'))"
+    $stream = $null
+    try {
+        $stream = [System.IO.FileStream]::new(
+            $temporaryPath,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None
+        )
+        Set-Acl -LiteralPath $temporaryPath -AclObject $Acl
+        $bytes = $utf8NoBom.GetBytes($Contents)
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+        $stream.Dispose()
+        $stream = $null
+        Move-Item -LiteralPath $temporaryPath -Destination $Path -Force
+    }
+    finally {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+        if ([System.IO.File]::Exists($temporaryPath)) {
+            [System.IO.File]::Delete($temporaryPath)
+        }
+    }
+}
+
+function Restore-ManagedServiceConfiguration {
+    param(
+        [AllowNull()]
+        [pscustomobject]$Snapshot,
+        [bool]$CreatedByThisRun
+    )
+
+    Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+    if ($CreatedByThisRun) {
+        & sc.exe delete $serviceName | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "删除安装失败后创建的服务失败，sc.exe 返回 $LASTEXITCODE。"
+        }
+        return
+    }
+    if ($null -eq $Snapshot) {
+        return
+    }
+
+    & sc.exe config $serviceName binPath= $Snapshot.ImagePath | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "恢复服务程序路径失败，sc.exe 返回 $LASTEXITCODE。"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Snapshot.ObjectName)) {
+        & sc.exe config $serviceName obj= $Snapshot.ObjectName | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "恢复服务账户失败，sc.exe 返回 $LASTEXITCODE。"
+        }
+    }
+    $startMode = switch ($Snapshot.Start) {
+        2 {
+            if ($Snapshot.DelayedAutoStart) { 'delayed-auto' } else { 'auto' }
+        }
+        3 { 'demand' }
+        4 { 'disabled' }
+        default { 'demand' }
+    }
+    & sc.exe config $serviceName start= $startMode | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "恢复服务启动类型失败，sc.exe 返回 $LASTEXITCODE。"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Snapshot.DisplayName)) {
+        & sc.exe config $serviceName DisplayName= $Snapshot.DisplayName | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "恢复服务显示名称失败，sc.exe 返回 $LASTEXITCODE。"
+        }
+    }
+    & sc.exe description $serviceName ([string]$Snapshot.Description) | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "恢复服务说明失败，sc.exe 返回 $LASTEXITCODE。"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Snapshot.Sddl)) {
+        & sc.exe sdset $serviceName $Snapshot.Sddl | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "恢复服务权限失败，sc.exe 返回 $LASTEXITCODE。"
+        }
+    }
+
+    foreach ($property in @(
+        @{ Name = 'Environment'; Type = 'MultiString' }
+        @{ Name = 'FailureActions'; Type = 'Binary' }
+        @{ Name = 'FailureActionsOnNonCrashFailures'; Type = 'DWord' }
+    )) {
+        $snapshotProperty = $Snapshot.Registry.PSObject.Properties[$property.Name]
+        if ($null -eq $snapshotProperty) {
+            Remove-ItemProperty `
+                -LiteralPath $serviceRegistry `
+                -Name $property.Name `
+                -ErrorAction SilentlyContinue
+        }
+        else {
+            New-ItemProperty `
+                -LiteralPath $serviceRegistry `
+                -Name $property.Name `
+                -PropertyType $property.Type `
+                -Value $snapshotProperty.Value `
+                -Force | Out-Null
+        }
+    }
+    if ($Snapshot.WasRunning) {
+        Start-Service -Name $serviceName
+    }
+}
+
 if ($Port -ne 18787) {
     throw '当前 GUI 发布版固定使用端口 18787。'
 }
@@ -426,6 +546,30 @@ if (-not [string]::IsNullOrWhiteSpace($ProxyUrl)) {
 }
 
 $existingService = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+$serviceRollback = $null
+$serviceCreatedByThisRun = $false
+if ($null -ne $existingService) {
+    $existingServiceRegistry = Get-ItemProperty -LiteralPath $serviceRegistry
+    $existingServiceSddlOutput = & sc.exe sdshow $serviceName
+    if ($LASTEXITCODE -ne 0) {
+        throw "读取原服务权限失败，sc.exe 返回 $LASTEXITCODE。"
+    }
+    $existingServiceSddl = $existingServiceSddlOutput |
+        Where-Object { $_ -match '^D:' } |
+        Select-Object -First 1
+    $serviceRollback = [pscustomobject]@{
+        ImagePath = [string]$existingServiceRegistry.ImagePath
+        ObjectName = [string]$existingServiceRegistry.ObjectName
+        Start = [int]$existingServiceRegistry.Start
+        DelayedAutoStart = [bool]$existingServiceRegistry.DelayedAutostart
+        DisplayName = [string]$existingService.DisplayName
+        Description = [string]$existingServiceRegistry.Description
+        Sddl = [string]$existingServiceSddl
+        Registry = $existingServiceRegistry
+        WasRunning = $existingService.Status -ne 'Stopped'
+    }
+}
+try {
 if ($null -ne $existingService -and $existingService.Status -ne 'Stopped') {
     Stop-Service -Name $serviceName -Force
     $existingService.WaitForStatus(
@@ -452,6 +596,36 @@ New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 New-Item -ItemType Directory -Path $imageDir -Force | Out-Null
 New-Item -ItemType Directory -Path $claudeDir -Force | Out-Null
 
+$currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$installUserSid = if ([string]::IsNullOrWhiteSpace($ElevationUserSid)) {
+    $currentIdentity.User
+}
+else {
+    [Security.Principal.SecurityIdentifier]::new($ElevationUserSid)
+}
+$installSecretAcl = [Security.AccessControl.FileSecurity]::new()
+$installSecretAcl.SetAccessRuleProtection($true, $false)
+foreach ($principalEntry in @(
+    @{
+        Sid = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+        Rights = [Security.AccessControl.FileSystemRights]::FullControl
+    }
+    @{
+        Sid = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+        Rights = [Security.AccessControl.FileSystemRights]::FullControl
+    }
+    @{
+        Sid = $installUserSid
+        Rights = [Security.AccessControl.FileSystemRights]::FullControl
+    }
+)) {
+    $installSecretAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+        $principalEntry.Sid,
+        $principalEntry.Rights,
+        [Security.AccessControl.AccessControlType]::Allow
+    ))
+}
+
 $localAuthToken = if (Test-Path -LiteralPath $localTokenFile -PathType Leaf) {
     [System.IO.File]::ReadAllText($localTokenFile).Trim()
 }
@@ -460,9 +634,13 @@ else {
 }
 if ($localAuthToken.Length -lt 32) {
     $localAuthToken = New-LocalAuthToken
-    Write-Utf8TextAtomically `
+    Write-ProtectedUtf8TextAtomically `
         -Path $localTokenFile `
-        -Contents "$localAuthToken`r`n"
+        -Contents "$localAuthToken`r`n" `
+        -Acl $installSecretAcl
+}
+else {
+    Set-Acl -LiteralPath $localTokenFile -AclObject $installSecretAcl
 }
 
 Copy-FileIfNeeded -Source $packageExe -Destination $serviceExe
@@ -474,45 +652,13 @@ Copy-FileIfNeeded `
     -Source (Join-Path $packageDir 'scripts\stop-bridge.ps1') `
     -Destination (Join-Path $scriptsDir 'stop-bridge.ps1')
 
-$currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
-$installUserSid = if ([string]::IsNullOrWhiteSpace($ElevationUserSid)) {
-    $currentIdentity.User
-}
-else {
-    [Security.Principal.SecurityIdentifier]::new($ElevationUserSid)
-}
 if ($configureGemini) {
     $escapedApiKey = $apiKey.Replace('\', '\\').Replace('"', '\"')
-    Write-Utf8TextAtomically `
+    Write-ProtectedUtf8TextAtomically `
         -Path $keyFile `
-        -Contents "experimental_bearer_token = `"$escapedApiKey`"`r`n"
+        -Contents "experimental_bearer_token = `"$escapedApiKey`"`r`n" `
+        -Acl $installSecretAcl
     $apiKey = $null
-
-    $keyAcl = [Security.AccessControl.FileSecurity]::new()
-    $keyAcl.SetAccessRuleProtection($true, $false)
-    $keyPrincipals = @(
-        @{
-            Sid = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
-            Rights = [Security.AccessControl.FileSystemRights]::FullControl
-        }
-        @{
-            Sid = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
-            Rights = [Security.AccessControl.FileSystemRights]::FullControl
-        }
-        @{
-            Sid = $installUserSid
-            Rights = [Security.AccessControl.FileSystemRights]::FullControl
-        }
-    )
-    foreach ($principalEntry in $keyPrincipals) {
-        $rule = [Security.AccessControl.FileSystemAccessRule]::new(
-            $principalEntry.Sid,
-            $principalEntry.Rights,
-            [Security.AccessControl.AccessControlType]::Allow
-        )
-        $keyAcl.AddAccessRule($rule)
-    }
-    Set-Acl -LiteralPath $keyFile -AclObject $keyAcl
 }
 
 $template = [System.IO.File]::ReadAllText($bridgeSettingsTemplate) | ConvertFrom-Json
@@ -612,9 +758,10 @@ $installMetadata = [pscustomobject]@{
     previous_env = $previousEnv
     installed_env = $installedEnv
 }
-Write-Utf8TextAtomically `
+Write-ProtectedUtf8TextAtomically `
     -Path $installMetadataFile `
-    -Contents ($installMetadata | ConvertTo-Json -Depth 20)
+    -Contents ($installMetadata | ConvertTo-Json -Depth 20) `
+    -Acl $installSecretAcl
 
 try {
     if (Test-Path -LiteralPath $claudeUserConfig -PathType Leaf) {
@@ -671,6 +818,7 @@ if ($null -eq $existingService) {
         -DisplayName $displayName `
         -Description 'Always-on local protocol bridge for Claude Code model providers.' `
         -StartupType Automatic | Out-Null
+    $serviceCreatedByThisRun = $true
 }
 else {
     & sc.exe config $serviceName binPath= $scBinaryPath | Out-Null
@@ -895,6 +1043,19 @@ while ([DateTime]::UtcNow -lt $deadline) {
 if (-not $healthy) {
     Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
     throw "服务已经启动，但健康检查失败：$healthUrl"
+}
+}
+catch {
+    $installFailure = $_
+    try {
+        Restore-ManagedServiceConfiguration `
+            -Snapshot $serviceRollback `
+            -CreatedByThisRun $serviceCreatedByThisRun
+    }
+    catch {
+        Write-Warning "安装失败后的服务回滚也失败：$($_.Exception.Message)"
+    }
+    throw $installFailure
 }
 
 $resolvedLegacyServiceExe = [System.IO.Path]::GetFullPath($legacyServiceExe)

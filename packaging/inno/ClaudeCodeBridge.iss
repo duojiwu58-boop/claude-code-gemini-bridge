@@ -51,6 +51,7 @@ Source: "{#SourceDir}\examples\providers\*"; DestDir: "{app}\examples\providers"
 Source: "{#SourceDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\scripts\*"; DestDir: "{app}\scripts"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceDir}\scripts\stop-bridge.ps1"; Flags: dontcopy
+Source: "{#SourceDir}\capture-original-user.ps1"; Flags: dontcopy
 
 [Icons]
 Name: "{group}\模型切换器"; Filename: "{app}\ClaudeBridgeManager.exe"; WorkingDir: "{app}"
@@ -71,10 +72,67 @@ var
   GeminiChoicePage: TInputOptionWizardPage;
   GeminiKeyPage: TInputQueryWizardPage;
   GeminiProxyPage: TInputQueryWizardPage;
+  OriginalUserProfile: String;
+  OriginalUserPictures: String;
+  OriginalUserDesktop: String;
+  OriginalUserSid: String;
 
 function WantsGemini: Boolean;
 begin
   Result := GeminiChoicePage.Values[0];
+end;
+
+function CaptureOriginalUserContext: String;
+var
+  ContextFile: String;
+  ResultCode: Integer;
+  Executed: Boolean;
+  Lines: TArrayOfString;
+begin
+  Result := '';
+  ExtractTemporaryFile('capture-original-user.ps1');
+  ContextFile := ExpandConstant('{tmp}\claude-bridge-original-user.txt');
+  if FileExists(ContextFile) then
+    DeleteFile(ContextFile);
+  try
+    Executed := ExecAsOriginalUser(
+      ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+      '-NoProfile -ExecutionPolicy Bypass -File "' +
+        ExpandConstant('{tmp}\capture-original-user.ps1') +
+        '" -OutputPath "' + ContextFile + '"',
+      ExpandConstant('{tmp}'),
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      ResultCode
+    );
+    if not Executed then
+    begin
+      Result := '无法启动原始用户信息采集程序。';
+      exit;
+    end;
+    if ResultCode <> 0 then
+    begin
+      Result :=
+        '原始用户信息采集失败，PowerShell 返回代码 ' +
+        IntToStr(ResultCode) + '。';
+      exit;
+    end;
+    if not LoadStringsFromFile(ContextFile, Lines) or (GetArrayLength(Lines) <> 4) then
+    begin
+      Result := '原始用户信息采集结果无效。';
+      exit;
+    end;
+    OriginalUserProfile := Trim(Lines[0]);
+    OriginalUserPictures := Trim(Lines[1]);
+    OriginalUserDesktop := Trim(Lines[2]);
+    OriginalUserSid := Trim(Lines[3]);
+    if (OriginalUserProfile = '') or (OriginalUserPictures = '') or
+       (OriginalUserDesktop = '') or (OriginalUserSid = '') then
+      Result := '原始用户信息采集结果不完整。';
+  finally
+    if FileExists(ContextFile) then
+      DeleteFile(ContextFile);
+  end;
 end;
 
 function ExtractProxyValue(const SettingName, ProxySetting: String): String;
@@ -203,7 +261,9 @@ var
   ResultCode: Integer;
   Executed: Boolean;
 begin
-  Result := '';
+  Result := CaptureOriginalUserContext;
+  if Result <> '' then
+    exit;
   ExtractTemporaryFile('stop-bridge.ps1');
   Executed := Exec(
     ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
@@ -222,24 +282,15 @@ begin
       IntToStr(ResultCode) + '。';
 end;
 
-function GetClaudeSettingsDir: String;
-var
-  UserProfileDir: String;
-begin
-  UserProfileDir := Trim(GetEnv('USERPROFILE'));
-  if UserProfileDir = '' then
-    UserProfileDir :=
-      ExtractFileDir(ExtractFileDir(ExpandConstant('{userappdata}')));
-  Result := AddBackslash(UserProfileDir) + '.claude';
-end;
-
 function BuildInstallParameters(const KeyFile: String): String;
 begin
   Result :=
     '-NoProfile -ExecutionPolicy Bypass -File "' +
     ExpandConstant('{app}\install.ps1') +
-    '" -ClaudeSettingsDir "' +
-    GetClaudeSettingsDir +
+    '" -ElevationUserProfile "' + OriginalUserProfile +
+    '" -ElevationUserPictures "' + OriginalUserPictures +
+    '" -ElevationUserDesktop "' + OriginalUserDesktop +
+    '" -ElevationUserSid "' + OriginalUserSid +
     '" -NonInteractive -SkipShortcuts';
 
   if WantsGemini then
