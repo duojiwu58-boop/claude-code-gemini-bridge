@@ -1171,6 +1171,110 @@ fn provider_capabilities_control_optional_openai_fields() {
 }
 
 #[test]
+fn native_provider_profile_reasoning_effort_override_is_strict_and_public() {
+    let root = env::temp_dir().join(format!(
+        "claude-bridge-reasoning-effort-override-{}",
+        Uuid::new_v4()
+    ));
+    let providers_dir = root.join("bridge-providers");
+    let settings_dir = root.join(".claude");
+    fs::create_dir_all(&providers_dir).unwrap();
+    fs::create_dir_all(&settings_dir).unwrap();
+    let profile_path = providers_dir.join("openrouter-claude.json");
+    fs::write(
+        &profile_path,
+        serde_json::to_vec_pretty(&json!({
+            "model": "anthropic/claude-sonnet-5",
+            "base_url": "https://openrouter.ai/api/v1",
+            "protocol": "anthropic",
+            "api_key": "secret",
+            "reasoning_effort": "high"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let loaded =
+        load_provider_profiles(&providers_dir, &settings_dir, "http://127.0.0.1:18787").unwrap();
+    let profile = &loaded.profiles[0];
+    assert_eq!(
+        profile
+            .openai_capabilities
+            .reasoning_effort_override
+            .as_deref(),
+        Some("high")
+    );
+    assert_eq!(
+        provider_profile_json(profile, &profile.file_name)["reasoning_effort"],
+        "high"
+    );
+
+    fs::write(
+        &profile_path,
+        serde_json::to_vec_pretty(&json!({
+            "model": "anthropic/claude-sonnet-5",
+            "base_url": "https://openrouter.ai/api/v1",
+            "protocol": "anthropic",
+            "api_key": "secret",
+            "reasoning_effort": "ultra"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let error = load_provider_profiles(&providers_dir, &settings_dir, "http://127.0.0.1:18787")
+        .err()
+        .unwrap();
+    fs::remove_dir_all(&root).unwrap();
+    assert!(error.contains("field 'reasoning_effort'"));
+    assert!(error.contains("none, minimal, low, medium, high, xhigh, or max"));
+}
+
+#[test]
+fn provider_reasoning_effort_override_wins_across_supported_transports() {
+    let client = Client::builder().build().unwrap();
+    let mut profile = test_provider_profile(client, "https://example.test/v1/messages".to_string());
+    profile.openai_capabilities.reasoning_effort_override = Some("high".to_string());
+    let original = json!({
+        "messages": [{"role": "user", "content": "Inspect this project"}],
+        "thinking": {"type": "adaptive"},
+        "output_config": {
+            "effort": "max",
+            "format": {"type": "json_schema", "schema": {"type": "object"}}
+        }
+    });
+
+    let mut native_request = original.clone();
+    let diagnostics = apply_provider_request_overrides(&profile, &mut native_request).unwrap();
+    assert_eq!(native_request["output_config"]["effort"], "high");
+    assert!(native_request["output_config"].get("format").is_some());
+    assert_eq!(diagnostics.len(), 1);
+    assert!(diagnostics[0].contains("from 'max' to 'high'"));
+
+    let signatures = RwLock::new(IndexMap::new());
+    let chat = translate_anthropic_request_with_capabilities(
+        &native_request,
+        "anthropic/claude-sonnet-5",
+        &signatures,
+        &profile.openai_capabilities,
+    )
+    .unwrap();
+    assert_eq!(chat["reasoning_effort"], "high");
+
+    profile.transport = ProviderTransport::OpenAiResponses;
+    let continuations = RwLock::new(InteractionContinuationCache::default());
+    let responses =
+        translate_anthropic_to_responses(&native_request, &profile, &continuations).unwrap();
+    assert_eq!(responses["reasoning"]["effort"], "high");
+
+    profile.openai_capabilities.reasoning_effort_override = None;
+    let mut unchanged = original.clone();
+    assert!(apply_provider_request_overrides(&profile, &mut unchanged)
+        .unwrap()
+        .is_empty());
+    assert_eq!(unchanged, original);
+}
+
+#[test]
 fn provider_parses_active_task_reasoning_replay_scope_with_legacy_fallback() {
     let scoped_profile = json!({
         "capabilities": {
@@ -1461,6 +1565,14 @@ async fn admin_gemini_thinking_level_is_hot_persisted_and_profile_scoped() {
     assert_eq!(
         load_persisted_gemini_thinking_level(&state_path).as_deref(),
         Some("low")
+    );
+
+    state.routing.write().unwrap().profiles[0]
+        .openai_capabilities
+        .reasoning_effort_override = Some("high".to_string());
+    assert_eq!(
+        effective_gemini_thinking_level(&state).unwrap().as_deref(),
+        Some("high")
     );
 
     state.routing.write().unwrap().profiles[0].transport = ProviderTransport::OpenAiChat;
@@ -4170,6 +4282,271 @@ fn forwarding_prefers_bearer_and_supplies_default_version() {
     );
     assert!(!request.headers().contains_key("anthropic-beta"));
     assert!(!request.headers().contains_key("x-dashscope-session-cache"));
+}
+
+#[test]
+fn openrouter_claude5_normalizes_removed_anthropic_parameters() {
+    let mut profile = test_provider_profile(
+        Client::builder().build().unwrap(),
+        "https://openrouter.ai/api/v1/messages".to_string(),
+    );
+    profile.base_url = "https://openrouter.ai/api".to_string();
+    profile.model = "anthropic/claude-sonnet-5".to_string();
+    profile.transport = ProviderTransport::Anthropic;
+    let mut request = json!({
+        "thinking": {
+            "type": "enabled",
+            "budget_tokens": 8192,
+            "display": "summarized"
+        },
+        "temperature": 0.2,
+        "top_p": 0.8,
+        "top_k": 40,
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+
+    let diagnostics = normalize_openrouter_claude5_request(&profile, &mut request);
+
+    assert_eq!(request["thinking"]["type"], "adaptive");
+    assert_eq!(request["thinking"]["display"], "summarized");
+    assert!(request["thinking"].get("budget_tokens").is_none());
+    assert!(request.get("temperature").is_none());
+    assert!(request.get("top_p").is_none());
+    assert!(request.get("top_k").is_none());
+    assert_eq!(diagnostics.len(), 4);
+}
+
+#[test]
+fn openrouter_claude5_preserves_accepted_defaults_and_other_profiles() {
+    let mut profile = test_provider_profile(
+        Client::builder().build().unwrap(),
+        "https://openrouter.ai/api/v1/messages".to_string(),
+    );
+    profile.base_url = "https://openrouter.ai/api".to_string();
+    profile.model = "anthropic/claude-sonnet-5".to_string();
+    profile.transport = ProviderTransport::Anthropic;
+    let accepted = json!({"temperature": 1.0, "top_p": 0.99});
+    let mut request = accepted.clone();
+    assert!(normalize_openrouter_claude5_request(&profile, &mut request).is_empty());
+    assert_eq!(request, accepted);
+
+    profile.model = "anthropic/claude-sonnet-4.6".to_string();
+    let mut older = json!({
+        "thinking": {"type": "enabled", "budget_tokens": 8192},
+        "temperature": 0.2,
+        "top_k": 40
+    });
+    let original = older.clone();
+    assert!(normalize_openrouter_claude5_request(&profile, &mut older).is_empty());
+    assert_eq!(older, original);
+}
+
+#[test]
+fn openrouter_opus5_gets_shared_normalization_and_disabled_effort_cap() {
+    let mut profile = test_provider_profile(
+        Client::builder().build().unwrap(),
+        "https://openrouter.ai/api/v1/messages".to_string(),
+    );
+    profile.base_url = "https://openrouter.ai/api".to_string();
+    profile.model = "anthropic/claude-opus-5".to_string();
+    profile.transport = ProviderTransport::Anthropic;
+    let mut legacy = json!({
+        "thinking": {"type": "enabled", "budget_tokens": 16384},
+        "temperature": 0.4,
+        "top_p": 0.8,
+        "top_k": 20
+    });
+
+    let diagnostics = normalize_openrouter_claude5_request(&profile, &mut legacy);
+
+    assert_eq!(
+        legacy["thinking"],
+        json!({"type": "adaptive", "display": "summarized"})
+    );
+    assert!(legacy.get("temperature").is_none());
+    assert!(legacy.get("top_p").is_none());
+    assert!(legacy.get("top_k").is_none());
+    assert_eq!(diagnostics.len(), 4);
+
+    let mut disabled = json!({
+        "thinking": {"type": "disabled"},
+        "output_config": {"effort": "max", "format": {"type": "json_schema", "schema": {"type": "object"}}}
+    });
+    let diagnostics = normalize_openrouter_claude5_request(&profile, &mut disabled);
+    assert_eq!(disabled["thinking"]["type"], "disabled");
+    assert_eq!(disabled["output_config"]["effort"], "high");
+    assert!(disabled["output_config"].get("format").is_some());
+    assert_eq!(diagnostics.len(), 1);
+}
+
+#[test]
+fn sonnet5_does_not_inherit_opus5_disabled_thinking_effort_cap() {
+    let mut profile = test_provider_profile(
+        Client::builder().build().unwrap(),
+        "https://openrouter.ai/api/v1/messages".to_string(),
+    );
+    profile.base_url = "https://openrouter.ai/api".to_string();
+    profile.model = "anthropic/claude-sonnet-5".to_string();
+    profile.transport = ProviderTransport::Anthropic;
+    let mut request = json!({
+        "thinking": {"type": "disabled"},
+        "output_config": {"effort": "max"}
+    });
+    let original = request.clone();
+
+    assert!(normalize_openrouter_claude5_request(&profile, &mut request).is_empty());
+    assert_eq!(request, original);
+}
+
+#[test]
+fn anthropic_forwarding_preserves_safe_native_and_openrouter_headers() {
+    let client = Client::builder().build().unwrap();
+    let mut profile = test_provider_profile(
+        client.clone(),
+        "https://openrouter.ai/api/v1/messages".to_string(),
+    );
+    profile.base_url = "https://openrouter.ai/api".to_string();
+    profile.transport = ProviderTransport::Anthropic;
+    let mut headers = HeaderMap::new();
+    headers.insert("anthropic-user-profile-id", "profile-123".parse().unwrap());
+    headers.insert("x-openrouter-metadata", "enabled".parse().unwrap());
+    headers.insert("http-referer", "https://bridge.example".parse().unwrap());
+    headers.insert("x-openrouter-title", "Claude Bridge".parse().unwrap());
+
+    let request = apply_anthropic_forward_headers(
+        client.post("https://openrouter.ai/api/v1/messages"),
+        &profile,
+        &headers,
+    )
+    .build()
+    .unwrap();
+
+    for name in [
+        "anthropic-user-profile-id",
+        "x-openrouter-metadata",
+        "http-referer",
+        "x-openrouter-title",
+    ] {
+        assert_eq!(
+            request
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok()),
+            headers.get(name).and_then(|value| value.to_str().ok()),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn openrouter_anthropic_api_key_uses_documented_bearer_auth() {
+    let client = Client::builder().build().unwrap();
+    let mut profile = test_provider_profile(
+        client.clone(),
+        "https://openrouter.ai/api/v1/messages".to_string(),
+    );
+    profile.base_url = "https://openrouter.ai/api".to_string();
+    profile.transport = ProviderTransport::Anthropic;
+    profile.auth_token = None;
+    profile.api_key = Some("openrouter-secret".to_string());
+
+    let request = apply_anthropic_forward_headers(
+        client.post("https://openrouter.ai/api/v1/messages"),
+        &profile,
+        &HeaderMap::new(),
+    )
+    .build()
+    .unwrap();
+
+    assert_eq!(
+        request
+            .headers()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer openrouter-secret")
+    );
+    assert!(!request.headers().contains_key("x-api-key"));
+}
+
+#[tokio::test]
+async fn anthropic_forwarding_preserves_upstream_rate_limit_metadata() {
+    let mock = Router::new().route(
+        "/v1/messages",
+        post(|| async {
+            let mut headers = HeaderMap::new();
+            headers.insert("request-id", "req-native-123".parse().unwrap());
+            headers.insert("retry-after", "7".parse().unwrap());
+            headers.insert(
+                "anthropic-ratelimit-requests-remaining",
+                "42".parse().unwrap(),
+            );
+            headers.insert("x-ratelimit-limit", "100".parse().unwrap());
+            headers.insert(
+                "x-openrouter-generation-id",
+                "gen-openrouter-123".parse().unwrap(),
+            );
+            (headers, Json(json!({"type": "message", "content": []})))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let mut profile = test_provider_profile(
+        Client::builder().no_proxy().build().unwrap(),
+        format!("http://{address}/v1/messages"),
+    );
+    profile.base_url = format!("http://{address}");
+    profile.transport = ProviderTransport::Anthropic;
+
+    let response = forward_anthropic_profile(
+        profile,
+        &HeaderMap::new(),
+        json!({"messages": [], "max_tokens": 1}),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    for (name, value) in [
+        ("request-id", "req-native-123"),
+        ("retry-after", "7"),
+        ("anthropic-ratelimit-requests-remaining", "42"),
+        ("x-ratelimit-limit", "100"),
+        ("x-openrouter-generation-id", "gen-openrouter-123"),
+    ] {
+        assert_eq!(
+            response
+                .headers()
+                .get(name)
+                .and_then(|header| header.to_str().ok()),
+            Some(value),
+            "{name}"
+        );
+    }
+    server.abort();
+}
+
+#[test]
+fn model_listing_uses_active_profile_and_known_claude5_limits() {
+    let mut profile = test_provider_profile(
+        Client::builder().build().unwrap(),
+        "https://openrouter.ai/api/v1/messages".to_string(),
+    );
+    profile.base_url = "https://openrouter.ai/api".to_string();
+    profile.model = "anthropic/claude-sonnet-5".to_string();
+    profile.context_window = None;
+
+    let listing = models_response_value("gemini-3.7-flash", Some(&profile));
+
+    assert_eq!(listing["data"][0]["id"], "anthropic/claude-sonnet-5");
+    assert_eq!(listing["data"][0]["upstream_model"], profile.model);
+    assert_eq!(listing["data"][0]["context_window"], 1_000_000);
+    assert_eq!(listing["data"][0]["max_output_tokens"], 128_000);
+
+    profile.model = "anthropic/claude-opus-5".to_string();
+    let listing = models_response_value("gemini-3.7-flash", Some(&profile));
+    assert_eq!(listing["data"][0]["id"], "anthropic/claude-opus-5");
+    assert_eq!(listing["data"][0]["context_window"], 1_000_000);
+    assert_eq!(listing["data"][0]["max_output_tokens"], 128_000);
 }
 
 #[test]

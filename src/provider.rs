@@ -112,6 +112,32 @@ fn profile_u64(
     Ok(None)
 }
 
+fn profile_reasoning_effort_override(
+    object: &Map<String, Value>,
+    file_name: &str,
+) -> Result<Option<String>, String> {
+    for name in ["reasoning_effort", "reasoningEffort"] {
+        if let Some(value) = object.get(name) {
+            let effort = value
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "Provider profile '{file_name}' field '{name}' must be a non-empty string"
+                    )
+                })?;
+            if !is_reasoning_effort(effort) {
+                return Err(format!(
+                    "Provider profile '{file_name}' field '{name}' must be none, minimal, low, medium, high, xhigh, or max"
+                ));
+            }
+            return Ok(Some(effort.to_string()));
+        }
+    }
+    Ok(None)
+}
+
 fn parse_vision_config(
     profile: &Map<String, Value>,
     file_name: &str,
@@ -875,6 +901,7 @@ fn parse_openai_capabilities_with_defaults(
             file_name,
         )?,
         default_reasoning_effort,
+        reasoning_effort_override: defaults.reasoning_effort_override,
         reasoning_effort_map,
         reasoning_replay_scope,
         gemini_thinking_level_override: None,
@@ -1106,8 +1133,17 @@ fn load_native_provider_profiles(
             }
             ProviderTransport::Anthropic => OpenAiCapabilities::for_anthropic_base_url(&base_url),
         };
-        let openai_capabilities =
+        let mut openai_capabilities =
             parse_openai_capabilities_with_defaults(object, &file_name, capability_defaults)?;
+        openai_capabilities.reasoning_effort_override =
+            profile_reasoning_effort_override(object, &file_name)?;
+        if openai_capabilities.reasoning_effort_override.is_some()
+            && !openai_capabilities.reasoning_effort
+        {
+            return Err(format!(
+                "Provider profile '{file_name}' cannot set top-level 'reasoning_effort' while capability 'reasoning_effort' is false"
+            ));
+        }
         let vision = parse_vision_config(object, &file_name)?;
         if transport == ProviderTransport::LocalGemini
             && normalize_base_url(&base_url) != normalize_base_url(local_bridge_base_url)

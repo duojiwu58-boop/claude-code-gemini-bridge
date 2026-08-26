@@ -9,6 +9,10 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 
 ## [Unreleased]
 
+- Added a validated top-level Provider `reasoning_effort` override. A model profile can now replace Claude Code's process-wide/request effort across native Anthropic, OpenAI Chat, OpenAI Responses, Gemini Interactions, and local Gemini while preserving the existing default-only and capability-switch semantics. Profile overrides also outrank the Gemini GUI level; absent fields remain strict no-ops.
+- Added first-class OpenRouter Anthropic handling for Claude Sonnet 5 and Opus 5: OpenRouter API keys use documented Bearer authentication; removed manual thinking is converted to adaptive thinking with summarized display when unspecified; incompatible non-default sampling fields are omitted with explicit bridge warnings. Opus 5 additionally caps `xhigh`/`max` effort at `high` when thinking is disabled, without changing Sonnet 5 or other models.
+- Preserved Anthropic user-profile/OpenRouter attribution request headers plus upstream rate-limit and tracing response headers. `/v1/models` now identifies the active profile model and reports both Claude 5 models' official 1M context and 128k output limits instead of a stale bridge default. OpenRouter token counting remains explicitly estimated because its current Anthropic API exposes no native count endpoint. The locked Rust suite now contains 197 passing tests.
+
 ## [v0.7.2] - 2026-08-27
 
 ### Local Security and Reliability Remediation
@@ -313,6 +317,10 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 ## 中文
 
 ## [未发布]
+
+- 新增经过严格校验的 Provider 顶层 `reasoning_effort` 强制值。单个模型 profile 现在可以在原生 Anthropic、OpenAI Chat、OpenAI Responses、Gemini Interactions 与本地 Gemini 路径中覆盖 Claude Code 的进程级/请求 effort，同时保留既有“仅兜底默认值”和“能力开关”语义。profile 强制值也高于 Gemini GUI 档位；未配置时严格保持原行为。
+- 新增 OpenRouter Claude Sonnet 5 与 Opus 5 的原生 Anthropic 适配：OpenRouter API Key 按官方方式使用 Bearer 鉴权；已移除的手动 thinking 会转换为 adaptive thinking，未指定显示模式时保留摘要显示；不兼容的非默认采样字段会在给出明确桥接警告后省略。仅 Opus 5 在关闭 thinking 时会把 `xhigh`/`max` effort 限制为 `high`，Sonnet 5 与其他模型保持不变。
+- 保留 Anthropic 用户 profile/OpenRouter 归属请求头及上游限流、追踪响应头。`/v1/models` 现在使用活动 profile 的真实模型 ID，并报告两个 Claude 5 模型官方 1M 上下文与 128k 输出上限，不再显示过期的桥接默认模型。由于 OpenRouter 当前 Anthropic API 没有原生计数端点，Token Count 仍明确标记为估算。锁定 Rust 回归现为 197 项且全部通过。
 
 ## [v0.7.2] - 2026-08-27
 

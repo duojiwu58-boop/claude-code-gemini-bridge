@@ -65,11 +65,21 @@ Anthropic Messages · agent · MCP · tools · thinking · media
 | **DeepSeek V4 Flash** | `anthropic` | Minimal translation of the Claude Code contract; Anthropic and Chat routes provide disabled/high/max reasoning modes and keep 16K budgets at high; Chat omits ordinary reasoning only in tool-free requests and fully replays it whenever `tools` are present, as required by the API | Stateless `openai-responses`, OpenAI Chat, Vision Proxy |
 | **Qwen3.8 Max** | `anthropic` | Three effective Anthropic/Chat reasoning modes (`low/medium/xhigh`) with bounded normal-turn budgets instead of permanent maximum reasoning; exact Responses continuation, seven-level native effort, session cache, usage and latency observability | Stateful `openai-responses`, OpenAI Chat |
 | **Kimi K3** | `anthropic` | Bearer authentication, verified `kimi-k3` model ID, 1M context metadata, native token estimate, and cache usage; Chat fallback maps Kimi effort, reasoning replay, and structured output | OpenAI Chat and explicitly enabled Kimi Formula MCP tools |
+| **Claude Sonnet 5 / Opus 5 through OpenRouter** | `anthropic` | Native Messages/SSE pass-through, signed adaptive thinking, strict/parallel tools, prompt caching, structured output, image/PDF input, web search/fetch, OpenRouter Bearer auth, and 1M/128k model metadata | OpenRouter extensions remain upstream-dependent |
 | **Other compatible models** | Provider-dependent | Anthropic pass-through or the generic OpenAI Chat/Responses semantic core, with differences declared through `capabilities` | Depth depends on the upstream API |
 
 “Callable” is not the same as “deeply adapted.” Priority models are reviewed against their provider API contracts and covered by request/response fixtures for reasoning, tools, streaming, usage, and continuation. Generic providers receive only the capabilities proven by their actual fields and explicit configuration.
 
 Providers may change model IDs, regional domains, and API behavior. Repository templates record configurations verified by this project; check the [Provider configuration guide](PROVIDER_CONFIG.md) and [changelog](CHANGELOG.md) before upgrading.
+
+For `anthropic/claude-sonnet-5` and `anthropic/claude-opus-5` on OpenRouter, the bridge keeps successful Anthropic Messages responses as byte streams and only repairs documented request incompatibilities. Removed manual thinking becomes adaptive thinking with summarized display when the legacy request did not choose a display mode; unsupported non-default sampling fields are omitted. Opus 5 alone also caps `xhigh`/`max` effort at `high` when thinking is explicitly disabled. Every compatibility edit is reported through `x-claude-bridge-warning`. Native/OpenRouter attribution headers and upstream rate-limit/tracing headers are preserved. OpenRouter does not currently expose Anthropic Token Count, Files, or Message Batches endpoints, so token counting remains explicitly marked as `estimated`, and those missing APIs are not emulated.
+
+To override Claude Code's process-wide effort for one model, set top-level
+`"reasoning_effort": "high"` in that `bridge-providers\*.json` file (the other accepted values are
+`none`, `minimal`, `low`, `medium`, `xhigh`, and `max`). The profile override wins over the incoming
+Claude request and the Gemini GUI level; omitting it preserves existing behavior.
+`capabilities.default_reasoning_effort` remains a fallback only, while the boolean
+`capabilities.reasoning_effort` still controls whether effort is sent at all.
 
 ### Gemini 3.7 Flash for local project development
 

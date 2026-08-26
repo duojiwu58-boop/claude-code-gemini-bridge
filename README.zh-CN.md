@@ -64,11 +64,19 @@ Anthropic Messages · Agent · MCP · tools · thinking · media
 | **DeepSeek V4 Flash** | `anthropic` | 最少转换保留 Claude Code 协议；Anthropic 与 Chat 路径提供 disabled/high/max 三态推理并让 16K budget 保持 high；Chat 仅在请求完全不携带工具时省略普通推理，携带 `tools` 时按 API 契约完整回放全部推理 | 无状态 `openai-responses`、OpenAI Chat、Vision Proxy |
 | **Qwen3.8 Max** | `anthropic` | Anthropic/Chat 提供真正可区分的 `low/medium/xhigh` 三档并限制普通轮次预算，避免常驻最大推理；Responses 支持七档原生 effort、精确续接、会话缓存及 Usage/延迟观测 | 有状态 `openai-responses`、OpenAI Chat |
 | **Kimi K3** | `anthropic` | Bearer 鉴权、`kimi-k3`、1M 上下文元数据、原生 Token Estimate、缓存 Usage；Chat 路径支持 Kimi effort、推理回放和结构化输出 | OpenAI Chat、显式启用的 Kimi Formula MCP 工具 |
+| **OpenRouter Claude Sonnet 5 / Opus 5** | `anthropic` | 原生 Messages/SSE 直通、带签名的 adaptive thinking、严格/并行工具、提示缓存、结构化输出、图片/PDF、网页搜索/抓取、OpenRouter Bearer 鉴权及 1M/128k 模型元数据 | OpenRouter 扩展能力取决于上游 |
 | **其他兼容模型** | 视供应商而定 | Anthropic 直通或通用 OpenAI Chat/Responses 语义核心；可通过 `capabilities` 声明差异 | 能力完整度取决于上游 API |
 
 “可调用”不等于“深度适配”。重点模型会按供应商 API 契约审核，并用请求/响应 fixture 覆盖推理、工具、流式、Usage 和续接行为；其他兼容 Provider 则以它真实提供的字段和显式能力配置为准。
 
 供应商可能调整模型 ID、区域域名和 API 行为。仓库模板保存本项目实际验证过的配置；更新前请同时查看 [Provider 配置指南](PROVIDER_CONFIG.md) 与 [CHANGELOG](CHANGELOG.md)。
+
+通过 OpenRouter 调用 `anthropic/claude-sonnet-5` 或 `anthropic/claude-opus-5` 时，桥接器会保持成功的 Anthropic Messages 响应字节流直通，只修复文档已明确的不兼容请求：已移除的手动 thinking 会转为 adaptive thinking；旧请求未指定显示模式时会保留为摘要显示；不兼容的非默认采样字段会被省略。仅对 Opus 5，显式关闭 thinking 后仍请求 `xhigh`/`max` effort 时会降为 `high`。每项修正都会通过 `x-claude-bridge-warning` 明确报告。Anthropic/OpenRouter 归属请求头以及上游限流/追踪响应头会继续透传。OpenRouter 当前没有公开 Anthropic Token Count、Files 或 Message Batches 端点，因此 Token Count 会明确标记为 `estimated`，缺失的 API 也不会被伪造。
+
+需要让某个模型覆盖 Claude Code 的进程级 effort 时，可在对应 `bridge-providers\*.json` 顶层设置
+`"reasoning_effort": "high"`（也支持 `none/minimal/low/medium/xhigh/max`）。profile 强制值优先于
+Claude 请求以及 Gemini GUI 档位；省略时保持原有行为。`capabilities.default_reasoning_effort` 仍只负责
+请求未指定档位时的默认值，`capabilities.reasoning_effort` 仍是是否发送 effort 的布尔能力开关。
 
 ### Gemini 3.7 Flash 用于本地项目开发
 

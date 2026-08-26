@@ -107,6 +107,45 @@ async fn responses(
         .into_response()
 }
 
+fn apply_provider_request_overrides(
+    profile: &ProviderProfile,
+    request: &mut Value,
+) -> Result<Vec<String>, String> {
+    let Some(effort) = profile
+        .openai_capabilities
+        .reasoning_effort_override
+        .as_deref()
+    else {
+        return Ok(Vec::new());
+    };
+    let request = request
+        .as_object_mut()
+        .ok_or_else(|| "Anthropic request body must be a JSON object".to_string())?;
+    let output_config = request
+        .entry("output_config".to_string())
+        .or_insert_with(|| json!({}));
+    let output_config = output_config
+        .as_object_mut()
+        .ok_or_else(|| "Anthropic field 'output_config' must be an object".to_string())?;
+    let previous = output_config
+        .get("effort")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if previous.as_deref() == Some(effort) {
+        return Ok(Vec::new());
+    }
+    output_config.insert("effort".to_string(), json!(effort));
+    let diagnostic = match previous {
+        Some(previous) => format!(
+            "Provider profile overrode Anthropic output_config.effort from '{previous}' to '{effort}'"
+        ),
+        None => format!(
+            "Provider profile set Anthropic output_config.effort to '{effort}'"
+        ),
+    };
+    Ok(vec![diagnostic])
+}
+
 async fn anthropic_messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -119,6 +158,17 @@ async fn anthropic_messages(
             "No active provider profile",
         );
     };
+    let request_override_diagnostics =
+        match apply_provider_request_overrides(&active_profile, &mut request) {
+            Ok(diagnostics) => diagnostics,
+            Err(message) => {
+                return anthropic_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    &message,
+                );
+            }
+        };
     if let Some(identity) = upstream_identity_label(&active_profile, &state.model) {
         if let Err(message) = append_bridge_identity(&mut request, &identity) {
             return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message);
@@ -135,21 +185,27 @@ async fn anthropic_messages(
     let local_capabilities = active_profile.openai_capabilities.clone();
     match active_profile.transport {
         ProviderTransport::Anthropic => {
-            let diagnostics = match active_profile.openai_capabilities.chat_dialect {
+            let mut diagnostics = request_override_diagnostics;
+            diagnostics.extend(match active_profile.openai_capabilities.chat_dialect {
                 OpenAiChatDialect::DeepSeek => deepseek_anthropic_reasoning_diagnostics(&request),
                 OpenAiChatDialect::Qwen => qwen_anthropic_reasoning_diagnostics(&request),
                 _ => Vec::new(),
-            };
+            });
+            diagnostics.extend(normalize_openrouter_claude5_request(
+                &active_profile,
+                &mut request,
+            ));
             let provider_file = active_profile.file_name.clone();
             let response = forward_anthropic_profile(active_profile, &headers, request).await;
             return attach_bridge_diagnostics(response, &provider_file, &diagnostics);
         }
         ProviderTransport::OpenAiChat => {
-            let diagnostics = openai_request_diagnostics(
+            let mut diagnostics = request_override_diagnostics;
+            diagnostics.extend(openai_request_diagnostics(
                 &request,
                 &active_profile.openai_capabilities,
                 ProviderTransport::OpenAiChat,
-            );
+            ));
             let provider_file = active_profile.file_name.clone();
             let response =
                 forward_openai_profile(active_profile, request, state.thought_signatures.clone())
@@ -157,11 +213,12 @@ async fn anthropic_messages(
             return attach_bridge_diagnostics(response, &provider_file, &diagnostics);
         }
         ProviderTransport::OpenAiResponses => {
-            let diagnostics = openai_request_diagnostics(
+            let mut diagnostics = request_override_diagnostics;
+            diagnostics.extend(openai_request_diagnostics(
                 &request,
                 &active_profile.openai_capabilities,
                 ProviderTransport::OpenAiResponses,
-            );
+            ));
             let provider_file = active_profile.file_name.clone();
             let response = forward_openai_responses_profile(
                 active_profile,
@@ -173,18 +230,24 @@ async fn anthropic_messages(
         }
         ProviderTransport::GeminiInteractions => {
             let mut active_profile = active_profile;
-            match current_gemini_thinking_level(&state) {
-                Ok(level) => {
-                    active_profile
-                        .openai_capabilities
-                        .gemini_thinking_level_override = level;
-                }
-                Err(message) => {
-                    return anthropic_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "api_error",
-                        &message,
-                    );
+            if active_profile
+                .openai_capabilities
+                .reasoning_effort_override
+                .is_none()
+            {
+                match current_gemini_thinking_level(&state) {
+                    Ok(level) => {
+                        active_profile
+                            .openai_capabilities
+                            .gemini_thinking_level_override = level;
+                    }
+                    Err(message) => {
+                        return anthropic_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "api_error",
+                            &message,
+                        );
+                    }
                 }
             }
             if let Err(message) =
@@ -192,7 +255,8 @@ async fn anthropic_messages(
             {
                 return anthropic_error(StatusCode::UNAUTHORIZED, "authentication_error", &message);
             }
-            let mut diagnostics = gemini_interaction_request_diagnostics(&request);
+            let mut diagnostics = request_override_diagnostics;
+            diagnostics.extend(gemini_interaction_request_diagnostics(&request));
             if let Some(diagnostic) = gemini_interaction_pdf_tool_diagnostic(
                 &request,
                 &active_profile.openai_capabilities,
@@ -325,6 +389,113 @@ async fn anthropic_messages(
 fn is_claude_identity(identity: &str) -> bool {
     let identity = identity.to_ascii_lowercase();
     identity.contains("claude") || identity.contains("anthropic")
+}
+
+fn is_openrouter_profile(profile: &ProviderProfile) -> bool {
+    url::Url::parse(&profile.base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "openrouter.ai" || host.ends_with(".openrouter.ai"))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Claude5Model {
+    Sonnet,
+    Opus,
+}
+
+fn claude_5_model(model: &str) -> Option<Claude5Model> {
+    let model = display_model_name(model);
+    match model.rsplit('/').next().unwrap_or(&model).to_ascii_lowercase().as_str() {
+        "claude-sonnet-5" => Some(Claude5Model::Sonnet),
+        "claude-opus-5" => Some(Claude5Model::Opus),
+        _ => None,
+    }
+}
+
+fn normalize_openrouter_claude5_request(
+    profile: &ProviderProfile,
+    request: &mut Value,
+) -> Vec<String> {
+    if profile.transport != ProviderTransport::Anthropic || !is_openrouter_profile(profile) {
+        return Vec::new();
+    }
+    let Some(model) = claude_5_model(&profile.model) else {
+        return Vec::new();
+    };
+    let Some(object) = request.as_object_mut() else {
+        return Vec::new();
+    };
+    let mut diagnostics = Vec::new();
+    if let Some(thinking) = object.get_mut("thinking").and_then(Value::as_object_mut) {
+        if thinking.get("type").and_then(Value::as_str) == Some("enabled") {
+            thinking.insert("type".to_string(), json!("adaptive"));
+            thinking.remove("budget_tokens");
+            thinking
+                .entry("display".to_string())
+                .or_insert_with(|| json!("summarized"));
+            diagnostics.push(
+                "Converted removed Claude 5 manual thinking to adaptive thinking; budget_tokens is not supported"
+                    .to_string(),
+            );
+        }
+    }
+    if object
+        .get("temperature")
+        .and_then(Value::as_f64)
+        .is_some_and(|value| value != 1.0)
+    {
+        object.remove("temperature");
+        diagnostics.push(
+            "Removed non-default temperature because Claude 5 models accept only temperature=1.0"
+                .to_string(),
+        );
+    }
+    if object
+        .get("top_p")
+        .and_then(Value::as_f64)
+        .is_some_and(|value| value < 0.99)
+    {
+        object.remove("top_p");
+        diagnostics.push(
+            "Removed top_p below 0.99 because Claude 5 models reject non-default top_p"
+                .to_string(),
+        );
+    }
+    if object.remove("top_k").is_some() {
+        diagnostics.push(
+            "Removed top_k because Claude 5 models do not accept that parameter".to_string(),
+        );
+    }
+    let thinking_disabled = object
+        .get("thinking")
+        .and_then(Value::as_object)
+        .and_then(|thinking| thinking.get("type"))
+        .and_then(Value::as_str)
+        == Some("disabled");
+    let conflicting_effort = (model == Claude5Model::Opus && thinking_disabled)
+        .then(|| {
+            object
+                .get("output_config")
+                .and_then(Value::as_object)
+                .and_then(|output_config| output_config.get("effort"))
+                .and_then(Value::as_str)
+                .filter(|effort| matches!(*effort, "xhigh" | "max"))
+                .map(str::to_owned)
+        })
+        .flatten();
+    if let Some(effort) = conflicting_effort {
+        if let Some(output_config) = object
+            .get_mut("output_config")
+            .and_then(Value::as_object_mut)
+        {
+            output_config.insert("effort".to_string(), json!("high"));
+            diagnostics.push(format!(
+                "Reduced Claude Opus 5 effort from '{effort}' to 'high' because thinking is disabled"
+            ));
+        }
+    }
+    diagnostics
 }
 
 async fn forward_anthropic_profile(
@@ -470,6 +641,12 @@ async fn forward_anthropic_profile(
         .or_else(|| upstream.headers().get("x-request-id"))
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
+    let forwarded_headers = upstream
+        .headers()
+        .iter()
+        .filter(|(name, _)| should_forward_anthropic_response_header(name.as_str()))
+        .map(|(name, value)| (name.as_str().to_string(), value.as_bytes().to_vec()))
+        .collect::<Vec<_>>();
     // The response body owns the reqwest stream. If Claude Code disconnects,
     // Hyper drops this body and the upstream response stream with it, which
     // cancels further socket reads. The client-wide timeout also bounds
@@ -481,6 +658,9 @@ async fn forward_anthropic_profile(
         .header("cache-control", "no-cache");
     if let Some(request_id) = request_id {
         builder = builder.header("request-id", request_id);
+    }
+    for (name, value) in forwarded_headers {
+        builder = builder.header(name, value);
     }
     builder.body(body).unwrap_or_else(|err| {
         anthropic_error(
@@ -499,7 +679,11 @@ fn apply_anthropic_forward_headers(
     if let Some(token) = &profile.auth_token {
         upstream_request = upstream_request.bearer_auth(token);
     } else if let Some(api_key) = &profile.api_key {
-        upstream_request = upstream_request.header("x-api-key", api_key);
+        upstream_request = if is_openrouter_profile(profile) {
+            upstream_request.bearer_auth(api_key)
+        } else {
+            upstream_request.header("x-api-key", api_key)
+        };
     }
     let anthropic_version = client_headers
         .get("anthropic-version")
@@ -512,8 +696,25 @@ fn apply_anthropic_forward_headers(
     {
         upstream_request = upstream_request.header("anthropic-beta", value);
     }
+    for name in [
+        "anthropic-user-profile-id",
+        "x-openrouter-metadata",
+        "http-referer",
+        "x-openrouter-title",
+    ] {
+        if let Some(value) = client_headers.get(name).and_then(|value| value.to_str().ok()) {
+            upstream_request = upstream_request.header(name, value);
+        }
+    }
     if profile.openai_capabilities.responses_session_cache {
         upstream_request = upstream_request.header("x-dashscope-session-cache", "enable");
     }
     upstream_request
+}
+
+fn should_forward_anthropic_response_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("retry-after")
+        || name.starts_with("anthropic-ratelimit-")
+        || name.starts_with("x-ratelimit-")
+        || name.starts_with("x-openrouter-")
 }

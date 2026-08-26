@@ -47,6 +47,54 @@
 `/chat/completions`。如果供应商给出的不是 SDK 基地址，或网关路径比较特殊，
 请用 `endpoint` 填写完整的 Chat Completions 请求地址。
 
+## OpenRouter Claude Sonnet 5 / Opus 5 原生 Anthropic 配置
+
+OpenRouter 提供 Anthropic Messages 入口时，应直接使用 `protocol: anthropic`，避免先降为
+Chat Completions 再重建工具、Thinking 与 SSE 生命周期：
+
+```json
+{
+  "name": "OpenRouter Claude Sonnet 5",
+  "model": "anthropic/claude-sonnet-5",
+  "base_url": "https://openrouter.ai/api",
+  "protocol": "anthropic",
+  "api_key": "你的 OpenRouter API Key",
+  "reasoning_effort": "high",
+  "context_window": 1000000
+}
+```
+
+Opus 5 使用同一配置，只需把 `name` 和 `model` 分别改为 `OpenRouter Claude Opus 5` 与
+`anthropic/claude-opus-5`。
+
+顶层 `reasoning_effort` 是可选的模型级强制值，可取 `none`、`minimal`、`low`、`medium`、
+`high`、`xhigh` 或 `max`。例如上面的 `high` 会覆盖 Claude Code 进程级
+`CLAUDE_CODE_EFFORT_LEVEL=max` 所产生的请求值，只影响切换到这个 profile 后的新请求；删除该字段
+则继续采用 Claude Code 请求值。它不同于 `capabilities.default_reasoning_effort`：后者只在请求没有
+指定 effort 时兜底。也不同于布尔值 `capabilities.reasoning_effort`：后者用于关闭上游 effort 字段；
+两者不能同时配置为“顶层有值、能力关闭”。
+
+桥接器会按 OpenRouter 文档使用 Bearer 鉴权，并保留 `anthropic-version`、`anthropic-beta`、
+`anthropic-user-profile-id`、`X-OpenRouter-Metadata`、`HTTP-Referer` 与
+`X-OpenRouter-Title` 等安全请求头；`retry-after`、Anthropic/OpenRouter 限流与追踪响应头也会
+返回给本地客户端。`/v1/models` 使用活动 profile 的真实模型 ID；Sonnet 5 和 Opus 5 在
+profile 未写 `context_window` 时仍会报告官方 1,000,000-token 上下文和 128,000-token 最大输出。
+
+Sonnet 5 和 Opus 5 已移除 `thinking:{"type":"enabled","budget_tokens":...}`。桥接器仅在
+OpenRouter 的这两个精确模型 ID 上将旧配置改为 `thinking:{"type":"adaptive"}`；已有
+`display` 会保留，未提供时则设为 `summarized`，避免旧客户端丢失可见的 thinking 摘要。
+`temperature != 1.0`、`top_p < 0.99` 和任意 `top_k` 也会被省略。Opus 5 还有一条独立约束：
+显式 `thinking:{"type":"disabled"}` 时，`xhigh`/`max` effort 会降为 `high`；Sonnet 5 不应用
+这项限制。所有兼容修正都会通过 `x-claude-bridge-warning` 报告；已接受的默认值及其他模型保持原样。
+
+实测可用的核心能力包括文本/流式输出、带签名的 adaptive thinking、严格与并行客户端工具、
+工具结果续接、结构化输出、图片/PDF、显式提示缓存、Web Search/Web Fetch，以及 context
+management/compaction 请求包络。当前 OpenRouter OpenAPI 没有 Anthropic
+`/v1/messages/count_tokens`、Files 或 Message Batches 端点，因此本地 Token Count 会以
+`x-claude-bridge-token-count: estimated` 明确标识估算来源，桥接器不会伪造 Files/Batch。
+Anthropic Code Execution 服务端工具及“用户提供文档”的 citation metadata 也不应从邻近能力
+推断为可用；这些仍取决于 OpenRouter 上游实现。
+
 ## DeepSeek / Qwen 推荐配置与 Responses
 
 DeepSeek V4 Flash 与 Qwen3.8-Max 的推荐默认配置是厂商原生 Anthropic Messages transport：
@@ -128,11 +176,12 @@ DeepSeek 服务端执行（实测：模型发出 `server_tool_use`，API 返回
 `web_search_*` 服务端工具冒充为客户端 function；需要上游 Responses 原生搜索时，
 应在确认供应商支持后通过 `capabilities.responses_builtin_tools` 显式启用。
 
-若希望 Claude Code 对 DeepSeek 默认请求最高 effort，应在 Claude Code 自己的
+若希望 Claude Code 对所有模型默认请求最高 effort，应在 Claude Code 自己的
 `%USERPROFILE%\.claude\settings.json` 中设置 `env.CLAUDE_CODE_EFFORT_LEVEL` 为 `max`；
 安装器使用的 `claude-settings.bridge.json` 模板已采用该值。它是客户端进程级全局设置，
-不是 DeepSeek Provider JSON 字段，因此也会影响同一 Claude Code 进程切换到的其他模型；
-修改后需要重启正在运行的 Claude Code 会话。
+因此会影响同一 Claude Code 进程切换到的所有模型，修改后需要重启正在运行的会话。
+若只希望某个 Provider 使用固定档位，应在对应 Provider JSON 顶层设置
+`reasoning_effort`；profile 值优先于客户端全局值，并可在 GUI“刷新”后从下一次请求生效。
 
 Chat fallback 的历史回放遵循 DeepSeek 工具契约：不携带 `tools` 且历史中没有工具调用时，普通
 assistant Thinking 不进入后续 Chat 上下文；只要当前请求携带 `tools`，全部历史
@@ -277,7 +326,8 @@ Gemini 3.7 Flash 的输入窗口为 1,048,576 tokens、最大输出为 65,536 to
 模型中心为活动的 Gemini 3.7 Flash Interactions profile 提供“低 / 中 / 高”即时选择。该值写入
 `bridge-state.json`，切换后从下一次请求生效，无需重启；它的优先级高于 Claude 请求携带的
 `output_config.effort`、`thinking.budget_tokens` 以及 profile 的 `default_reasoning_effort`。
-因此 GUI 选择表示明确的全局强制档位，而 profile 字段仍是未设置 GUI override 时的默认值。
+若 profile 顶层设置了 `reasoning_effort`，该模型级强制值再覆盖 GUI 档位；未设置时保持现有 GUI
+行为。完整优先级为：profile 顶层强制值 > Gemini GUI 值 > Claude 请求/全局值 > profile 默认值。
 
 此 transport 默认发送 `store: true`；可用 `gemini_store: false` 关闭 Google 服务端存储，
 同时禁用 `previous_interaction_id` 续接。首轮成功后，普通多轮按完整消息前缀指纹、
@@ -387,6 +437,7 @@ Google 文本 annotations 则原样保存在
   "api_key": "sk-...",
   "auth_scheme": "bearer",
   "context_window": 1048576,
+  "reasoning_effort": "high",
   "protocol": "openai",
   "endpoint": "https://provider.example/v1/chat/completions",
   "identity": "模型对外说明的真实身份",
@@ -438,10 +489,15 @@ Google 文本 annotations 则原样保存在
 - `endpoint`：可选，完整请求地址；设置后不会根据 `base_url`推导。
 - `identity`：可选，告诉下游模型它在此路由中的真实身份；默认使用模型 ID。
 - `identity_override`：可选，默认 `true`。设为 `false` 可关闭身份提示适配。
-- `auth_scheme`：可选，`bearer` 或 `x-api-key`。OpenAI transport 默认 `bearer`，Anthropic
-  transport 默认 `x-api-key`；Kimi 官方 Anthropic endpoint 应显式使用 `bearer`。百炼工作区
+- `auth_scheme`：可选，`bearer` 或 `x-api-key`。OpenAI transport 默认 `bearer`，普通 Anthropic
+  transport 默认 `x-api-key`；OpenRouter Anthropic profile 会自动使用官方 Bearer 形式，Kimi
+  官方 Anthropic endpoint 应显式使用 `bearer`。百炼工作区
   Anthropic endpoint 若对 `x-api-key` 返回 401，可显式改为 `bearer` 重试。
 - `context_window`：可选正整数，记录上游上下文窗口并通过管理 API 与 `/v1/models` 暴露。
+- `reasoning_effort`：可选的 profile 级强制推理档位，可取 `none`、`minimal`、`low`、`medium`、
+  `high`、`xhigh` 或 `max`。它覆盖 Claude 请求和 Gemini GUI 的档位，并复用各 transport 的既有
+  映射；省略时严格保持原行为。该字段只控制发给上游的推理强度，不能覆盖 Claude Code 客户端的
+  上下文窗口、自动压缩阈值或代理编排。管理 API 会在 profile 顶层返回有效值。
 - `proxy`：可选，仅用于这个 Provider；省略表示直连。
 - `enabled`：可选，默认 `true`。设为 `false` 后保留文件但不显示该配置。
 - `vision`：可选，默认 `{"mode":"native"}`，即图片仍由当前 Provider 原生处理。

@@ -6,6 +6,7 @@ fn provider_profile_json(profile: &ProviderProfile, active_file: &str) -> Value 
         "source": profile.source.as_str(),
         "model": profile.model,
         "context_window": profile.context_window,
+        "reasoning_effort": profile.openai_capabilities.reasoning_effort_override,
         "upstream_identity": profile.upstream_identity,
         "identity_override": profile.identity_override,
         "base_url": profile.base_url,
@@ -40,6 +41,14 @@ fn effective_gemini_thinking_level(state: &AppState) -> Result<Option<String>, S
     else {
         return Ok(None);
     };
+    if let Some(level) = profile
+        .openai_capabilities
+        .reasoning_effort_override
+        .as_deref()
+    {
+        return Ok(normalize_gemini_thinking_level(level, "gemini-3.7-flash")
+            .map(str::to_owned));
+    }
     if let Some(level) = current_gemini_thinking_level(state)? {
         return Ok(Some(level));
     }
@@ -562,16 +571,29 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
 
 async fn models(State(state): State<Arc<AppState>>) -> Json<Value> {
     let active_profile = active_provider_profile(&state);
-    Json(json!({
+    Json(models_response_value(&state.model, active_profile.as_ref()))
+}
+
+fn models_response_value(local_model: &str, active_profile: Option<&ProviderProfile>) -> Value {
+    let model = active_profile
+        .map(|profile| profile.model.as_str())
+        .unwrap_or(local_model);
+    let known_limits = claude_5_model(model).map(|_| (1_000_000_u64, 128_000_u64));
+    let context_window = active_profile
+        .and_then(|profile| profile.context_window)
+        .or_else(|| known_limits.map(|limits| limits.0));
+    let max_output_tokens = known_limits.map(|limits| limits.1);
+    json!({
         "object": "list",
         "models": [],
         "data": [{
-            "id": state.model,
+            "id": model,
             "object": "model",
             "created": 0,
             "owned_by": "claude-bridge",
             "upstream_model": active_profile.as_ref().map(|profile| profile.model.clone()),
-            "context_window": active_profile.as_ref().and_then(|profile| profile.context_window)
+            "context_window": context_window,
+            "max_output_tokens": max_output_tokens
         }]
-    }))
+    })
 }
