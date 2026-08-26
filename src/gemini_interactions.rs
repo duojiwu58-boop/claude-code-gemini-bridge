@@ -2,6 +2,120 @@ fn interaction_call_cache_key(profile_file: &str, call_id: &str) -> String {
     format!("{profile_file}\0{call_id}")
 }
 
+fn interaction_continuation_state_path(bridge_state_path: &Path) -> PathBuf {
+    bridge_state_path.with_file_name("interaction-continuations.json")
+}
+
+fn load_interaction_continuation_cache(state_path: &Path) -> InteractionContinuationCache {
+    let mut cache = InteractionContinuationCache {
+        persistence_path: Some(state_path.to_path_buf()),
+        ..InteractionContinuationCache::default()
+    };
+    let contents = match fs::read_to_string(state_path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return cache,
+        Err(err) => {
+            warn!(
+                "Cannot read Gemini interaction continuation state '{}': {err}",
+                state_path.display()
+            );
+            return cache;
+        }
+    };
+    let value = match serde_json::from_str::<Value>(&contents) {
+        Ok(value) => value,
+        Err(err) => {
+            warn!(
+                "Cannot parse Gemini interaction continuation state '{}': {err}",
+                state_path.display()
+            );
+            return cache;
+        }
+    };
+    if let Some(calls) = value.get("calls").and_then(Value::as_array) {
+        for call in calls.iter().rev().take(INTERACTION_CONTINUATION_CAPACITY).rev() {
+            let Some(key) = call.get("key").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(interaction_id) = call.get("interaction_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(name) = call.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            if key.is_empty() || interaction_id.is_empty() || name.is_empty() {
+                continue;
+            }
+            cache.calls.insert(
+                key.to_string(),
+                InteractionCallContinuation {
+                    interaction_id: interaction_id.to_string(),
+                    name: name.to_string(),
+                },
+            );
+        }
+    }
+    if let Some(transcripts) = value.get("transcripts").and_then(Value::as_array) {
+        for transcript in transcripts
+            .iter()
+            .rev()
+            .take(INTERACTION_CONTINUATION_CAPACITY)
+            .rev()
+        {
+            let Some(key) = transcript.get("key").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(interaction_id) = transcript.get("interaction_id").and_then(Value::as_str)
+            else {
+                continue;
+            };
+            if key.is_empty() || interaction_id.is_empty() {
+                continue;
+            }
+            cache
+                .transcripts
+                .insert(key.to_string(), interaction_id.to_string());
+        }
+    }
+    cache
+}
+
+fn persist_interaction_continuation_cache(cache: &InteractionContinuationCache) {
+    let Some(state_path) = cache.persistence_path.as_deref() else {
+        return;
+    };
+    let calls = cache
+        .calls
+        .iter()
+        .map(|(key, continuation)| {
+            json!({
+                "key": key,
+                "interaction_id": continuation.interaction_id,
+                "name": continuation.name
+            })
+        })
+        .collect::<Vec<_>>();
+    let transcripts = cache
+        .transcripts
+        .iter()
+        .map(|(key, interaction_id)| {
+            json!({
+                "key": key,
+                "interaction_id": interaction_id
+            })
+        })
+        .collect::<Vec<_>>();
+    let contents = json!({
+        "version": 1,
+        "calls": calls,
+        "transcripts": transcripts
+    })
+    .to_string();
+    if let Err(err) = write_state_atomically(state_path, &contents) {
+        warn!("{err}");
+    }
+}
+
 fn interaction_transcript_cache_key(
     profile_file: &str,
     system: Option<&Value>,
@@ -56,6 +170,7 @@ fn remember_interaction_calls(
         );
     }
     evict_interaction_cache(&mut cache);
+    persist_interaction_continuation_cache(&cache);
 }
 
 fn remember_interaction_continuation(
@@ -96,6 +211,7 @@ fn remember_interaction_continuation(
         );
     }
     evict_interaction_cache(&mut cache);
+    persist_interaction_continuation_cache(&cache);
 }
 
 fn interaction_content_from_anthropic(part: &Value) -> Option<Value> {
@@ -161,12 +277,23 @@ fn interaction_content_from_anthropic(part: &Value) -> Option<Value> {
     }
 }
 
-fn interaction_tool_result_value(content: &Value, max_chars: Option<u64>) -> Value {
+struct InteractionToolResultTranslation {
+    result: Value,
+    documents: Vec<Value>,
+}
+
+fn interaction_tool_result_value(
+    content: &Value,
+    max_chars: Option<u64>,
+) -> InteractionToolResultTranslation {
     if let Some(parts) = content.as_array() {
         let translated: Vec<Value> = parts
             .iter()
             .filter_map(interaction_content_from_anthropic)
             .collect();
+        let (documents, translated): (Vec<_>, Vec<_>) = translated
+            .into_iter()
+            .partition(|part| part.get("type").and_then(Value::as_str) == Some("document"));
         if !translated.is_empty() {
             let combined_text = translated
                 .iter()
@@ -180,9 +307,21 @@ fn interaction_tool_result_value(content: &Value, max_chars: Option<u64>) -> Val
                 bounded.extend(translated.into_iter().filter(|part| {
                     part.get("type").and_then(Value::as_str) != Some("text")
                 }));
-                return Value::Array(bounded);
+                return InteractionToolResultTranslation {
+                    result: Value::Array(bounded),
+                    documents,
+                };
             }
-            return Value::Array(translated);
+            return InteractionToolResultTranslation {
+                result: Value::Array(translated),
+                documents,
+            };
+        }
+        if !documents.is_empty() {
+            return InteractionToolResultTranslation {
+                result: json!("Document attached in the following user input."),
+                documents,
+            };
         }
     }
     let text = if let Some(text) = content.as_str() {
@@ -190,7 +329,10 @@ fn interaction_tool_result_value(content: &Value, max_chars: Option<u64>) -> Val
     } else {
         value_to_text(content)
     };
-    Value::String(bound_tool_result_text(text, max_chars))
+    InteractionToolResultTranslation {
+        result: Value::String(bound_tool_result_text(text, max_chars)),
+        documents: Vec::new(),
+    }
 }
 
 fn is_legacy_interaction_tool_call_text(text: &str) -> bool {
@@ -238,16 +380,18 @@ fn interaction_user_steps(
                         "An earlier {name} operation produced this {status}. It is historical context:"
                     )
                 }));
-                match interaction_tool_result_value(
+                let translated_result = interaction_tool_result_value(
                     part.get("content").unwrap_or(&Value::Null),
                     max_tool_result_chars,
-                ) {
+                );
+                match translated_result.result {
                     Value::Array(result_content) => user_content.extend(result_content),
                     Value::String(text) if !text.is_empty() => {
                         user_content.push(json!({"type": "text", "text": text}));
                     }
                     _ => {}
                 }
+                user_content.extend(translated_result.documents);
                 continue;
             }
             if !user_content.is_empty() {
@@ -256,16 +400,23 @@ fn interaction_user_steps(
                     "content": std::mem::take(&mut user_content)
                 }));
             }
+            let translated_result = interaction_tool_result_value(
+                part.get("content").unwrap_or(&Value::Null),
+                max_tool_result_chars,
+            );
             steps.push(json!({
                 "type": "function_result",
                 "call_id": call_id,
                 "name": name,
                 "is_error": part.get("is_error").and_then(Value::as_bool).unwrap_or(false),
-                "result": interaction_tool_result_value(
-                    part.get("content").unwrap_or(&Value::Null),
-                    max_tool_result_chars
-                )
+                "result": translated_result.result
             }));
+            if !translated_result.documents.is_empty() {
+                steps.push(json!({
+                    "type": "user_input",
+                    "content": translated_result.documents
+                }));
+            }
         } else if let Some(translated) = interaction_content_from_anthropic(part) {
             user_content.push(translated);
         }
@@ -391,6 +542,34 @@ fn interaction_messages_have_tool_history(messages: &[Value]) -> bool {
     })
 }
 
+fn interaction_message_shapes(messages: &[Value]) -> String {
+    messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            let role = message
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let content = match message.get("content") {
+                Some(Value::String(_)) => "text".to_string(),
+                Some(Value::Array(parts)) => parts
+                    .iter()
+                    .map(|part| {
+                        part.get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("+"),
+                _ => "unsupported".to_string(),
+            };
+            format!("{index}:{role}:{content}")
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn interaction_tool_names_from_messages(messages: &[Value]) -> HashMap<String, String> {
     let mut names = HashMap::new();
     for message in messages {
@@ -467,18 +646,23 @@ fn translated_interaction_tools(request: &Value, capabilities: &OpenAiCapabiliti
             translated.push(translated_tool);
         }
     }
-    translated.extend(
-        capabilities
-            .gemini_builtin_tools
-            .iter()
-            .map(|tool| json!({"type": tool})),
-    );
+    translated.extend(capabilities.gemini_builtin_tools.iter().cloned());
     if !capabilities.gemini_file_search_store_names.is_empty() {
-        translated.push(json!({
-            "type": "file_search",
-            "file_search_store_names": capabilities.gemini_file_search_store_names
-        }));
+        if let Some(file_search) = translated.iter_mut().find(|tool| {
+            tool.get("type").and_then(Value::as_str) == Some("file_search")
+        }) {
+            if file_search.get("file_search_store_names").is_none() {
+                file_search["file_search_store_names"] =
+                    json!(capabilities.gemini_file_search_store_names);
+            }
+        } else {
+            translated.push(json!({
+                "type": "file_search",
+                "file_search_store_names": capabilities.gemini_file_search_store_names
+            }));
+        }
     }
+    translated.extend(capabilities.gemini_remote_mcp_servers.iter().cloned());
     translated
 }
 
@@ -597,11 +781,16 @@ fn interaction_response_format(request: &Value) -> Result<Option<Value>, String>
     })))
 }
 
-fn interaction_service_tier(request: &Value) -> Option<&'static str> {
-    match request.get("service_tier").and_then(Value::as_str) {
-        Some("standard_only") => Some("standard"),
-        _ => None,
-    }
+fn interaction_service_tier(
+    request: &Value,
+    capabilities: &OpenAiCapabilities,
+) -> Option<String> {
+    capabilities.gemini_service_tier.clone().or_else(|| {
+        match request.get("service_tier").and_then(Value::as_str) {
+            Some("standard_only") => Some("standard".to_string()),
+            _ => None,
+        }
+    })
 }
 
 fn json_contains_key(value: &Value, key: &str) -> bool {
@@ -612,6 +801,175 @@ fn json_contains_key(value: &Value, key: &str) -> bool {
         }
         _ => false,
     }
+}
+
+#[derive(Clone)]
+struct PendingInteractionToolCall {
+    id: String,
+    name: String,
+    input: Value,
+}
+
+struct RepeatedInteractionToolLoop {
+    repeats: usize,
+    names: Vec<String>,
+}
+
+fn interaction_request_has_source_navigation_tools(request: &Value) -> bool {
+    request
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .any(|name| {
+            name.eq_ignore_ascii_case("Read")
+                || name.eq_ignore_ascii_case("Grep")
+                || name.eq_ignore_ascii_case("Glob")
+        })
+}
+
+fn canonical_json_value(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(values.iter().map(canonical_json_value).collect()),
+        Value::Object(object) => {
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            let mut canonical = Map::new();
+            for key in keys {
+                canonical.insert(key.clone(), canonical_json_value(&object[key]));
+            }
+            Value::Object(canonical)
+        }
+        _ => value.clone(),
+    }
+}
+
+fn repeated_interaction_tool_loop(messages: &[Value]) -> Option<RepeatedInteractionToolLoop> {
+    let mut pending_calls = Vec::<PendingInteractionToolCall>::new();
+    let mut pending_results = HashMap::<String, (Value, bool)>::new();
+    let mut completed_cycles = Vec::<(Vec<u8>, Vec<String>)>::new();
+
+    for message in messages {
+        match message.get("role").and_then(Value::as_str) {
+            Some("assistant") => {
+                let parts = message.get("content").and_then(Value::as_array);
+                let calls = parts
+                    .into_iter()
+                    .flatten()
+                    .filter(|part| {
+                        part.get("type").and_then(Value::as_str) == Some("tool_use")
+                    })
+                    .filter_map(|part| {
+                        Some(PendingInteractionToolCall {
+                            id: part.get("id")?.as_str()?.to_string(),
+                            name: part.get("name")?.as_str()?.to_string(),
+                            input: part.get("input").cloned().unwrap_or_else(|| json!({})),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if calls.is_empty() {
+                    let has_final_text = parts.into_iter().flatten().any(|part| {
+                        part.get("type").and_then(Value::as_str) == Some("text")
+                            && part
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .is_some_and(|text| !text.is_empty())
+                    });
+                    if has_final_text {
+                        pending_calls.clear();
+                        pending_results.clear();
+                        completed_cycles.clear();
+                    }
+                } else {
+                    if !pending_calls.is_empty() {
+                        completed_cycles.clear();
+                    }
+                    pending_calls = calls;
+                    pending_results.clear();
+                }
+            }
+            Some("user") => {
+                let results = message
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(|part| {
+                        part.get("type").and_then(Value::as_str) == Some("tool_result")
+                    })
+                    .filter_map(|part| {
+                        Some((
+                            part.get("tool_use_id")?.as_str()?.to_string(),
+                            part.get("content").cloned().unwrap_or(Value::Null),
+                            part.get("is_error")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                if results.is_empty() {
+                    if !pending_calls.is_empty() || !completed_cycles.is_empty() {
+                        pending_calls.clear();
+                        pending_results.clear();
+                        completed_cycles.clear();
+                    }
+                    continue;
+                }
+                if pending_calls.is_empty() {
+                    completed_cycles.clear();
+                    continue;
+                }
+                for (call_id, result, is_error) in results {
+                    if pending_calls.iter().any(|call| call.id == call_id) {
+                        pending_results.insert(call_id, (result, is_error));
+                    }
+                }
+                if pending_calls
+                    .iter()
+                    .all(|call| pending_results.contains_key(&call.id))
+                {
+                    let cycle = pending_calls
+                        .iter()
+                        .map(|call| {
+                            let (result, is_error) = &pending_results[&call.id];
+                            json!({
+                                "name": call.name,
+                                "input": canonical_json_value(&call.input),
+                                "result": canonical_json_value(result),
+                                "is_error": is_error
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let fingerprint = serde_json::to_vec(&cycle).ok()?;
+                    let names = pending_calls
+                        .iter()
+                        .map(|call| call.name.clone())
+                        .collect();
+                    completed_cycles.push((fingerprint, names));
+                    pending_calls.clear();
+                    pending_results.clear();
+                }
+            }
+            Some("system") => {}
+            _ => {
+                pending_calls.clear();
+                pending_results.clear();
+                completed_cycles.clear();
+            }
+        }
+    }
+
+    let (latest, names) = completed_cycles.last()?;
+    let repeats = completed_cycles
+        .iter()
+        .rev()
+        .take_while(|(fingerprint, _)| fingerprint == latest)
+        .count();
+    (repeats >= 3).then(|| RepeatedInteractionToolLoop {
+        repeats,
+        names: names.clone(),
+    })
 }
 
 fn gemini_interaction_request_diagnostics(request: &Value) -> Vec<String> {
@@ -693,6 +1051,17 @@ fn gemini_interaction_request_diagnostics(request: &Value) -> Vec<String> {
                 "Ignored Anthropic extension '{field}' while translating to Gemini Interactions"
             ));
         }
+    }
+    if let Some(repeated) = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .and_then(|messages| repeated_interaction_tool_loop(messages))
+    {
+        add(&format!(
+            "Stopped a repeated Gemini tool loop after {} identical completed cycles ({}) and forced a final no-tools turn",
+            repeated.repeats,
+            repeated.names.join(", ")
+        ));
     }
     diagnostics
 }
@@ -1040,22 +1409,44 @@ fn openai_request_diagnostics(
     diagnostics
 }
 
+struct InteractionRequestContinuation {
+    previous_id: String,
+    tool_names: HashMap<String, String>,
+    input_start: usize,
+    kind: &'static str,
+}
+
+fn trailing_interaction_input_start(messages: &[Value]) -> Option<usize> {
+    let mut start = messages.len();
+    let mut has_user = false;
+    while start > 0 {
+        match messages[start - 1].get("role").and_then(Value::as_str) {
+            Some("user") => {
+                has_user = true;
+                start -= 1;
+            }
+            Some("system") => start -= 1,
+            _ => break,
+        }
+    }
+    has_user.then_some(start)
+}
+
 fn interaction_continuation_for_request(
     profile_file: &str,
     request: &Value,
     messages: &[Value],
     continuations: &InteractionContinuationState,
-) -> Option<(String, HashMap<String, String>, &'static str)> {
-    let last = messages.last()?;
-    if last.get("role").and_then(Value::as_str) != Some("user") {
-        return None;
-    }
+) -> Option<InteractionRequestContinuation> {
+    let input_start = trailing_interaction_input_start(messages)?;
     let mut result_ids = Vec::new();
-    if let Some(parts) = last.get("content").and_then(Value::as_array) {
-        for part in parts {
-            if part.get("type").and_then(Value::as_str) == Some("tool_result") {
-                if let Some(call_id) = part.get("tool_use_id").and_then(Value::as_str) {
-                    result_ids.push(call_id.to_string());
+    for message in &messages[input_start..] {
+        if let Some(parts) = message.get("content").and_then(Value::as_array) {
+            for part in parts {
+                if part.get("type").and_then(Value::as_str) == Some("tool_result") {
+                    if let Some(call_id) = part.get("tool_use_id").and_then(Value::as_str) {
+                        result_ids.push(call_id.to_string());
+                    }
                 }
             }
         }
@@ -1085,22 +1476,50 @@ fn interaction_continuation_for_request(
         }
         if complete {
             if let Some(id) = interaction_id {
-                return Some((id, names, "tool_call_id"));
+                return Some(InteractionRequestContinuation {
+                    previous_id: id,
+                    tool_names: names,
+                    input_start,
+                    kind: "tool_call_id",
+                });
             }
         }
     }
-    if messages.len() <= 1 {
+    if input_start == 0 {
         return None;
     }
-    let previous_messages = &messages[..messages.len() - 1];
+    let previous_messages = &messages[..input_start];
     let key =
         interaction_transcript_cache_key(profile_file, request.get("system"), previous_messages);
     let names = interaction_tool_names_from_messages(previous_messages);
-    cache
+    let transcript = cache
         .transcripts
         .get(&key)
         .cloned()
-        .map(|id| (id, names, "transcript"))
+        .map(|id| InteractionRequestContinuation {
+            previous_id: id,
+            tool_names: names,
+            input_start,
+            kind: "transcript",
+        });
+    if transcript.is_none() && !result_ids.is_empty() {
+        let cached_results = result_ids
+            .iter()
+            .filter(|call_id| {
+                cache
+                    .calls
+                    .contains_key(&interaction_call_cache_key(profile_file, call_id))
+            })
+            .count();
+        warn!(
+            provider = profile_file,
+            result_count = result_ids.len(),
+            cached_results,
+            result_ids = %result_ids.join(","),
+            "Could not select a stored interaction for trailing tool results"
+        );
+    }
+    transcript
 }
 
 fn translate_gemini_interactions_request(
@@ -1136,7 +1555,8 @@ fn translate_gemini_interactions_request_with_continuation(
                 .to_string(),
         );
     }
-    let continuation = allow_continuation
+    let store_interaction = profile.openai_capabilities.gemini_store;
+    let continuation = (allow_continuation && store_interaction)
         .then(|| {
             interaction_continuation_for_request(
                 &profile.file_name,
@@ -1146,18 +1566,32 @@ fn translate_gemini_interactions_request_with_continuation(
             )
         })
         .flatten();
+    if allow_continuation
+        && store_interaction
+        && continuation.is_none()
+        && interaction_messages_have_tool_history(messages)
+    {
+        warn!(
+            provider = %profile.file_name,
+            shapes = %interaction_message_shapes(messages),
+            "Stored Gemini continuation was not selected for a request with tool history"
+        );
+    }
     let text_tool_history =
         continuation.is_none() && interaction_messages_have_tool_history(messages);
-    let input = if let Some((_, tool_names, _)) = &continuation {
-        interaction_user_steps(
-            messages
-                .last()
-                .and_then(|message| message.get("content"))
-                .unwrap_or(&Value::Null),
-            tool_names,
-            false,
-            profile.openai_capabilities.max_tool_result_chars,
-        )
+    let input = if let Some(continuation) = &continuation {
+        messages[continuation.input_start..]
+            .iter()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+            .flat_map(|message| {
+                interaction_user_steps(
+                    message.get("content").unwrap_or(&Value::Null),
+                    &continuation.tool_names,
+                    false,
+                    profile.openai_capabilities.max_tool_result_chars,
+                )
+            })
+            .collect()
     } else {
         interaction_steps_from_messages(
             messages,
@@ -1170,7 +1604,17 @@ fn translate_gemini_interactions_request_with_continuation(
     }
 
     let mut generation_config = Map::new();
-    if let Some(max_tokens) = request.get("max_tokens").and_then(Value::as_u64) {
+    let repeated_tool_loop = repeated_interaction_tool_loop(messages);
+    if let Some(max_tokens) = request
+        .get("max_tokens")
+        .and_then(Value::as_u64)
+        .map(|requested| {
+            profile
+                .openai_capabilities
+                .max_output_tokens
+                .map_or(requested, |limit| requested.min(limit))
+        })
+    {
         generation_config.insert("max_output_tokens".to_string(), json!(max_tokens));
     }
     if let Some(stop_sequences) = request.get("stop_sequences").and_then(Value::as_array) {
@@ -1196,8 +1640,26 @@ fn translate_gemini_interactions_request_with_continuation(
             "none"
         }),
     );
-    if let Some(choice) = request.get("tool_choice").and_then(interaction_tool_choice) {
-        generation_config.insert("tool_choice".to_string(), choice);
+    let tools = translated_interaction_tools(request, &profile.openai_capabilities);
+    if !tools.is_empty() {
+        let tool_choice = profile
+            .openai_capabilities
+            .gemini_tool_choice_override
+            .as_ref()
+            .map(|choice| json!(choice))
+            .or_else(|| request.get("tool_choice").and_then(interaction_tool_choice));
+        if let Some(choice) = tool_choice {
+            generation_config.insert("tool_choice".to_string(), choice);
+        }
+    }
+    if let Some(repeated) = &repeated_tool_loop {
+        generation_config.insert("tool_choice".to_string(), json!("none"));
+        warn!(
+            provider = %profile.file_name,
+            repeats = repeated.repeats,
+            tools = %repeated.names.join(","),
+            "Stopped repeated Gemini tool loop and forced a final no-tools turn"
+        );
     }
 
     let mut body = Map::new();
@@ -1206,7 +1668,7 @@ fn translate_gemini_interactions_request_with_continuation(
         json!(display_model_name(&profile.model)),
     );
     body.insert("input".to_string(), Value::Array(input));
-    body.insert("store".to_string(), Value::Bool(true));
+    body.insert("store".to_string(), Value::Bool(store_interaction));
     body.insert(
         "stream".to_string(),
         Value::Bool(
@@ -1223,31 +1685,58 @@ fn translate_gemini_interactions_request_with_continuation(
     if let Some(response_format) = interaction_response_format(request)? {
         body.insert("response_format".to_string(), response_format);
     }
-    if let Some(service_tier) = interaction_service_tier(request) {
+    if let Some(service_tier) =
+        interaction_service_tier(request, &profile.openai_capabilities)
+    {
         body.insert("service_tier".to_string(), json!(service_tier));
     }
-    let tools = translated_interaction_tools(request, &profile.openai_capabilities);
     if !tools.is_empty() {
         body.insert("tools".to_string(), Value::Array(tools));
     }
-    if let Some((previous_id, _, continuation_kind)) = continuation {
+    if let Some(continuation) = continuation {
         info!(
             provider = %profile.file_name,
-            continuation = continuation_kind,
+            continuation = continuation.kind,
             "Continuing stored Gemini interaction"
         );
-        body.insert("previous_interaction_id".to_string(), json!(previous_id));
-    } else {
-        let mut system = value_to_text(request.get("system").unwrap_or(&Value::Null));
-        if text_tool_history {
-            if !system.is_empty() {
-                system.push_str("\n\n");
-            }
-            system.push_str(INTERACTION_TOOL_HISTORY_RECOVERY_INSTRUCTION);
+        body.insert(
+            "previous_interaction_id".to_string(),
+            json!(continuation.previous_id),
+        );
+    }
+    let mut system = value_to_text(request.get("system").unwrap_or(&Value::Null));
+    for message in messages.iter().filter(|message| {
+        message.get("role").and_then(Value::as_str) == Some("system")
+    }) {
+        let message_text = value_to_text(message.get("content").unwrap_or(&Value::Null));
+        if message_text.is_empty() {
+            continue;
         }
         if !system.is_empty() {
-            body.insert("system_instruction".to_string(), json!(system));
+            system.push_str("\n\n");
         }
+        system.push_str(&message_text);
+    }
+    if text_tool_history {
+        if !system.is_empty() {
+            system.push_str("\n\n");
+        }
+        system.push_str(INTERACTION_TOOL_HISTORY_RECOVERY_INSTRUCTION);
+    }
+    if interaction_request_has_source_navigation_tools(request) {
+        if !system.is_empty() {
+            system.push_str("\n\n");
+        }
+        system.push_str(INTERACTION_SOURCE_NAVIGATION_COACH_INSTRUCTION);
+    }
+    if repeated_tool_loop.is_some() {
+        if !system.is_empty() {
+            system.push_str("\n\n");
+        }
+        system.push_str(INTERACTION_REPEATED_TOOL_LOOP_INSTRUCTION);
+    }
+    if !system.is_empty() {
+        body.insert("system_instruction".to_string(), json!(system));
     }
     Ok(Value::Object(body))
 }
@@ -1284,8 +1773,8 @@ fn is_mixed_interaction_tools_error(status: u16, message: &str) -> bool {
         || (message.contains("built-in tool") && message.contains("function"))
 }
 
-fn is_interaction_continuation_not_implemented(status: u16, request: &Value) -> bool {
-    status == 501 && request.get("previous_interaction_id").is_some()
+fn is_interaction_continuation_unavailable(status: u16, request: &Value) -> bool {
+    matches!(status, 404 | 410 | 501) && request.get("previous_interaction_id").is_some()
 }
 
 struct InteractionResponseTranslation {
@@ -1338,9 +1827,6 @@ impl InteractionServerToolTrace {
             self.steps[index] = summary;
             return;
         }
-        if self.steps.len() >= INTERACTION_SERVER_TOOL_TRACE_CAPACITY {
-            return;
-        }
         if step_type == "google_search_call" {
             self.web_search_requests = self.web_search_requests.saturating_add(1);
         } else if step_type == "url_context_call" {
@@ -1349,14 +1835,35 @@ impl InteractionServerToolTrace {
         self.steps.push(summary);
     }
 
-    fn provider_metadata(&self) -> Option<Value> {
-        (!self.steps.is_empty()).then(|| {
-            json!({
-                "google": {
-                    "interaction_server_tools": self.steps
-                }
-            })
-        })
+    fn provider_metadata(
+        &self,
+        interaction_usage: &Value,
+        interaction_annotations: &[Value],
+        service_tier: Option<&str>,
+    ) -> Option<Value> {
+        let mut google = Map::new();
+        if !self.steps.is_empty() {
+            google.insert(
+                "interaction_server_tools".to_string(),
+                Value::Array(self.steps.clone()),
+            );
+        }
+        if interaction_usage
+            .as_object()
+            .is_some_and(|usage| !usage.is_empty())
+        {
+            google.insert("interaction_usage".to_string(), interaction_usage.clone());
+        }
+        if !interaction_annotations.is_empty() {
+            google.insert(
+                "interaction_annotations".to_string(),
+                Value::Array(interaction_annotations.to_vec()),
+            );
+        }
+        if let Some(service_tier) = service_tier.filter(|value| !value.is_empty()) {
+            google.insert("service_tier".to_string(), json!(service_tier));
+        }
+        (!google.is_empty()).then(|| json!({"google": google}))
     }
 
     fn anthropic_usage(&self) -> Option<Value> {
@@ -1379,40 +1886,8 @@ fn interaction_server_tool_trace_key(step: &Value) -> Option<String> {
     Some(format!("{step_type}\0{id}"))
 }
 
-fn bounded_interaction_trace_value(value: &Value) -> Value {
-    let serialized = serde_json::to_string(value).unwrap_or_default();
-    if serialized.chars().count() <= INTERACTION_SERVER_TOOL_TRACE_VALUE_CHARS {
-        return value.clone();
-    }
-    let preview = serialized
-        .chars()
-        .take(INTERACTION_SERVER_TOOL_TRACE_VALUE_CHARS)
-        .collect::<String>();
-    json!({"truncated": true, "preview": preview})
-}
-
 fn interaction_server_tool_summary(step: &Value) -> Value {
-    let mut summary = Map::new();
-    for field in [
-        "type",
-        "id",
-        "call_id",
-        "name",
-        "server_name",
-        "status",
-        "is_error",
-        "search_type",
-    ] {
-        if let Some(value) = step.get(field) {
-            summary.insert(field.to_string(), value.clone());
-        }
-    }
-    for field in ["arguments", "action", "result", "results"] {
-        if let Some(value) = step.get(field) {
-            summary.insert(field.to_string(), bounded_interaction_trace_value(value));
-        }
-    }
-    Value::Object(summary)
+    step.clone()
 }
 
 fn gemini_interaction_usage_to_anthropic(usage: &Value, fallback_input_tokens: u64) -> Value {
@@ -1440,12 +1915,37 @@ fn gemini_interaction_usage_to_anthropic(usage: &Value, fallback_input_tokens: u
     if let Some(tokens) = usage_token(usage, &["total_cached_tokens", "cached_tokens"]) {
         translated["cache_read_input_tokens"] = json!(tokens);
     }
+    if let Some(tokens) = usage_token(usage, &["total_tool_use_tokens", "tool_use_tokens"]) {
+        translated["tool_use_tokens"] = json!(tokens);
+    }
+    if let Some(tokens) = usage_token(usage, &["total_tokens"]) {
+        translated["total_tokens"] = json!(tokens);
+    }
     translated
 }
 
+fn interaction_stop_reason(status: &str, has_calls: bool) -> &'static str {
+    if has_calls || status == "requires_action" {
+        "tool_use"
+    } else if matches!(status, "incomplete" | "budget_exceeded") {
+        "max_tokens"
+    } else {
+        "end_turn"
+    }
+}
+
+#[cfg(test)]
 fn translate_gemini_interactions_response(
     upstream: &Value,
     model: &str,
+) -> Result<InteractionResponseTranslation, String> {
+    translate_gemini_interactions_response_with_service_tier(upstream, model, None)
+}
+
+fn translate_gemini_interactions_response_with_service_tier(
+    upstream: &Value,
+    model: &str,
+    actual_service_tier: Option<&str>,
 ) -> Result<InteractionResponseTranslation, String> {
     let interaction_id = upstream
         .get("id")
@@ -1465,34 +1965,58 @@ fn translate_gemini_interactions_response(
     if matches!(status, "failed" | "cancelled") {
         return Err(safe_error_message(upstream));
     }
+    if matches!(status, "queued" | "in_progress") {
+        return Err(format!(
+            "Gemini Interactions returned non-terminal status '{status}' to a synchronous request"
+        ));
+    }
     let steps = upstream
         .get("steps")
         .and_then(Value::as_array)
         .ok_or_else(|| "Gemini Interactions response has no steps array".to_string())?;
     let mut content = Vec::new();
     let mut calls = Vec::new();
+    let mut interaction_annotations = Vec::new();
     let mut server_tools = InteractionServerToolTrace::default();
-    for step in steps {
+    for (step_index, step) in steps.iter().enumerate() {
         match step.get("type").and_then(Value::as_str) {
             Some("thought") => {
                 let thinking = value_to_text(step.get("summary").unwrap_or(&Value::Null));
-                if thinking.is_empty() {
+                let signature = step
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty());
+                if thinking.is_empty() && signature.is_none() {
                     continue;
                 }
                 let mut block = json!({"type": "thinking", "thinking": thinking});
-                if let Some(signature) = step.get("signature").and_then(Value::as_str) {
+                if let Some(signature) = signature {
                     block["signature"] = json!(signature);
                 }
                 content.push(block);
             }
             Some("model_output") => {
                 if let Some(parts) = step.get("content").and_then(Value::as_array) {
-                    for part in parts {
+                    for (part_index, part) in parts.iter().enumerate() {
                         if part.get("type").and_then(Value::as_str) == Some("text") {
+                            let mut content_block_index = Value::Null;
                             if let Some(text) = part.get("text").and_then(Value::as_str) {
                                 if !text.is_empty() {
+                                    content_block_index = json!(content.len());
                                     content.push(json!({"type": "text", "text": text}));
                                 }
+                            }
+                            if let Some(annotations) = part
+                                .get("annotations")
+                                .and_then(Value::as_array)
+                                .filter(|annotations| !annotations.is_empty())
+                            {
+                                interaction_annotations.push(json!({
+                                    "step_index": step_index,
+                                    "part_index": part_index,
+                                    "content_block_index": content_block_index,
+                                    "annotations": annotations
+                                }));
                             }
                         }
                     }
@@ -1526,17 +2050,9 @@ fn translate_gemini_interactions_response(
             _ => {}
         }
     }
-    let usage = gemini_interaction_usage_to_anthropic(
-        upstream.get("usage").unwrap_or(&Value::Null),
-        0,
-    );
-    let stop_reason = if !calls.is_empty() || status == "requires_action" {
-        "tool_use"
-    } else if status == "incomplete" {
-        "max_tokens"
-    } else {
-        "end_turn"
-    };
+    let interaction_usage = upstream.get("usage").unwrap_or(&Value::Null);
+    let usage = gemini_interaction_usage_to_anthropic(interaction_usage, 0);
+    let stop_reason = interaction_stop_reason(status, !calls.is_empty());
     let mut message = json!({
         "id": format!("msg_{}", Uuid::new_v4().simple()),
         "type": "message",
@@ -1550,7 +2066,11 @@ fn translate_gemini_interactions_response(
     if let Some(usage) = server_tools.anthropic_usage() {
         message["usage"]["server_tool_use"] = usage;
     }
-    if let Some(metadata) = server_tools.provider_metadata() {
+    if let Some(metadata) = server_tools.provider_metadata(
+        interaction_usage,
+        &interaction_annotations,
+        actual_service_tier.or_else(|| upstream.get("service_tier").and_then(Value::as_str)),
+    ) {
         message["provider_metadata"] = metadata;
     }
     Ok(InteractionResponseTranslation {
@@ -1633,7 +2153,7 @@ async fn forward_gemini_interactions_profile(
         }
 
         if !continuation_fallback
-            && is_interaction_continuation_not_implemented(status.as_u16(), &interaction_request)
+            && is_interaction_continuation_unavailable(status.as_u16(), &interaction_request)
         {
             interaction_request = match translate_gemini_interactions_request_with_continuation(
                 &request,
@@ -1679,8 +2199,15 @@ async fn forward_gemini_interactions_profile(
             request,
             continuations,
             estimated_input_tokens,
+            profile.openai_capabilities.gemini_store,
         );
     }
+    let actual_service_tier = upstream
+        .headers()
+        .get("x-gemini-service-tier")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
     let upstream_body = match read_response_json_limited(upstream).await {
         Ok(value) => value,
         Err(err) => {
@@ -1691,7 +2218,11 @@ async fn forward_gemini_interactions_profile(
             )
         }
     };
-    let translated = match translate_gemini_interactions_response(&upstream_body, &model) {
+    let translated = match translate_gemini_interactions_response_with_service_tier(
+        &upstream_body,
+        &model,
+        actual_service_tier.as_deref(),
+    ) {
         Ok(value) => value,
         Err(message) => {
             error!(
@@ -1701,13 +2232,15 @@ async fn forward_gemini_interactions_profile(
             return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", &message);
         }
     };
-    remember_interaction_continuation(
-        &continuations,
-        &profile.file_name,
-        &request,
-        &translated.interaction_id,
-        &translated.assistant_content,
-        &translated.calls,
-    );
+    if profile.openai_capabilities.gemini_store {
+        remember_interaction_continuation(
+            &continuations,
+            &profile.file_name,
+            &request,
+            &translated.interaction_id,
+            &translated.assistant_content,
+            &translated.calls,
+        );
+    }
     Json(translated.message).into_response()
 }

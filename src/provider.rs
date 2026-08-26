@@ -303,6 +303,205 @@ fn capability_string_array(
     Ok(default)
 }
 
+fn capability_gemini_builtin_tools(
+    object: &Map<String, Value>,
+    names: &[&str],
+    default: Vec<Value>,
+    file_name: &str,
+) -> Result<Vec<Value>, String> {
+    for name in names {
+        let Some(value) = object.get(*name) else {
+            continue;
+        };
+        let values = value.as_array().ok_or_else(|| {
+            format!("Provider profile '{file_name}' capability '{name}' must be an array")
+        })?;
+        return values
+            .iter()
+            .map(|value| {
+                let tool = if let Some(tool_type) = value.as_str() {
+                    let tool_type = tool_type.trim();
+                    if tool_type.is_empty() {
+                        return Err(format!(
+                            "Provider profile '{file_name}' capability '{name}' contains an empty tool type"
+                        ));
+                    }
+                    json!({"type": tool_type})
+                } else {
+                    value.clone()
+                };
+                let tool_type = tool
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        format!(
+                            "Provider profile '{file_name}' capability '{name}' entries must be strings or JSON objects with a non-empty 'type'"
+                        )
+                    })?;
+                if !matches!(
+                    tool_type,
+                    "google_search"
+                        | "url_context"
+                        | "code_execution"
+                        | "google_maps"
+                        | "file_search"
+                ) {
+                    return Err(format!(
+                        "Provider profile '{file_name}' capability '{name}' contains unsupported tool '{tool_type}' (expected google_search, url_context, code_execution, google_maps, or file_search)"
+                    ));
+                }
+                Ok(tool)
+            })
+            .collect();
+    }
+    Ok(default)
+}
+
+fn capability_gemini_remote_mcp_servers(
+    object: &Map<String, Value>,
+    names: &[&str],
+    default: Vec<Value>,
+    file_name: &str,
+) -> Result<Vec<Value>, String> {
+    for name in names {
+        let Some(value) = object.get(*name) else {
+            continue;
+        };
+        let servers = value.as_array().ok_or_else(|| {
+            format!("Provider profile '{file_name}' capability '{name}' must be an array")
+        })?;
+        return servers
+            .iter()
+            .map(|server| {
+                let server = server.as_object().ok_or_else(|| {
+                    format!(
+                        "Provider profile '{file_name}' capability '{name}' must contain only JSON objects"
+                    )
+                })?;
+                let server_name = server
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| {
+                        !value.is_empty()
+                            && value
+                                .chars()
+                                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                    })
+                    .ok_or_else(|| {
+                        format!(
+                            "Provider profile '{file_name}' capability '{name}' entries require a snake_case 'name'"
+                        )
+                    })?;
+                let server_url = server
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        format!(
+                            "Provider profile '{file_name}' capability '{name}' entries require a non-empty 'url'"
+                        )
+                    })?;
+                let parsed_url = url::Url::parse(server_url).map_err(|_| {
+                    format!(
+                        "Provider profile '{file_name}' capability '{name}' server '{server_name}' has an invalid URL"
+                    )
+                })?;
+                if parsed_url.scheme() != "https"
+                    || parsed_url.host_str().is_none()
+                    || !parsed_url.username().is_empty()
+                    || parsed_url.password().is_some()
+                {
+                    return Err(format!(
+                        "Provider profile '{file_name}' capability '{name}' server '{server_name}' must use an HTTPS URL without embedded credentials"
+                    ));
+                }
+
+                let mut translated = Map::new();
+                translated.insert("type".to_string(), json!("mcp_server"));
+                translated.insert("name".to_string(), json!(server_name));
+                translated.insert("url".to_string(), json!(server_url));
+
+                if let Some(headers) = server.get("headers") {
+                    let headers = headers.as_object().ok_or_else(|| {
+                        format!(
+                            "Provider profile '{file_name}' capability '{name}' server '{server_name}' headers must be an object of strings"
+                        )
+                    })?;
+                    let mut validated = Map::new();
+                    for (header_name, header_value) in headers {
+                        let value = header_value.as_str().ok_or_else(|| {
+                            format!(
+                                "Provider profile '{file_name}' capability '{name}' server '{server_name}' headers must contain only string values"
+                            )
+                        })?;
+                        header_name
+                            .parse::<reqwest::header::HeaderName>()
+                            .map_err(|_| {
+                                format!(
+                                    "Provider profile '{file_name}' capability '{name}' server '{server_name}' contains an invalid header name"
+                                )
+                            })?;
+                        value
+                            .parse::<reqwest::header::HeaderValue>()
+                            .map_err(|_| {
+                                format!(
+                                    "Provider profile '{file_name}' capability '{name}' server '{server_name}' contains an invalid header value"
+                                )
+                            })?;
+                        validated.insert(header_name.clone(), json!(value));
+                    }
+                    translated.insert("headers".to_string(), Value::Object(validated));
+                }
+
+                if let Some(allowed_tools) = server.get("allowed_tools") {
+                    let allowed_tools = allowed_tools.as_array().ok_or_else(|| {
+                        format!(
+                            "Provider profile '{file_name}' capability '{name}' server '{server_name}' allowed_tools must be an array of non-empty strings"
+                        )
+                    })?;
+                    let allowed_tools = allowed_tools
+                        .iter()
+                        .map(|tool| {
+                            tool.as_str()
+                                .map(str::trim)
+                                .filter(|value| !value.is_empty())
+                                .map(str::to_owned)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "Provider profile '{file_name}' capability '{name}' server '{server_name}' allowed_tools must contain only non-empty strings"
+                                    )
+                                })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    translated.insert("allowed_tools".to_string(), json!(allowed_tools));
+                }
+
+                Ok(Value::Object(translated))
+            })
+            .collect();
+    }
+    Ok(default)
+}
+
+fn redacted_gemini_remote_mcp_servers(servers: &[Value]) -> Vec<Value> {
+    servers
+        .iter()
+        .cloned()
+        .map(|mut server| {
+            if let Some(headers) = server.get_mut("headers").and_then(Value::as_object_mut) {
+                for value in headers.values_mut() {
+                    *value = json!("<redacted>");
+                }
+            }
+            server
+        })
+        .collect()
+}
+
 fn is_reasoning_effort(value: &str) -> bool {
     matches!(
         value,
@@ -546,22 +745,12 @@ fn parse_openai_capabilities_with_defaults(
             ))
         }
     };
-    let gemini_builtin_tools = capability_string_array(
+    let gemini_builtin_tools = capability_gemini_builtin_tools(
         object,
         &["gemini_builtin_tools", "geminiBuiltinTools"],
         defaults.gemini_builtin_tools.clone(),
         file_name,
     )?;
-    for tool in &gemini_builtin_tools {
-        if !matches!(
-            tool.as_str(),
-            "google_search" | "url_context" | "code_execution" | "google_maps"
-        ) {
-            return Err(format!(
-                "Provider profile '{file_name}' capability 'gemini_builtin_tools' contains unsupported tool '{tool}' (expected google_search, url_context, code_execution, or google_maps)"
-            ));
-        }
-    }
     let gemini_file_search_store_names = capability_string_array(
         object,
         &[
@@ -571,6 +760,43 @@ fn parse_openai_capabilities_with_defaults(
         defaults.gemini_file_search_store_names.clone(),
         file_name,
     )?;
+    let gemini_remote_mcp_servers = capability_gemini_remote_mcp_servers(
+        object,
+        &[
+            "gemini_remote_mcp_servers",
+            "geminiRemoteMcpServers",
+        ],
+        defaults.gemini_remote_mcp_servers.clone(),
+        file_name,
+    )?;
+    let gemini_service_tier = capability_string(
+        object,
+        &["gemini_service_tier", "geminiServiceTier"],
+        file_name,
+    )?;
+    if gemini_service_tier.as_deref().is_some_and(|tier| {
+        !matches!(tier, "standard" | "priority" | "flex")
+    }) {
+        return Err(format!(
+            "Provider profile '{file_name}' capability 'gemini_service_tier' has an unsupported value (expected standard, priority, or flex)"
+        ));
+    }
+    let gemini_tool_choice_override = capability_string(
+        object,
+        &[
+            "gemini_tool_choice_override",
+            "geminiToolChoiceOverride",
+        ],
+        file_name,
+    )?;
+    if gemini_tool_choice_override
+        .as_deref()
+        .is_some_and(|choice| !matches!(choice, "auto" | "any" | "none" | "validated"))
+    {
+        return Err(format!(
+            "Provider profile '{file_name}' capability 'gemini_tool_choice_override' has an unsupported value (expected auto, any, none, or validated)"
+        ));
+    }
     let responses_builtin_tools = capability_string_array(
         object,
         &["responses_builtin_tools", "responsesBuiltinTools"],
@@ -695,11 +921,22 @@ fn parse_openai_capabilities_with_defaults(
         kimi_formula_tools,
         gemini_builtin_tools,
         gemini_file_search_store_names,
+        gemini_remote_mcp_servers,
+        gemini_store: capability_bool(
+            object,
+            &["gemini_store", "geminiStore"],
+            defaults.gemini_store,
+            file_name,
+        )?,
+        gemini_service_tier,
+        gemini_tool_choice_override,
         user_id,
     })
 }
 
 fn openai_capabilities_json(capabilities: &OpenAiCapabilities) -> Value {
+    let remote_mcp_servers =
+        redacted_gemini_remote_mcp_servers(&capabilities.gemini_remote_mcp_servers);
     json!({
         "chat_dialect": capabilities.chat_dialect.as_str(),
         "stream_options": capabilities.stream_options,
@@ -724,7 +961,11 @@ fn openai_capabilities_json(capabilities: &OpenAiCapabilities) -> Value {
         "responses_apply_patch_custom": capabilities.responses_apply_patch_custom,
         "kimi_formula_tools": capabilities.kimi_formula_tools,
         "gemini_builtin_tools": capabilities.gemini_builtin_tools,
-        "gemini_file_search_store_names": capabilities.gemini_file_search_store_names
+        "gemini_file_search_store_names": capabilities.gemini_file_search_store_names,
+        "gemini_remote_mcp_servers": remote_mcp_servers,
+        "gemini_store": capabilities.gemini_store,
+        "gemini_service_tier": capabilities.gemini_service_tier,
+        "gemini_tool_choice_override": capabilities.gemini_tool_choice_override
     })
 }
 

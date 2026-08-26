@@ -9,13 +9,12 @@
     "default_reasoning_effort": "medium",
     "include_thoughts": true,
     "sampling_parameters": false,
-    "max_tool_result_chars": 16000,
-    "gemini_builtin_tools": [
-      "google_search",
-      "url_context",
-      "code_execution",
-      "google_maps"
-    ],
-    "gemini_file_search_store_names": []
+    "max_output_tokens": 65536,
+    "gemini_store": true,
+    "gemini_service_tier": "standard",
+    "gemini_tool_choice_override": "validated",
+    "gemini_builtin_tools": [],
+    "gemini_file_search_store_names": [],
+    "gemini_remote_mcp_servers": []
   }
 }

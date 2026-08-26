@@ -4459,9 +4459,9 @@ fn selects_profile_identity_and_honors_disable_switch() {
 fn interactions_test_profile(file_name: &str) -> ProviderProfile {
     let mut capabilities = OpenAiCapabilities::gemini_interactions();
     capabilities.gemini_builtin_tools = vec![
-        "google_search".to_string(),
-        "url_context".to_string(),
-        "code_execution".to_string(),
+        json!({"type": "google_search"}),
+        json!({"type": "url_context"}),
+        json!({"type": "code_execution"}),
     ];
     ProviderProfile {
         file_name: file_name.to_string(),
@@ -4482,6 +4482,59 @@ fn interactions_test_profile(file_name: &str) -> ProviderProfile {
         upstream_url: "https://generativelanguage.googleapis.com/v1beta/interactions".to_string(),
         client: Client::builder().build().unwrap(),
     }
+}
+
+#[test]
+fn packaged_gemini_profile_does_not_truncate_tool_results_by_default() {
+    let profile: Value =
+        serde_json::from_str(include_str!("../examples/providers/gemini.example.json")).unwrap();
+    let capabilities = parse_openai_capabilities_with_defaults(
+        profile.as_object().unwrap(),
+        "gemini.example.json",
+        OpenAiCapabilities::gemini_interactions(),
+    )
+    .unwrap();
+
+    assert_eq!(capabilities.max_tool_result_chars, None);
+}
+
+#[test]
+fn accepts_native_gemini_builtin_tool_options_without_flattening_them() {
+    let raw = json!({
+        "capabilities": {
+            "gemini_builtin_tools": [
+                "url_context",
+                {
+                    "type": "google_search",
+                    "search_types": ["web_search", "image_search"]
+                },
+                {
+                    "type": "google_maps",
+                    "enable_widget": true
+                }
+            ]
+        }
+    });
+    let capabilities = parse_openai_capabilities_with_defaults(
+        raw.as_object().unwrap(),
+        "gemini-native-tools.json",
+        OpenAiCapabilities::gemini_interactions(),
+    )
+    .unwrap();
+    let tools = translated_interaction_tools(&json!({}), &capabilities);
+
+    assert_eq!(tools[0], json!({"type": "url_context"}));
+    assert_eq!(
+        tools[1],
+        json!({
+            "type": "google_search",
+            "search_types": ["web_search", "image_search"]
+        })
+    );
+    assert_eq!(
+        tools[2],
+        json!({"type": "google_maps", "enable_widget": true})
+    );
 }
 
 #[test]
@@ -4512,8 +4565,23 @@ fn detects_and_removes_only_mixed_interaction_server_tools() {
 fn configures_google_maps_and_native_file_search() {
     let raw = json!({
         "capabilities": {
-            "gemini_builtin_tools": ["google_maps"],
-            "gemini_file_search_store_names": ["fileSearchStores/project-docs"]
+            "gemini_builtin_tools": [
+                {
+                    "type": "google_maps",
+                    "enable_widget": true,
+                    "latitude": 31.2304,
+                    "longitude": 121.4737
+                },
+                {
+                    "type": "file_search",
+                    "metadata_filter": "team = \"bridge\""
+                }
+            ],
+            "gemini_file_search_store_names": ["fileSearchStores/project-docs"],
+            "gemini_store": false,
+            "gemini_service_tier": "priority",
+            "gemini_tool_choice_override": "validated",
+            "max_output_tokens": 32768
         }
     });
     let capabilities = parse_openai_capabilities_with_defaults(
@@ -4522,18 +4590,214 @@ fn configures_google_maps_and_native_file_search() {
         OpenAiCapabilities::gemini_interactions(),
     )
     .unwrap();
-    assert_eq!(capabilities.gemini_builtin_tools, ["google_maps"]);
+    assert_eq!(
+        capabilities.gemini_builtin_tools[0],
+        json!({
+            "type": "google_maps",
+            "enable_widget": true,
+            "latitude": 31.2304,
+            "longitude": 121.4737
+        })
+    );
     assert_eq!(
         capabilities.gemini_file_search_store_names,
         ["fileSearchStores/project-docs"]
     );
+    assert!(!capabilities.gemini_store);
+    assert_eq!(
+        capabilities.gemini_service_tier.as_deref(),
+        Some("priority")
+    );
+    assert_eq!(
+        capabilities.gemini_tool_choice_override.as_deref(),
+        Some("validated")
+    );
     let tools = translated_interaction_tools(&json!({}), &capabilities);
-    assert_eq!(tools[0]["type"], "google_maps");
+    assert_eq!(tools[0]["enable_widget"], true);
+    assert_eq!(tools[0]["latitude"], 31.2304);
+    assert_eq!(tools[0]["longitude"], 121.4737);
     assert_eq!(tools[1]["type"], "file_search");
+    assert_eq!(tools[1]["metadata_filter"], "team = \"bridge\"");
     assert_eq!(
         tools[1]["file_search_store_names"][0],
         "fileSearchStores/project-docs"
     );
+
+    let mut profile = interactions_test_profile("gemini-controls.json");
+    profile.openai_capabilities = capabilities;
+    let translated = translate_gemini_interactions_request(
+        &json!({
+            "max_tokens": 65536,
+            "tool_choice": {"type": "auto"},
+            "messages": [{"role": "user", "content": "Inspect the project"}],
+            "tools": [{
+                "name": "read_file",
+                "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}
+            }]
+        }),
+        &profile,
+        &RwLock::new(InteractionContinuationCache::default()),
+    )
+    .unwrap();
+    assert_eq!(translated["store"], false);
+    assert_eq!(translated["service_tier"], "priority");
+    assert_eq!(translated["generation_config"]["tool_choice"], "validated");
+    assert_eq!(translated["generation_config"]["max_output_tokens"], 32768);
+}
+
+#[test]
+fn moves_pdf_tool_result_documents_to_a_legal_user_input_step() {
+    let content = json!([{
+        "type": "tool_result",
+        "tool_use_id": "toolu_pdf",
+        "content": [
+            {"type": "text", "text": "Generated report"},
+            {
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": "cGRm"
+                }
+            }
+        ]
+    }]);
+    let tool_names = HashMap::from([("toolu_pdf".to_string(), "read_pdf".to_string())]);
+
+    let steps = interaction_user_steps(&content, &tool_names, false, None);
+
+    assert_eq!(steps.len(), 2);
+    assert_eq!(steps[0]["type"], "function_result");
+    assert_eq!(steps[0]["result"][0]["type"], "text");
+    assert!(steps[0]["result"].as_array().unwrap().iter().all(|part| {
+        matches!(
+            part.get("type").and_then(Value::as_str),
+            Some("text" | "image")
+        )
+    }));
+    assert_eq!(steps[1]["type"], "user_input");
+    assert_eq!(steps[1]["content"][0]["type"], "document");
+    assert_eq!(steps[1]["content"][0]["mime_type"], "application/pdf");
+    assert_eq!(steps[1]["content"][0]["data"], "cGRm");
+}
+
+#[test]
+fn gives_document_only_function_results_a_legal_text_placeholder() {
+    let content = json!([{
+        "type": "tool_result",
+        "tool_use_id": "toolu_pdf",
+        "content": [{
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": "cGRm"
+            }
+        }]
+    }]);
+    let tool_names = HashMap::from([("toolu_pdf".to_string(), "read_pdf".to_string())]);
+
+    let steps = interaction_user_steps(&content, &tool_names, false, None);
+
+    assert_eq!(steps.len(), 2);
+    assert_eq!(steps[0]["type"], "function_result");
+    assert_eq!(
+        steps[0]["result"],
+        "Document attached in the following user input."
+    );
+    assert_eq!(steps[1]["content"][0]["type"], "document");
+}
+
+#[test]
+fn configures_native_remote_mcp_without_exposing_header_values() {
+    let raw = json!({
+        "capabilities": {
+            "gemini_remote_mcp_servers": [{
+                "name": "weather_tools",
+                "url": "https://mcp.example.com/v1",
+                "headers": {"Authorization": "Bearer remote-secret"},
+                "allowed_tools": ["current_weather"]
+            }]
+        }
+    });
+    let capabilities = parse_openai_capabilities_with_defaults(
+        raw.as_object().unwrap(),
+        "gemini-remote-mcp.json",
+        OpenAiCapabilities::gemini_interactions(),
+    )
+    .unwrap();
+
+    let tools = translated_interaction_tools(&json!({}), &capabilities);
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["type"], "mcp_server");
+    assert_eq!(tools[0]["name"], "weather_tools");
+    assert_eq!(tools[0]["url"], "https://mcp.example.com/v1");
+    assert_eq!(tools[0]["headers"]["Authorization"], "Bearer remote-secret");
+    assert_eq!(tools[0]["allowed_tools"][0], "current_weather");
+
+    let mut profile = interactions_test_profile("gemini-remote-mcp.json");
+    profile.openai_capabilities = capabilities.clone();
+    let request = translate_gemini_interactions_request(
+        &json!({"messages": [{"role": "user", "content": "Check the weather"}]}),
+        &profile,
+        &RwLock::new(InteractionContinuationCache::default()),
+    )
+    .unwrap();
+    assert_eq!(request["tools"][0], tools[0]);
+
+    let public = openai_capabilities_json(&capabilities);
+    assert_eq!(
+        public["gemini_remote_mcp_servers"][0]["headers"]["Authorization"],
+        "<redacted>"
+    );
+    assert!(!public.to_string().contains("remote-secret"));
+}
+
+#[test]
+fn rejects_unsafe_remote_mcp_and_unsupported_interactions_tiers() {
+    for server in [
+        json!({"name": "bad-name", "url": "https://mcp.example.com/v1"}),
+        json!({"name": "good_name", "url": "http://mcp.example.com/v1"}),
+        json!({
+            "name": "good_name",
+            "url": "https://mcp.example.com/v1",
+            "headers": {"Authorization": "Bearer secret\r\nX-Injected: true"}
+        }),
+    ] {
+        let raw = json!({
+            "capabilities": {"gemini_remote_mcp_servers": [server]}
+        });
+        let error = parse_openai_capabilities_with_defaults(
+            raw.as_object().unwrap(),
+            "invalid-remote-mcp.json",
+            OpenAiCapabilities::gemini_interactions(),
+        )
+        .unwrap_err();
+        assert!(error.contains("gemini_remote_mcp_servers"));
+    }
+
+    let raw = json!({"capabilities": {"gemini_service_tier": "deferred"}});
+    let error = parse_openai_capabilities_with_defaults(
+        raw.as_object().unwrap(),
+        "invalid-tier.json",
+        OpenAiCapabilities::gemini_interactions(),
+    )
+    .unwrap_err();
+    assert!(error.contains("standard, priority, or flex"));
+}
+
+#[test]
+fn accepts_all_supported_interactions_service_tiers() {
+    for tier in ["standard", "flex", "priority"] {
+        let raw = json!({"capabilities": {"gemini_service_tier": tier}});
+        let capabilities = parse_openai_capabilities_with_defaults(
+            raw.as_object().unwrap(),
+            "gemini-tier.json",
+            OpenAiCapabilities::gemini_interactions(),
+        )
+        .unwrap();
+        assert_eq!(capabilities.gemini_service_tier.as_deref(), Some(tier));
+    }
 }
 
 #[test]
@@ -4627,7 +4891,21 @@ fn builds_google_native_count_tokens_request_with_prompt_and_tools() {
         "messages": [
             {"role": "user", "content": "Read Cargo.toml"},
             {"role": "assistant", "content": [{"type": "tool_use", "id": "call-1", "name": "read_file", "input": {"path": "Cargo.toml"}}]},
-            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call-1", "content": "package data"}]}
+            {"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "call-1",
+                "content": [
+                    {"type": "text", "text": "package data"},
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": "cGRm"
+                        }
+                    }
+                ]
+            }]}
         ],
         "tools": [{
             "name": "read_file",
@@ -4650,6 +4928,14 @@ fn builds_google_native_count_tokens_request_with_prompt_and_tools() {
     assert_eq!(
         generate["contents"][2]["parts"][0]["functionResponse"]["name"],
         "read_file"
+    );
+    assert_eq!(
+        generate["contents"][2]["parts"][1]["inlineData"]["mimeType"],
+        "application/pdf"
+    );
+    assert_eq!(
+        generate["contents"][2]["parts"][1]["inlineData"]["data"],
+        "cGRm"
     );
     assert_eq!(
         generate["tools"][0]["functionDeclarations"][0]["name"],
@@ -4928,6 +5214,8 @@ fn returns_bounded_gemini_server_tool_metadata_and_standard_usage_counts() {
             {"type": "google_search_result", "call_id": "search-1", "result": [{"search_suggestions": ["Rust language"]}]},
             {"type": "url_context_call", "id": "fetch-1", "arguments": {"urls": ["https://example.com"]}},
             {"type": "url_context_result", "call_id": "fetch-1", "result": [{"url": "https://example.com", "status": "success"}]},
+            {"type": "mcp_server_tool_call", "id": "mcp-1", "server_name": "weather_tools", "name": "current_weather", "arguments": {"city": "Shanghai"}},
+            {"type": "mcp_server_tool_result", "call_id": "mcp-1", "result": {"temperature_c": 29}},
             {"type": "model_output", "content": [{"type": "text", "text": "Done."}]}
         ],
         "usage": {"total_input_tokens": 12, "total_output_tokens": 4}
@@ -4947,7 +5235,65 @@ fn returns_bounded_gemini_server_tool_metadata_and_standard_usage_counts() {
             .as_array()
             .unwrap()
             .len(),
-        4
+        6
+    );
+    assert_eq!(
+        translated.message["provider_metadata"]["google"]["interaction_server_tools"][4]["type"],
+        "mcp_server_tool_call"
+    );
+}
+
+#[test]
+fn preserves_signature_only_thought_annotations_and_actual_service_tier() {
+    let upstream = json!({
+        "id": "interaction-fidelity-1",
+        "status": "completed",
+        "service_tier": "priority",
+        "steps": [
+            {"type": "thought", "summary": [], "signature": "opaque-thought-signature"},
+            {
+                "type": "model_output",
+                "content": [{
+                    "type": "text",
+                    "text": "Grounded answer.",
+                    "annotations": [{
+                        "type": "url_citation",
+                        "start_index": 0,
+                        "end_index": 8,
+                        "url": "https://example.com/source",
+                        "title": "Source"
+                    }]
+                }]
+            }
+        ],
+        "usage": {"total_input_tokens": 3, "total_output_tokens": 2}
+    });
+
+    let translated = translate_gemini_interactions_response(&upstream, "gemini-3.7-flash").unwrap();
+    assert_eq!(translated.message["content"][0]["type"], "thinking");
+    assert_eq!(translated.message["content"][0]["thinking"], "");
+    assert_eq!(
+        translated.message["content"][0]["signature"],
+        "opaque-thought-signature"
+    );
+    assert_eq!(
+        translated.message["provider_metadata"]["google"]["interaction_annotations"][0]
+            ["annotations"][0]["url"],
+        "https://example.com/source"
+    );
+    assert_eq!(
+        translated.message["provider_metadata"]["google"]["service_tier"],
+        "priority"
+    );
+    let header_tier = translate_gemini_interactions_response_with_service_tier(
+        &upstream,
+        "gemini-3.7-flash",
+        Some("flex"),
+    )
+    .unwrap();
+    assert_eq!(
+        header_tier.message["provider_metadata"]["google"]["service_tier"],
+        "flex"
     );
 }
 
@@ -5010,7 +5356,7 @@ async fn retries_known_mixed_tools_rejection_with_function_tools_only() {
 }
 
 #[tokio::test]
-async fn retries_unimplemented_interaction_continuation_with_full_history() {
+async fn retries_unavailable_interaction_continuation_with_full_history() {
     let requests = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
     let captured = requests.clone();
     let mock = Router::new().route(
@@ -5022,8 +5368,8 @@ async fn retries_unimplemented_interaction_continuation_with_full_history() {
                     requests.push(body);
                     if requests.len() == 1 {
                         return (
-                            StatusCode::NOT_IMPLEMENTED,
-                            Json(json!({"error": {"message": "previous_interaction_id is not implemented for this interaction"}})),
+                            StatusCode::NOT_FOUND,
+                            Json(json!({"error": {"message": "stored interaction expired or was not found"}})),
                         )
                             .into_response();
                     }
@@ -5128,7 +5474,10 @@ fn builds_stateful_interactions_delta_only_after_exact_transcript_match() {
         continued["input"][0]["content"][0]["text"],
         "What did I ask you to remember?"
     );
-    assert!(continued.get("system_instruction").is_none());
+    assert_eq!(
+        continued["system_instruction"],
+        "You are a coding assistant."
+    );
 
     let recovered = translate_gemini_interactions_request_with_continuation(
         &second,
@@ -5146,6 +5495,67 @@ fn builds_stateful_interactions_delta_only_after_exact_transcript_match() {
         translate_gemini_interactions_request(&edited, &profile, &continuations).unwrap();
     assert!(fallback.get("previous_interaction_id").is_none());
     assert_eq!(fallback["input"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn persists_opaque_interaction_continuations_without_prompt_content() {
+    let root = env::temp_dir().join(format!(
+        "claude-bridge-interaction-state-{}",
+        Uuid::new_v4()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let state_path = root.join("interaction-continuations.json");
+    let continuations = RwLock::new(load_interaction_continuation_cache(&state_path));
+    let first = json!({
+        "system": "secret system prompt",
+        "messages": [{"role": "user", "content": "secret user prompt"}]
+    });
+    let assistant_content = vec![json!({
+        "type": "tool_use",
+        "id": "call-persisted-1",
+        "name": "read_file",
+        "input": {"path": "secret-path.txt"}
+    })];
+    remember_interaction_continuation(
+        &continuations,
+        "gemini.json",
+        &first,
+        "interaction-persisted-1",
+        &assistant_content,
+        &[("call-persisted-1".to_string(), "read_file".to_string())],
+    );
+
+    let persisted = fs::read_to_string(&state_path).unwrap();
+    assert!(persisted.contains("interaction-persisted-1"));
+    assert!(!persisted.contains("secret system prompt"));
+    assert!(!persisted.contains("secret user prompt"));
+    assert!(!persisted.contains("secret-path.txt"));
+
+    let reloaded = RwLock::new(load_interaction_continuation_cache(&state_path));
+    let request = json!({
+        "system": "secret system prompt",
+        "messages": [
+            {"role": "user", "content": "secret user prompt"},
+            {"role": "assistant", "content": assistant_content},
+            {"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "call-persisted-1",
+                "content": "secret tool result"
+            }]}
+        ]
+    });
+    let translated = translate_gemini_interactions_request(
+        &request,
+        &interactions_test_profile("gemini.json"),
+        &reloaded,
+    )
+    .unwrap();
+    assert_eq!(
+        translated["previous_interaction_id"],
+        "interaction-persisted-1"
+    );
+
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -5187,6 +5597,326 @@ fn continues_interactions_tool_result_by_opaque_call_id() {
     assert_eq!(translated["input"][0]["call_id"], "call-opaque-1");
     assert_eq!(translated["input"][0]["name"], "read_file");
     assert_eq!(translated["input"][0]["result"], "package data");
+}
+
+#[test]
+fn continues_interactions_across_split_trailing_user_result_messages() {
+    let profile = interactions_test_profile("gemini-interactions.json");
+    let continuations = RwLock::new(InteractionContinuationCache::default());
+    let first = json!({
+        "messages": [{"role": "user", "content": "Inspect both files"}]
+    });
+    let assistant_content = vec![
+        json!({
+            "type": "tool_use",
+            "id": "call-split-1",
+            "name": "Read",
+            "input": {"file_path": "Cargo.toml"}
+        }),
+        json!({
+            "type": "tool_use",
+            "id": "call-split-2",
+            "name": "Read",
+            "input": {"file_path": "src/main.rs"}
+        }),
+    ];
+    remember_interaction_continuation(
+        &continuations,
+        &profile.file_name,
+        &first,
+        "interaction-split-results",
+        &assistant_content,
+        &[
+            ("call-split-1".to_string(), "Read".to_string()),
+            ("call-split-2".to_string(), "Read".to_string()),
+        ],
+    );
+    let result_request = json!({
+        "messages": [
+            {"role": "user", "content": "Inspect both files"},
+            {"role": "system", "content": [{"type": "text", "text": "Initial runtime context"}]},
+            {"role": "assistant", "content": assistant_content},
+            {"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "call-split-1",
+                "content": "package data"
+            }]},
+            {"role": "system", "content": [{"type": "text", "text": "Tool runtime context"}]},
+            {"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "call-split-2",
+                "content": "source data"
+            }]},
+            {"role": "system", "content": [{
+                "type": "text",
+                "text": "Use the tool results already returned."
+            }]}
+        ]
+    });
+
+    let translated =
+        translate_gemini_interactions_request(&result_request, &profile, &continuations).unwrap();
+    assert_eq!(
+        translated["previous_interaction_id"],
+        "interaction-split-results"
+    );
+    assert_eq!(translated["input"].as_array().unwrap().len(), 2);
+    assert_eq!(translated["input"][0]["call_id"], "call-split-1");
+    assert_eq!(translated["input"][1]["call_id"], "call-split-2");
+    assert!(translated["system_instruction"]
+        .as_str()
+        .unwrap()
+        .contains("Use the tool results already returned."));
+}
+
+fn repeated_read_loop_request(last_result: &str) -> Value {
+    json!({
+        "system": "Act as a coding assistant.",
+        "messages": [
+            {"role": "user", "content": "Read Cargo.toml and report the version."},
+            {"role": "assistant", "content": [{
+                "type": "tool_use", "id": "call-loop-1", "name": "Read",
+                "input": {"limit": 2000, "file_path": "Cargo.toml"}
+            }]},
+            {"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": "call-loop-1", "content": "package version 0.6.0"
+            }]},
+            {"role": "system", "content": "Runtime context after call 1"},
+            {"role": "assistant", "content": [{
+                "type": "tool_use", "id": "call-loop-2", "name": "Read",
+                "input": {"file_path": "Cargo.toml", "limit": 2000}
+            }]},
+            {"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": "call-loop-2", "content": "package version 0.6.0"
+            }]},
+            {"role": "system", "content": "Runtime context after call 2"},
+            {"role": "assistant", "content": [{
+                "type": "tool_use", "id": "call-loop-3", "name": "Read",
+                "input": {"limit": 2000, "file_path": "Cargo.toml"}
+            }]},
+            {"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": "call-loop-3", "content": last_result
+            }]},
+            {"role": "system", "content": "Runtime context after call 3"}
+        ],
+        "tools": [{
+            "name": "Read",
+            "description": "Read a file",
+            "input_schema": {"type": "object"}
+        }]
+    })
+}
+
+#[test]
+fn forces_no_tools_after_three_identical_completed_tool_cycles() {
+    let mut profile = interactions_test_profile("gemini-interactions.json");
+    profile.openai_capabilities.gemini_tool_choice_override = Some("validated".to_string());
+    let continuations = RwLock::new(InteractionContinuationCache::default());
+    let translated = translate_gemini_interactions_request(
+        &repeated_read_loop_request("package version 0.6.0"),
+        &profile,
+        &continuations,
+    )
+    .unwrap();
+
+    assert_eq!(translated["generation_config"]["tool_choice"], "none");
+    let system = translated["system_instruction"].as_str().unwrap();
+    assert!(system.contains("Accuracy and complete evidence"));
+    assert!(system.contains("same completed tool call and result repeated three times"));
+    assert!(system.ends_with("provide the best final response now."));
+    assert!(
+        gemini_interaction_request_diagnostics(&repeated_read_loop_request(
+            "package version 0.6.0"
+        ))
+        .iter()
+        .any(|diagnostic| diagnostic.contains("forced a final no-tools turn"))
+    );
+}
+
+#[test]
+fn repeated_tool_loop_detection_ignores_signature_only_assistant_messages() {
+    let mut profile = interactions_test_profile("gemini-interactions.json");
+    profile.openai_capabilities.gemini_tool_choice_override = Some("validated".to_string());
+    let continuations = RwLock::new(InteractionContinuationCache::default());
+    let mut request = repeated_read_loop_request("package version 0.6.0");
+    let messages = request["messages"].as_array_mut().unwrap();
+    messages.insert(
+        7,
+        json!({"role": "assistant", "content": [{
+            "type": "thinking", "thinking": "", "signature": "sig-3"
+        }]}),
+    );
+    messages.insert(
+        4,
+        json!({"role": "assistant", "content": [{
+            "type": "thinking", "thinking": "", "signature": "sig-2"
+        }]}),
+    );
+    let translated =
+        translate_gemini_interactions_request(&request, &profile, &continuations).unwrap();
+
+    assert_eq!(translated["generation_config"]["tool_choice"], "none");
+}
+
+#[test]
+fn keeps_tools_enabled_when_a_repeated_cycle_result_changes() {
+    let mut profile = interactions_test_profile("gemini-interactions.json");
+    profile.openai_capabilities.gemini_tool_choice_override = Some("validated".to_string());
+    let continuations = RwLock::new(InteractionContinuationCache::default());
+    let translated = translate_gemini_interactions_request(
+        &repeated_read_loop_request("package version 0.6.1"),
+        &profile,
+        &continuations,
+    )
+    .unwrap();
+
+    assert_eq!(translated["generation_config"]["tool_choice"], "validated");
+    assert!(!translated["system_instruction"]
+        .as_str()
+        .unwrap()
+        .contains("same completed tool call and result repeated three times"));
+}
+
+#[test]
+fn keeps_tools_enabled_when_repeated_cycle_arguments_change() {
+    let mut profile = interactions_test_profile("gemini-interactions.json");
+    profile.openai_capabilities.gemini_tool_choice_override = Some("validated".to_string());
+    let continuations = RwLock::new(InteractionContinuationCache::default());
+    let mut request = repeated_read_loop_request("package version 0.6.0");
+    let call = request["messages"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|message| {
+            message
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|parts| {
+                    parts
+                        .iter()
+                        .any(|part| part.get("id").and_then(Value::as_str) == Some("call-loop-3"))
+                })
+        })
+        .unwrap();
+    call["content"][0]["input"]["limit"] = json!(1000);
+    let translated =
+        translate_gemini_interactions_request(&request, &profile, &continuations).unwrap();
+
+    assert_eq!(translated["generation_config"]["tool_choice"], "validated");
+}
+
+fn completed_navigation_request(calls: Vec<(&str, Value)>) -> Value {
+    let mut messages = vec![json!({
+        "role": "user",
+        "content": "Review the implementation and report the important findings."
+    })];
+    for (index, (name, input)) in calls.into_iter().enumerate() {
+        let call_id = format!("call-navigation-{index}");
+        messages.push(json!({
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": call_id,
+                "name": name,
+                "input": input
+            }]
+        }));
+        messages.push(json!({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": call_id,
+                "content": format!("distinct navigation result {index}")
+            }]
+        }));
+        messages.push(json!({
+            "role": "system",
+            "content": format!("Runtime context after navigation call {index}")
+        }));
+    }
+    json!({
+        "system": "Act as a coding assistant.",
+        "messages": messages,
+        "tools": [
+            {"name": "Read", "description": "Read a file", "input_schema": {"type": "object"}},
+            {"name": "Grep", "description": "Search files", "input_schema": {"type": "object"}},
+            {"name": "Glob", "description": "Find files", "input_schema": {"type": "object"}},
+            {"name": "Bash", "description": "Run a command", "input_schema": {"type": "object"}}
+        ]
+    })
+}
+
+fn translate_navigation_request(request: &Value) -> Value {
+    let mut profile = interactions_test_profile("gemini-interactions.json");
+    profile.openai_capabilities.gemini_tool_choice_override = Some("validated".to_string());
+    translate_gemini_interactions_request(
+        request,
+        &profile,
+        &RwLock::new(InteractionContinuationCache::default()),
+    )
+    .unwrap()
+}
+
+#[test]
+fn keeps_tools_enabled_after_many_useful_navigation_calls() {
+    let request = completed_navigation_request(
+        (0..12)
+            .map(|index| {
+                (
+                    "Read",
+                    json!({"file_path": format!("src/file-{index}.rs"), "limit": 800}),
+                )
+            })
+            .collect(),
+    );
+    let translated = translate_navigation_request(&request);
+
+    assert_eq!(translated["generation_config"]["tool_choice"], "validated");
+    assert!(translated["system_instruction"]
+        .as_str()
+        .unwrap()
+        .contains("Accuracy and complete evidence are more important than minimizing tool calls"));
+    assert!(!gemini_interaction_request_diagnostics(&request)
+        .iter()
+        .any(|diagnostic| diagnostic.contains("source navigation")));
+}
+
+#[test]
+fn adds_source_navigation_coach_only_when_source_tools_are_available() {
+    for tool_name in ["Read", "Grep", "Glob"] {
+        let request = json!({
+            "system": "Original system instruction.",
+            "messages": [{"role": "user", "content": "Inspect the implementation."}],
+            "tools": [{
+                "name": tool_name,
+                "description": "Source navigation",
+                "input_schema": {"type": "object"}
+            }]
+        });
+        let translated = translate_navigation_request(&request);
+        let system = translated["system_instruction"].as_str().unwrap();
+        assert!(system.starts_with("Original system instruction."));
+        assert!(system.contains("no more than two consecutive discovery searches"));
+        assert!(system.contains("matching content and line numbers rather than only file names"));
+        assert!(system.contains("Read complete logical units"));
+        assert!(system.contains("what is proven and what evidence is still missing"));
+        assert!(system.ends_with("Never trade correctness or coverage for fewer tool calls."));
+    }
+
+    let bash_only = json!({
+        "system": "Original system instruction.",
+        "messages": [{"role": "user", "content": "Run the checks."}],
+        "tools": [{
+            "name": "Bash",
+            "description": "Run a command",
+            "input_schema": {"type": "object"}
+        }]
+    });
+    let translated = translate_navigation_request(&bash_only);
+    assert_eq!(
+        translated["system_instruction"],
+        "Original system instruction."
+    );
 }
 
 #[test]
@@ -5243,11 +5973,16 @@ fn bounds_oversized_gemini_interactions_tool_results() {
         Some(1_024),
     );
     assert_eq!(
-        media_result[0]["text"].as_str().unwrap().chars().count(),
+        media_result.result[0]["text"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .count(),
         1_024
     );
-    assert_eq!(media_result[1]["type"], "image");
-    assert_eq!(media_result[1]["data"], "aGVsbG8=");
+    assert_eq!(media_result.result[1]["type"], "image");
+    assert_eq!(media_result.result[1]["data"], "aGVsbG8=");
+    assert!(media_result.documents.is_empty());
 }
 
 #[test]
@@ -5354,6 +6089,7 @@ fn translates_interactions_stream_and_remembers_tool_continuation() {
         request,
         continuations.clone(),
         10,
+        true,
     );
     assert_eq!(translator.start_events().unwrap().len(), 1);
     translator
@@ -5371,6 +6107,7 @@ fn translates_interactions_stream_and_remembers_tool_continuation() {
     translator
         .process_payload(r#"{"event_type":"step.stop","index":0}"#)
         .unwrap();
+    assert_eq!(translator.assistant_content[0]["thinking"], "Checking.");
     translator
             .process_payload(r#"{"event_type":"step.start","index":1,"step":{"type":"function_call","id":"call-stream-1","name":"lookup","arguments":{}}}"#)
             .unwrap();
@@ -5419,6 +6156,7 @@ fn translates_gemini_37_rest_stream_schema_without_losing_content_or_usage() {
         request,
         continuations,
         1,
+        true,
     );
     translator
         .process_payload(r#"{"type":"interaction.created","interaction":{"id":"interaction-37","status":"in_progress"}}"#)
@@ -5460,6 +6198,38 @@ fn translates_gemini_37_rest_stream_schema_without_losing_content_or_usage() {
 }
 
 #[test]
+fn preserves_streamed_server_tool_deltas_annotations_and_service_tier() {
+    let continuations = Arc::new(RwLock::new(InteractionContinuationCache::default()));
+    let mut translator = GeminiInteractionsStreamTranslator::new(
+        "gemini-3.7-flash".to_string(),
+        "gemini-interactions.json".to_string(),
+        json!({"messages": [{"role": "user", "content": "Search"}]}),
+        continuations,
+        2,
+        true,
+    );
+    for payload in [
+        r#"{"type":"interaction.created","interaction":{"id":"interaction-stream-fidelity","status":"in_progress"}}"#,
+        r#"{"type":"step.start","index":0,"step":{"type":"google_search_call","id":"search-stream-1","status":"in_progress"}}"#,
+        r#"{"type":"step.delta","index":0,"delta":{"type":"google_search_call","arguments":{"query":"Gemini API"},"signature":"server-signature"}}"#,
+        r#"{"type":"step.stop","index":0,"status":"done"}"#,
+        r#"{"type":"step.start","index":1,"step":{"type":"model_output","content":[{"type":"text","text":"Result"}]}}"#,
+        r#"{"type":"step.delta","index":1,"delta":{"type":"text_annotation_delta","annotations":[{"type":"url_citation","start_index":0,"end_index":6,"url":"https://example.com"}]}}"#,
+        r#"{"type":"step.stop","index":1,"status":"done"}"#,
+        r#"{"type":"interaction.completed","interaction":{"id":"interaction-stream-fidelity","status":"completed","service_tier":"priority","usage":{"total_input_tokens":2,"total_output_tokens":1}}}"#,
+    ] {
+        translator.process_payload(payload).unwrap();
+    }
+
+    let finish_events = format!("{:?}", translator.finish().unwrap());
+    assert!(finish_events.contains("server-signature"));
+    assert!(finish_events.contains("Gemini API"));
+    assert!(finish_events.contains("interaction_annotations"));
+    assert!(finish_events.contains("https://example.com"));
+    assert!(finish_events.contains("priority"));
+}
+
+#[test]
 fn treats_gemini_37_requires_action_as_a_terminal_tool_stream_event() {
     let continuations = Arc::new(RwLock::new(InteractionContinuationCache::default()));
     let mut translator = GeminiInteractionsStreamTranslator::new(
@@ -5468,6 +6238,7 @@ fn treats_gemini_37_requires_action_as_a_terminal_tool_stream_event() {
         json!({"messages": [{"role": "user", "content": "Check weather"}]}),
         continuations,
         4,
+        true,
     );
     for payload in [
         r#"{"type":"interaction.created","interaction":{"id":"interaction-tool-37","status":"in_progress"}}"#,
@@ -5496,7 +6267,9 @@ fn maps_latest_interactions_usage_details_to_anthropic_usage() {
             "total_thought_tokens": 6,
             "total_cached_tokens": 3,
             "total_tool_use_tokens": 2,
-            "total_tokens": 22
+            "total_tokens": 22,
+            "input_tokens_by_modality": [{"modality": "text", "tokens": 12}],
+            "grounding_tool_count": [{"type": "google_search", "count": 1}]
         }
     });
     let translated = translate_gemini_interactions_response(&upstream, "gemini-3.7-flash").unwrap();
@@ -5504,6 +6277,28 @@ fn maps_latest_interactions_usage_details_to_anthropic_usage() {
     assert_eq!(translated.message["usage"]["output_tokens"], 10);
     assert_eq!(translated.message["usage"]["reasoning_tokens"], 6);
     assert_eq!(translated.message["usage"]["cache_read_input_tokens"], 3);
+    assert_eq!(translated.message["usage"]["tool_use_tokens"], 2);
+    assert_eq!(translated.message["usage"]["total_tokens"], 22);
+    assert_eq!(
+        translated.message["provider_metadata"]["google"]["interaction_usage"]
+            ["input_tokens_by_modality"][0]["tokens"],
+        12
+    );
+    assert_eq!(
+        translated.message["provider_metadata"]["google"]["interaction_usage"]
+            ["grounding_tool_count"][0]["count"],
+        1
+    );
+
+    let budget_exceeded = json!({
+        "id": "interaction-budget-37",
+        "status": "budget_exceeded",
+        "steps": [{"type": "model_output", "content": [{"type": "text", "text": "Partial."}]}],
+        "usage": {"total_input_tokens": 12, "total_output_tokens": 4}
+    });
+    let translated =
+        translate_gemini_interactions_response(&budget_exceeded, "gemini-3.7-flash").unwrap();
+    assert_eq!(translated.message["stop_reason"], "max_tokens");
 }
 
 #[test]

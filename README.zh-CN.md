@@ -60,7 +60,7 @@ Anthropic Messages · Agent · MCP · tools · thinking · media
 
 | 模型 | 推荐 transport | 已适配的关键能力 | 可选路径 |
 | --- | --- | --- | --- |
-| **Gemini 3.7 Flash** | `gemini-interactions` | 最新 `step.*` SSE 双格式、有状态精确续接、Thinking/签名、1M 上下文、图片与 PDF、原生 Token Count、结构化输出、详细 Usage、Google 服务端工具 | OpenAI Chat fallback |
+| **Gemini 3.7 Flash** | `gemini-interactions` | 最新 `step.*` SSE 双格式、有状态精确续接、Thinking/签名、1M 上下文、图片与 PDF（含 Claude Code `Read` 工具结果）、原生 Token Count、结构化输出、详细 Usage、Google 服务端工具及显式启用的原生 Remote MCP | OpenAI Chat fallback |
 | **DeepSeek V4 Flash** | `anthropic` | 最少转换保留 Claude Code 协议；Anthropic 与 Chat 路径提供 disabled/high/max 三态推理并让 16K budget 保持 high；Chat 仅在请求完全不携带工具时省略普通推理，携带 `tools` 时按 API 契约完整回放全部推理 | 无状态 `openai-responses`、OpenAI Chat、Vision Proxy |
 | **Qwen3.8 Max** | `anthropic` | Anthropic/Chat 提供真正可区分的 `low/medium/xhigh` 三档并限制普通轮次预算，避免常驻最大推理；Responses 支持七档原生 effort、精确续接、会话缓存及 Usage/延迟观测 | 有状态 `openai-responses`、OpenAI Chat |
 | **Kimi K3** | `anthropic` | Bearer 鉴权、`kimi-k3`、1M 上下文元数据、原生 Token Estimate、缓存 Usage；Chat 路径支持 Kimi effort、推理回放和结构化输出 | OpenAI Chat、显式启用的 Kimi Formula MCP 工具 |
@@ -69,6 +69,14 @@ Anthropic Messages · Agent · MCP · tools · thinking · media
 “可调用”不等于“深度适配”。重点模型会按供应商 API 契约审核，并用请求/响应 fixture 覆盖推理、工具、流式、Usage 和续接行为；其他兼容 Provider 则以它真实提供的字段和显式能力配置为准。
 
 供应商可能调整模型 ID、区域域名和 API 行为。仓库模板保存本项目实际验证过的配置；更新前请同时查看 [Provider 配置指南](PROVIDER_CONFIG.md) 与 [CHANGELOG](CHANGELOG.md)。
+
+### Gemini 3.7 Flash 用于本地项目开发
+
+原生 `gemini-interactions` 路径配合默认 `standard` 档位，已经足够覆盖日常本地仓库开发。实测核心链路包括文本与 SSE 流式输出、Thinking/签名、Claude Code 本地工具及精确工具结果续接、图片与 PDF、结构化输出、原生 Token Count、Usage/缓存/实际档位观测，以及跨服务重启的有状态会话。任务需要最新网页证据或服务端沙箱时，再启用 Google Search、URL Context 和 Code Execution 即可。
+
+读取、搜索、修改、构建、测试、调试或审查本地项目，**不需要**预先创建 File Search store、Remote MCP server，也不需要开启 Google Maps、Flex 或 Priority。它们都是按需使用的云端或生产扩展：File Search 面向 Google 托管的 RAG 资料库，Remote MCP 用于连接外部业务系统，Maps 面向地理信息任务，Flex 以延迟和可靠性换取较低费用，Priority 以额外费用换取更低延迟。保持关闭可以减少外部资源、数据流向和计费配置，让本地开发环境更简单。
+
+本项目对 Gemini 的支持范围明确以 Interactions 和本地开发为先：不实现传统 `generateContent` transport，也不实现依赖它的显式 `cachedContents` 生命周期，而是使用 Interactions 原生有状态续接与隐式缓存。File Search store 创建、本地目录云同步、独立 Files/Batch 管理 API、Live API 会话、后台 Interaction 管理以及 Computer Use 执行器目前也不在支持范围。已经实现的 Maps、已配置 store 的 File Search 查询、Remote MCP、Flex 和 Priority 仍可通过 profile 显式启用，但它们默认关闭，也不属于本地开发核心链路的验收承诺。
 
 ### Qwen3.8 Max 推理注意事项
 
@@ -82,7 +90,7 @@ Anthropic Messages · Agent · MCP · tools · thinking · media
 | `protocol` | 适用场景 | 取舍 |
 | --- | --- | --- |
 | `anthropic` | 供应商提供 Anthropic Messages endpoint | 转换最少，通常是 DeepSeek、Qwen、Kimi 面向 Claude Code 的首选 |
-| `gemini-interactions` | Google Gemini 原生 Interactions API | 保留 Google 原生状态、事件和服务端工具；使用 `store: true`，需接受服务端状态保留 |
+| `gemini-interactions` | Google Gemini 原生 Interactions API | 保留 Google 原生状态、事件和服务端工具；存储可配置且默认开启 |
 | `openai-responses` | 供应商正式提供 Responses API | 支持 Responses item/event、服务端工具和经过验证的有状态续接 |
 | `openai` | OpenAI Chat Completions 兼容端点 | 覆盖面最广；桥接器按 DeepSeek、Qwen、Kimi、Gemini 或通用方言恢复扩展能力 |
 
@@ -169,9 +177,10 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:18787/health'
 
 - `gemini-image`：Windows 安装器可为 Claude Code 注册 `generate_image`，使用 Gemini 图像模型生成预览并保存到系统“图片”目录下的 `ClaudeCodeBridge` 文件夹；
 - Kimi Formula：只暴露 Provider 中 `kimi_formula_tools` 明确列出的官方 Formula，默认关闭；
-- Google 服务端工具：`google_search`、`url_context`、`code_execution`、`google_maps` 和 File Search 均需在 Gemini profile 中显式启用。
+- Google 服务端工具：`google_search`、`url_context`、`code_execution`、`google_maps` 和 File Search 均需在 Gemini profile 中显式启用；Maps/File Search 对象会保留原生选项；
+- Gemini 原生 Remote MCP：通过 `gemini_remote_mcp_servers` 配置经过校验的 HTTPS Streamable HTTP server；可选鉴权 header 的值不会出现在管理输出中。
 
-服务端搜索、执行和生图可能产生额外费用。桥接器不会默认开启这些能力。
+服务端搜索、执行、Maps、已配置 store 的 File Search 查询、Remote MCP 以及 priority/flex 服务档位可能产生额外费用或要求预先创建资源。桥接器不会默认开启这些能力，也不会代为创建或同步其外部资源。
 
 ## 配置与运维
 
@@ -198,6 +207,8 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:18787/health'
 API Key 可以直接写入 Provider 文件，也可以通过 `api_key_env` 引用服务进程可见的环境变量。不要提交、截图或分发包含真实密钥的文件。
 
 Kimi K3 的 `context_window: 1048576` 会进入管理 API 和 `/v1/models` 元数据；若要让 Claude Code 客户端按完整 1M 窗口自动压缩，还需在启动 Claude Code 前设置 `CLAUDE_CODE_AUTO_COMPACT_WINDOW=1048576`。不同上下文规格之间切换后进行超长任务时，建议重启 Claude Code 会话。
+
+Gemini 3.7 Flash 支持 1,048,576 输入窗口和最多 65,536 输出 tokens。要开放完整输出上限，请把 profile 的 `max_output_tokens` 与 Claude Code 的 `CLAUDE_CODE_MAX_OUTPUT_TOKENS` 都设为 `65536`。原生 Interactions 续接通过不含 prompt 或工具结果正文的 opaque 本地 sidecar 跨服务重启恢复；Claude Code 在当前工具结果后追加运行时 `system` 上下文时，桥接器会把整个尾部 user/system 区间一起扫描，再选择 `previous_interaction_id`，运行时上下文仍保留在 `system_instruction` 中。默认 profile 不裁剪工具结果，并为有状态文本编程保留 Thinking signature、组装后的服务端工具 delta、Google annotations 与实际 service tier；内置工具也可使用原生选项对象。Claude Code 提供 `Read`、`Grep` 或 `Glob` 时，桥接器会追加准确性优先的源码导航教练：最多连续执行两次返回内容和行号的发现搜索，随后立即读取定位到的最佳源码；按完整逻辑单元和足够大的非重叠范围读取，每次结果后维护“已证实 / 仍缺失”的证据，并在所有重要结论有依据前继续调查；不会仅因有效读取次数较多而强迫不完整作答。独立的安全熔断仍然保留：只有连续三个已完成轮次的规范化工具名、参数和结果完全相同时，下一轮才强制 `tool_choice: none`。Computer Use 需要客户端浏览器执行器、截图回传循环及安全确认，本桥接器未提供这些组件，因此不会将其伪装为已支持。
 
 ## 设计边界
 

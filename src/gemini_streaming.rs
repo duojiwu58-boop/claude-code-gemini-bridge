@@ -5,6 +5,7 @@ enum InteractionStreamingBlock {
     },
     Text {
         text: String,
+        annotations: Vec<Value>,
     },
     Tool {
         id: String,
@@ -24,15 +25,19 @@ struct GeminiInteractionsStreamTranslator {
     profile_file: String,
     request: Value,
     continuations: Arc<InteractionContinuationState>,
+    store_interactions: bool,
     interaction_id: Option<String>,
     status: Option<String>,
     usage: Value,
     input_tokens: u64,
     next_content_index: usize,
     active_blocks: IndexMap<usize, ActiveInteractionStreamingBlock>,
+    active_server_tools: IndexMap<usize, Value>,
     assistant_content: Vec<Value>,
     calls: Vec<(String, String)>,
     server_tools: InteractionServerToolTrace,
+    interaction_annotations: Vec<Value>,
+    service_tier: Option<String>,
     completed: bool,
     finished: bool,
 }
@@ -44,6 +49,7 @@ impl GeminiInteractionsStreamTranslator {
         request: Value,
         continuations: Arc<InteractionContinuationState>,
         estimated_input_tokens: u64,
+        store_interactions: bool,
     ) -> Self {
         Self {
             message_id: format!("msg_{}", Uuid::new_v4().simple()),
@@ -51,15 +57,19 @@ impl GeminiInteractionsStreamTranslator {
             profile_file,
             request,
             continuations,
+            store_interactions,
             interaction_id: None,
             status: None,
             usage: json!({}),
             input_tokens: estimated_input_tokens,
             next_content_index: 0,
             active_blocks: IndexMap::new(),
+            active_server_tools: IndexMap::new(),
             assistant_content: Vec::new(),
             calls: Vec::new(),
             server_tools: InteractionServerToolTrace::default(),
+            interaction_annotations: Vec::new(),
+            service_tier: None,
             completed: false,
             finished: false,
         }
@@ -149,12 +159,24 @@ impl GeminiInteractionsStreamTranslator {
         if let Some(status) = interaction.get("status").and_then(Value::as_str) {
             self.status = Some(status.to_string());
         }
+        if self.service_tier.is_none() {
+            if let Some(service_tier) = interaction
+                .get("service_tier")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            {
+                self.service_tier = Some(service_tier.to_string());
+            }
+        }
         if let Some(usage) = interaction.get("usage") {
             self.capture_usage(usage);
         }
         if let Some(steps) = interaction.get("steps").and_then(Value::as_array) {
-            for step in steps {
+            for (step_index, step) in steps.iter().enumerate() {
                 self.server_tools.capture(step);
+                if step.get("type").and_then(Value::as_str) == Some("model_output") {
+                    self.capture_completed_annotations(step_index, step);
+                }
             }
         }
         self.completed |= completed;
@@ -165,6 +187,32 @@ impl GeminiInteractionsStreamTranslator {
                 interaction_id,
                 &self.calls,
             );
+        }
+    }
+
+    fn capture_completed_annotations(&mut self, step_index: usize, step: &Value) {
+        let Some(parts) = step.get("content").and_then(Value::as_array) else {
+            return;
+        };
+        for (part_index, part) in parts.iter().enumerate() {
+            let Some(annotations) = part
+                .get("annotations")
+                .and_then(Value::as_array)
+                .filter(|annotations| !annotations.is_empty())
+            else {
+                continue;
+            };
+            if self.interaction_annotations.iter().any(|existing| {
+                existing.get("annotations").and_then(Value::as_array) == Some(annotations)
+            }) {
+                continue;
+            }
+            self.interaction_annotations.push(json!({
+                "step_index": step_index,
+                "part_index": part_index,
+                "content_block_index": Value::Null,
+                "annotations": annotations
+            }));
         }
     }
 
@@ -199,6 +247,7 @@ impl GeminiInteractionsStreamTranslator {
             "model_output" => (
                 InteractionStreamingBlock::Text {
                     text: String::new(),
+                    annotations: Vec::new(),
                 },
                 json!({"type": "text", "text": ""}),
             ),
@@ -225,7 +274,7 @@ impl GeminiInteractionsStreamTranslator {
             }
             _ => {
                 if is_gemini_server_tool_step(step_type) {
-                    self.server_tools.capture(step);
+                    self.active_server_tools.insert(index, step.clone());
                     info!(
                         provider = %self.profile_file,
                         step_type,
@@ -289,7 +338,7 @@ impl GeminiInteractionsStreamTranslator {
                         )?;
                     }
                 }
-                InteractionStreamingBlock::Text { text } => {
+                InteractionStreamingBlock::Text { text, annotations } => {
                     let initial_text =
                         value_to_text(step.get("content").unwrap_or(&Value::Null));
                     if !initial_text.is_empty() {
@@ -304,6 +353,10 @@ impl GeminiInteractionsStreamTranslator {
                             }),
                         )?;
                     }
+                    append_text_annotations(
+                        annotations,
+                        step.get("content").unwrap_or(&Value::Null),
+                    );
                 }
                 InteractionStreamingBlock::Tool { .. } => {}
             }
@@ -319,10 +372,14 @@ impl GeminiInteractionsStreamTranslator {
         else {
             return Ok(Vec::new());
         };
+        let delta = event.get("delta").unwrap_or(&Value::Null);
+        if let Some(step) = self.active_server_tools.get_mut(&index) {
+            merge_interaction_delta(step, delta);
+            return Ok(Vec::new());
+        }
         let Some(active) = self.active_blocks.get_mut(&index) else {
             return Ok(Vec::new());
         };
-        let delta = event.get("delta").unwrap_or(&Value::Null);
         let delta_type = delta
             .get("type")
             .and_then(Value::as_str)
@@ -337,6 +394,7 @@ impl GeminiInteractionsStreamTranslator {
                     let text = delta
                         .get("text")
                         .and_then(Value::as_str)
+                        .or_else(|| delta.pointer("/content/text").and_then(Value::as_str))
                         .map(str::to_owned)
                         .unwrap_or_else(|| {
                             value_to_text(delta.get("content").unwrap_or(&Value::Null))
@@ -370,7 +428,7 @@ impl GeminiInteractionsStreamTranslator {
                 }
                 _ => {}
             },
-            InteractionStreamingBlock::Text { text } => {
+            InteractionStreamingBlock::Text { text, annotations } => {
                 if delta_type == "text" || delta.get("text").is_some() {
                     if let Some(value) = delta.get("text").and_then(Value::as_str) {
                         if !value.is_empty() {
@@ -385,6 +443,10 @@ impl GeminiInteractionsStreamTranslator {
                                 }),
                             )?;
                         }
+                    }
+                } else if delta_type == "text_annotation_delta" {
+                    if let Some(values) = delta.get("annotations").and_then(Value::as_array) {
+                        annotations.extend(values.iter().cloned());
                     }
                 }
             }
@@ -413,9 +475,6 @@ impl GeminiInteractionsStreamTranslator {
     }
 
     fn stop_step(&mut self, event: &Value) -> Result<Vec<Event>, String> {
-        if let Some(step) = event.get("step") {
-            self.server_tools.capture(step);
-        }
         let Some(index) = event
             .get("index")
             .and_then(Value::as_u64)
@@ -423,6 +482,16 @@ impl GeminiInteractionsStreamTranslator {
         else {
             return Ok(Vec::new());
         };
+        if let Some(mut step) = self.active_server_tools.shift_remove(&index) {
+            if let Some(completed_step) = event.get("step") {
+                merge_interaction_delta(&mut step, completed_step);
+            }
+            self.server_tools.capture(&step);
+            return Ok(Vec::new());
+        }
+        if let Some(step) = event.get("step") {
+            self.server_tools.capture(step);
+        }
         let Some(active) = self.active_blocks.shift_remove(&index) else {
             return Ok(Vec::new());
         };
@@ -437,7 +506,13 @@ impl GeminiInteractionsStreamTranslator {
                 }
                 self.assistant_content.push(block);
             }
-            InteractionStreamingBlock::Text { text } => {
+            InteractionStreamingBlock::Text { text, annotations } => {
+                if !annotations.is_empty() {
+                    self.interaction_annotations.push(json!({
+                        "content_block_index": active.anthropic_index,
+                        "annotations": annotations
+                    }));
+                }
                 self.assistant_content
                     .push(json!({"type": "text", "text": text}));
             }
@@ -453,13 +528,15 @@ impl GeminiInteractionsStreamTranslator {
                 })?;
                 let call = (id.clone(), name.clone());
                 self.calls.push(call.clone());
-                if let Some(interaction_id) = self.interaction_id.as_deref() {
-                    remember_interaction_calls(
-                        &self.continuations,
-                        &self.profile_file,
-                        interaction_id,
-                        std::slice::from_ref(&call),
-                    );
+                if self.store_interactions {
+                    if let Some(interaction_id) = self.interaction_id.as_deref() {
+                        remember_interaction_calls(
+                            &self.continuations,
+                            &self.profile_file,
+                            interaction_id,
+                            std::slice::from_ref(&call),
+                        );
+                    }
                 }
                 self.assistant_content.push(json!({
                     "type": "tool_use",
@@ -490,29 +567,34 @@ impl GeminiInteractionsStreamTranslator {
         if !self.active_blocks.is_empty() {
             return Err("Gemini Interactions stream ended with an unfinished step".to_string());
         }
+        if !self.active_server_tools.is_empty() {
+            return Err(
+                "Gemini Interactions stream ended with an unfinished server-tool step".to_string(),
+            );
+        }
         let interaction_id = self.interaction_id.as_deref().ok_or_else(|| {
             "Gemini Interactions stream completed without an interaction id".to_string()
         })?;
-        remember_interaction_continuation(
-            &self.continuations,
-            &self.profile_file,
-            &self.request,
-            interaction_id,
-            &self.assistant_content,
-            &self.calls,
-        );
+        if self.store_interactions {
+            remember_interaction_continuation(
+                &self.continuations,
+                &self.profile_file,
+                &self.request,
+                interaction_id,
+                &self.assistant_content,
+                &self.calls,
+            );
+        }
         let status = self.status.as_deref().unwrap_or("completed");
-        let stop_reason = if !self.calls.is_empty() || status == "requires_action" {
-            "tool_use"
-        } else if status == "incomplete" {
-            "max_tokens"
-        } else {
-            "end_turn"
-        };
+        let stop_reason = interaction_stop_reason(status, !self.calls.is_empty());
         self.finished = true;
         let mut events = Vec::new();
         let mut delta = json!({"stop_reason": stop_reason, "stop_sequence": Value::Null});
-        if let Some(metadata) = self.server_tools.provider_metadata() {
+        if let Some(metadata) = self.server_tools.provider_metadata(
+            &self.usage,
+            &self.interaction_annotations,
+            self.service_tier.as_deref(),
+        ) {
             delta["provider_metadata"] = metadata;
         }
         let mut usage = gemini_interaction_usage_to_anthropic(&self.usage, self.input_tokens);
@@ -536,13 +618,36 @@ impl GeminiInteractionsStreamTranslator {
     }
 }
 
+fn append_text_annotations(target: &mut Vec<Value>, content: &Value) {
+    let Some(parts) = content.as_array() else {
+        return;
+    };
+    for part in parts {
+        if let Some(annotations) = part.get("annotations").and_then(Value::as_array) {
+            target.extend(annotations.iter().cloned());
+        }
+    }
+}
+
+fn merge_interaction_delta(target: &mut Value, delta: &Value) {
+    match (target, delta) {
+        (Value::Object(target), Value::Object(delta)) => {
+            for (key, value) in delta {
+                if let Some(existing) = target.get_mut(key) {
+                    merge_interaction_delta(existing, value);
+                } else {
+                    target.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        (Value::Array(target), Value::Array(delta)) => target.extend(delta.iter().cloned()),
+        (target, delta) => *target = delta.clone(),
+    }
+}
+
 fn gemini_interactions_event_stream<S, B, E>(
     byte_stream: S,
-    model: String,
-    profile_file: String,
-    request: Value,
-    continuations: Arc<InteractionContinuationState>,
-    estimated_input_tokens: u64,
+    translator: GeminiInteractionsStreamTranslator,
 ) -> impl Stream<Item = Result<Event, Infallible>>
 where
     S: Stream<Item = Result<B, E>> + Send + 'static,
@@ -550,13 +655,6 @@ where
     E: std::fmt::Display + Send + 'static,
 {
     let byte_stream = Box::pin(byte_stream);
-    let translator = GeminiInteractionsStreamTranslator::new(
-        model,
-        profile_file,
-        request,
-        continuations,
-        estimated_input_tokens,
-    );
     let initial_events = match translator.start_events() {
         Ok(events) => VecDeque::from(events),
         Err(message) => VecDeque::from([anthropic_stream_error_event(&message)]),
@@ -661,15 +759,24 @@ fn gemini_interactions_stream_response(
     request: Value,
     continuations: Arc<InteractionContinuationState>,
     estimated_input_tokens: u64,
+    store_interactions: bool,
 ) -> Response {
-    let event_stream = gemini_interactions_event_stream(
-        upstream.bytes_stream(),
+    let actual_service_tier = upstream
+        .headers()
+        .get("x-gemini-service-tier")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let mut translator = GeminiInteractionsStreamTranslator::new(
         model,
         profile_file,
         request,
         continuations,
         estimated_input_tokens,
+        store_interactions,
     );
+    translator.service_tier = actual_service_tier;
+    let event_stream = gemini_interactions_event_stream(upstream.bytes_stream(), translator);
     Sse::new(event_stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response()

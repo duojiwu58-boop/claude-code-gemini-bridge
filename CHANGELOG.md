@@ -9,8 +9,20 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 
 ## [v0.6.0] - 2026-08-19
 
+### Gemini 3.7 Flash Six-Capability Completion
+
+- Fixed Claude Code PDF `Read` continuation: documents are removed from `function_result.result` (which only accepts text/image) and emitted as a following native `user_input`; native token counting mirrors the same legal split.
+- Decoded structured `thought_summary.content` deltas to plain Anthropic thinking text instead of leaking serialized JSON wrappers.
+- Preserved native Google Maps and File Search options, including map widget/location fields, File Search metadata filters, and configured store names.
+- Added validated, opt-in Gemini native Remote MCP servers with HTTPS Streamable HTTP URLs, safe names, optional `allowed_tools`, and redacted authorization header values in management output.
+- Restricted Gemini 3.7 Flash service-tier configuration to the supported `standard`, `flex`, and `priority` values; the stale `deferred` value is now rejected.
+- Documented the recommended local-development baseline: native Interactions, stateful continuation, and the `standard` tier provide the complete core coding workflow without provisioning File Search, Remote MCP, Maps, Flex, or Priority. These cloud/production extensions remain explicitly opt-in.
+- Defined the Gemini product boundary around Claude Code local development: the legacy `generateContent` transport, explicit `cachedContents`, File Search store provisioning/local sync, standalone Files/Batch management, Live/background Interaction management, and Computer Use execution are intentionally unsupported for now. Existing optional Interactions extensions remain default-off profile features.
+- Added an accuracy-first Gemini Interactions source-navigation coach for Claude Code. Requests exposing `Read`, `Grep`, or `Glob` receive a final-position system policy for high-information search, complete logical-unit reads, large non-overlapping ranges, evidence-gap tracking, and accuracy-first completion. Fixed navigation-call cutoffs were removed so useful long investigations remain enabled; the exact three-identical-cycle safety breaker remains.
+
 ### Gemini 3.7 Flash and Current Interactions API
 
+- Made the default stateful Claude Code path near-lossless for text coding: packaged profiles no longer truncate tool results, signature-only thoughts remain replayable, streamed Google tool deltas and annotations are retained, actual service tier is observable, and built-in tool objects preserve native Google options.
 - Updated runtime, installer, provider, Claude settings, test scripts, documentation, and marketing defaults to the GA `gemini-3.7-flash` model. The native profile records its 1,048,576-token context window and uses the model's recommended `medium` default thinking level.
 - Changed the Windows installer's generated Gemini profile to the native `gemini-interactions` transport. Its Google key remains in the service-managed credential file instead of being duplicated in provider JSON, while the native Messages and Token Count paths inherit the bridge's global Gemini proxy.
 - Added dual-schema SSE compatibility for both the formal `event_type`/`thought_summary`/`arguments_delta` resource schema and the `type`/`thought`/`arguments` shapes in the Gemini 3.7 migration examples. Initial thought signatures, initial model-output content, and terminal `interaction.requires_action` tool streams are now preserved.
@@ -18,7 +30,9 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 - Mapped current Interactions usage (`total_input_tokens`, `total_output_tokens`, `total_thought_tokens`, and `total_cached_tokens`) plus the migration aliases (`prompt_tokens` and `completion_tokens`) into Claude usage. Thought tokens are included in `output_tokens` and also exposed as `reasoning_tokens`.
 - Reject assistant-prefill requests locally with a clear Anthropic error because Gemini 3.7 no longer accepts prefilled model turns. Deprecated sampling parameters remain suppressed, and `candidate_count` is diagnosed and ignored.
 - Added a Model Center **Low / Medium / High** control for active Gemini 3.7 Flash Interactions profiles. The persisted override applies to the next request without restarting the service and intentionally takes precedence over request-level effort/budget and the profile default.
-- Expanded the Rust regression suite from 121 to 130 passing tests with Gemini 3.7 REST SSE, function-tool pause, usage-detail, reasoning-level, hot GUI override, persistence, prefill, bridge-managed credential, and native token-count coverage.
+- Restored exact stored continuation when Claude Code appends runtime `system` context after a tool result or splits one tool turn across trailing messages; every current result is forwarded with the matched `previous_interaction_id`, and runtime context remains a system instruction.
+- Added a hard repeated-tool circuit breaker: three consecutive completed cycles with identical canonical tool names, arguments, and results override every normal tool-choice setting with `none`, emit a diagnostic, and request the best final answer. Changed arguments or results reset the guard.
+- Expanded the Rust regression suite from 121 to 167 passing tests with Gemini 3.7 REST SSE, function-tool pause, usage details, reasoning levels, hot GUI override, persistence, prefill, bridge-managed credentials, native token counting, optional server tools, restart-safe continuation, loop safety, and source-navigation coverage.
 
 ## [v0.5.1] - 2026-08-08
 
@@ -276,8 +290,20 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 
 ## [v0.6.0] - 2026-08-19
 
+### Gemini 3.7 Flash 六项能力补全
+
+- 修复 Claude Code PDF `Read` 续接：PDF 不再放入只允许 text/image 的 `function_result.result`，而是作为随后一条原生 `user_input` 发送；原生 Token Count 采用相同合法结构。
+- 将结构化 `thought_summary.content` delta 解码为纯 Anthropic Thinking 文本，不再泄漏 JSON 包装字符串。
+- 保留 Google Maps 与 File Search 原生选项，包括地图 widget/位置字段、File Search metadata filter 和 store 名称。
+- 新增显式启用、经过校验的 Gemini 原生 Remote MCP：只接受 HTTPS Streamable HTTP、安全名称和可选 `allowed_tools`，管理输出会脱敏鉴权 header 值。
+- Gemini 3.7 Flash 服务档位严格限制为受支持的 `standard`、`flex`、`priority`，陈旧的 `deferred` 配置会被拒绝。
+- 明确记录推荐的本地开发基线：原生 Interactions、有状态续接和 `standard` 档位已覆盖完整核心编码流程，无需预先创建 File Search、Remote MCP、Maps、Flex 或 Priority；这些云端/生产扩展继续保持显式按需启用。
+- 明确 Gemini 产品边界以 Claude Code 本地开发为核心：传统 `generateContent` transport、显式 `cachedContents`、File Search store 创建/本地同步、独立 Files/Batch 管理、Live/后台 Interaction 管理及 Computer Use 执行目前均不支持；已实现的 Interactions 扩展继续作为默认关闭的 profile 可选项保留。
+- 新增准确性优先的 Gemini Interactions 源码导航教练：提供 `Read`、`Grep` 或 `Glob` 的请求会在系统指令末尾获得高信息量搜索、完整逻辑单元读取、大范围非重叠阅读、证据缺口跟踪和准确性优先完成规则。固定导航次数截断已移除，长时间但持续获得证据的调查不会被提前终止；完全相同三轮的安全熔断继续保留。
+
 ### Gemini 3.7 Flash 与最新 Interactions API
 
+- 默认有状态 Claude Code 文本编程路径现已接近无损：随包 profile 不再裁剪工具结果，仅有签名的 Thinking 仍可回放，流式 Google 工具 delta 与 annotations 得到保留，实际 service tier 可观测，内置工具对象也会保留 Google 原生选项。
 - 将运行时、安装器、Provider、Claude settings、测试脚本、文档和推广内容的默认模型升级为 GA 的 `gemini-3.7-flash`。原生配置记录 1,048,576-token 上下文窗口，并采用模型推荐的 `medium` 默认 Thinking 档位。
 - Windows 安装器生成的 Gemini profile 已切换到原生 `gemini-interactions` transport。Google Key 继续只保存在服务托管的凭据文件中，不会重复写入 Provider JSON；原生 Messages 与 Token Count 路径会继承桥接器全局 Gemini 代理。
 - 同时兼容正式资源 schema 的 `event_type`/`thought_summary`/`arguments_delta`，以及 Gemini 3.7 迁移示例中的 `type`/`thought`/`arguments`。现在会保留 step 起始签名、起始模型文本，并把 `interaction.requires_action` 正确视为工具流终态。
@@ -285,7 +311,9 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 - 映射最新 Interactions Usage（`total_input_tokens`、`total_output_tokens`、`total_thought_tokens`、`total_cached_tokens`）及迁移示例别名（`prompt_tokens`、`completion_tokens`）。Thinking tokens 会计入 `output_tokens`，并单独暴露为 `reasoning_tokens`。
 - Gemini 3.7 不再接受 assistant prefill，因此桥接器会在本地返回清晰的 Anthropic 请求错误；废弃采样参数继续被抑制，`candidate_count` 会产生诊断并被忽略。
 - 模型中心新增 Gemini 3.7 Flash Interactions 专用的“低 / 中 / 高”Thinking 控件；选择会持久化并从下一次请求生效，无需重启服务，且明确优先于请求级 effort/budget 和 profile 默认值。
-- Rust 回归测试由 121 增加到 130 个且全部通过，新增覆盖 3.7 REST SSE、函数工具暂停、Usage 细分、推理档位、GUI 热切换与持久化、prefill、桥接器托管凭据及原生 Token Count。
+- 修复 Claude Code 在工具结果后追加运行时 `system` 上下文或拆分尾部消息时无法命中原生状态的问题；现在会完整转发本轮结果、使用匹配的 `previous_interaction_id`，并保持运行时上下文的 system 优先级。
+- 新增硬性重复工具熔断：若连续三个已完成轮次的规范化工具名、参数和结果完全相同，最终工具策略会无条件改为 `none`，同时给出诊断并要求模型直接作答；参数或结果变化会重置计数。
+- Rust 回归测试由 121 增加到 167 个且全部通过，新增覆盖 3.7 REST SSE、函数工具暂停、Usage 细分、推理档位、GUI 热切换与持久化、prefill、桥接器托管凭据、原生 Token Count、可选服务端工具、跨重启续接、循环安全及源码导航。
 
 ## [v0.5.1] - 2026-08-08
 

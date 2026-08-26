@@ -61,7 +61,7 @@ Anthropic Messages · agent · MCP · tools · thinking · media
 
 | Model | Recommended transport | Key adaptations | Optional paths |
 | --- | --- | --- | --- |
-| **Gemini 3.7 Flash** | `gemini-interactions` | Current `step.*` SSE variants, exact stateful continuation, thinking/signatures, 1M context, images and PDFs, native token count, structured output, detailed usage, and Google server-side tools | OpenAI Chat fallback |
+| **Gemini 3.7 Flash** | `gemini-interactions` | Current `step.*` SSE variants, exact stateful continuation, thinking/signatures, 1M context, images and PDFs (including Claude Code `Read` tool results), native token count, structured output, detailed usage, Google server-side tools, and opt-in native Remote MCP | OpenAI Chat fallback |
 | **DeepSeek V4 Flash** | `anthropic` | Minimal translation of the Claude Code contract; Anthropic and Chat routes provide disabled/high/max reasoning modes and keep 16K budgets at high; Chat omits ordinary reasoning only in tool-free requests and fully replays it whenever `tools` are present, as required by the API | Stateless `openai-responses`, OpenAI Chat, Vision Proxy |
 | **Qwen3.8 Max** | `anthropic` | Three effective Anthropic/Chat reasoning modes (`low/medium/xhigh`) with bounded normal-turn budgets instead of permanent maximum reasoning; exact Responses continuation, seven-level native effort, session cache, usage and latency observability | Stateful `openai-responses`, OpenAI Chat |
 | **Kimi K3** | `anthropic` | Bearer authentication, verified `kimi-k3` model ID, 1M context metadata, native token estimate, and cache usage; Chat fallback maps Kimi effort, reasoning replay, and structured output | OpenAI Chat and explicitly enabled Kimi Formula MCP tools |
@@ -70,6 +70,14 @@ Anthropic Messages · agent · MCP · tools · thinking · media
 “Callable” is not the same as “deeply adapted.” Priority models are reviewed against their provider API contracts and covered by request/response fixtures for reasoning, tools, streaming, usage, and continuation. Generic providers receive only the capabilities proven by their actual fields and explicit configuration.
 
 Providers may change model IDs, regional domains, and API behavior. Repository templates record configurations verified by this project; check the [Provider configuration guide](PROVIDER_CONFIG.md) and [changelog](CHANGELOG.md) before upgrading.
+
+### Gemini 3.7 Flash for local project development
+
+The native `gemini-interactions` route on the default `standard` tier is sufficient for ordinary local repository work. Its verified core path covers text and SSE streaming, Thinking/signatures, Claude Code local tools and exact tool-result continuation, images and PDFs, structured output, native token counting, usage/cache/tier observability, and restart-safe stateful conversations. Google Search, URL Context, and Code Execution can be enabled when a task benefits from current web evidence or a server-side sandbox.
+
+You do **not** need to provision File Search stores, Remote MCP servers, Google Maps, Flex, or Priority to read, search, edit, build, test, debug, or review a local project. Those are opt-in cloud or production extensions: File Search is for Google-hosted RAG corpora, Remote MCP connects external business systems, Maps serves geospatial work, Flex trades latency/reliability for lower cost, and Priority pays a premium for lower latency. Leaving them disabled keeps local development simpler and avoids unnecessary external resources, data flows, and billing modes.
+
+The project's supported Gemini scope is deliberately Interactions-first and local-development-first. It does not implement the legacy `generateContent` transport or its explicit `cachedContents` lifecycle; Interactions' native stateful continuation and implicit caching are used instead. File Search store creation, local-directory cloud synchronization, the standalone Files/Batch management APIs, Live API sessions, background Interaction management, and a Computer Use executor are also currently out of scope. Existing optional Interactions extensions such as Maps, configured File Search queries, Remote MCP, Flex, and Priority remain available only through explicit profile configuration; they are default-off extensions, not part of the locally validated baseline.
 
 ### Qwen3.8 Max reasoning notes
 
@@ -83,7 +91,7 @@ Providers may change model IDs, regional domains, and API behavior. Repository t
 | `protocol` | Use it when | Trade-off |
 | --- | --- | --- |
 | `anthropic` | The provider exposes an Anthropic Messages endpoint | Minimal translation and usually the preferred Claude Code route for DeepSeek, Qwen, and Kimi |
-| `gemini-interactions` | Calling Google's native Gemini Interactions API | Preserves Google-native state, events, and server tools; uses `store: true`, so provider-side state retention must be acceptable |
+| `gemini-interactions` | Calling Google's native Gemini Interactions API | Preserves Google-native state, events, and server tools; storage is configurable and enabled by default |
 | `openai-responses` | The provider officially exposes a Responses API | Supports semantic Responses items/events, server tools, and validated stateful continuation |
 | `openai` | Calling an OpenAI Chat Completions-compatible endpoint | Broadest coverage; provider dialects restore DeepSeek, Qwen, Kimi, Gemini, or generic extensions where available |
 
@@ -170,9 +178,10 @@ The original media is sent to the vision provider, and bounded extracted evidenc
 
 - `gemini-image`: the Windows installer can register a `generate_image` tool for Claude Code, returning a preview and saving the generated file under the `ClaudeCodeBridge` folder in the Windows known Pictures directory.
 - Kimi Formula: only official Formula tools explicitly listed in `kimi_formula_tools` are exposed; the feature is off by default.
-- Google server-side tools: `google_search`, `url_context`, `code_execution`, `google_maps`, and File Search must be explicitly enabled in the Gemini profile.
+- Google server-side tools: `google_search`, `url_context`, `code_execution`, `google_maps`, and File Search must be explicitly enabled in the Gemini profile. Maps/File Search objects retain their native options.
+- Gemini native Remote MCP: configure validated HTTPS Streamable HTTP servers through `gemini_remote_mcp_servers`; optional authorization header values are redacted from management output.
 
-Server-side search, execution, and image generation may incur extra charges. The bridge does not enable them by default.
+Server-side search, execution, Maps, configured File Search queries, Remote MCP, and priority/flex service tiers may incur extra charges or require provisioned resources. The bridge does not enable them by default and does not provision or synchronize their external resources.
 
 ## Configuration and operations
 
@@ -199,6 +208,8 @@ Each native provider owns an independent HTTP client and does not automatically 
 An API key can be stored directly in a provider profile or referenced through `api_key_env`, provided the variable is visible to the Windows service process. Never commit, screenshot, or distribute a configuration file containing a real credential.
 
 Kimi K3's `context_window: 1048576` is exposed through the management API and `/v1/models` metadata. To make the Claude Code client auto-compact against the full 1M window, set `CLAUDE_CODE_AUTO_COMPACT_WINDOW=1048576` before starting Claude Code. Restart the Claude Code session before a very long task after switching between models with different context sizes.
+
+Gemini 3.7 Flash supports a 1,048,576-token input window and up to 65,536 output tokens. Set the profile's `max_output_tokens` and Claude Code's `CLAUDE_CODE_MAX_OUTPUT_TOKENS` to `65536` to expose the full output limit. Native Interactions continuation survives bridge restarts through an opaque local sidecar that contains no prompt or tool-result text; split trailing Claude Code tool results and runtime `system` context messages are scanned together before selecting `previous_interaction_id`, while runtime context remains in `system_instruction`. The default profile does not truncate tool results. Thinking signatures, assembled server-tool deltas, Google annotations, and the actual service tier are preserved for stateful text-coding workflows; built-in tools may use native option objects. When Claude Code exposes `Read`, `Grep`, or `Glob`, the bridge appends an accuracy-first source-navigation coach: perform no more than two consecutive content-and-line discovery searches before reading the best located source, read complete logical units in sufficiently large non-overlapping ranges, track proven and missing evidence after each result, and continue until every material claim is supported. It never forces an incomplete answer merely because many useful reads were needed. The separate safety breaker still forces `tool_choice: none` after three consecutive completed cycles with identical canonical tool names, arguments, and results. Computer Use remains intentionally disabled because it requires a client-side browser executor, screenshot loop, and safety confirmations that this bridge does not provide.
 
 ## Design boundaries
 

@@ -4,10 +4,20 @@ struct InteractionCallContinuation {
     name: String,
 }
 
-#[derive(Default)]
 struct InteractionContinuationCache {
     calls: IndexMap<String, InteractionCallContinuation>,
     transcripts: IndexMap<String, String>,
+    persistence_path: Option<PathBuf>,
+}
+
+impl Default for InteractionContinuationCache {
+    fn default() -> Self {
+        Self {
+            calls: IndexMap::new(),
+            transcripts: IndexMap::new(),
+            persistence_path: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,8 +154,12 @@ struct OpenAiCapabilities {
     responses_builtin_tools: Vec<String>,
     responses_apply_patch_custom: bool,
     kimi_formula_tools: Vec<String>,
-    gemini_builtin_tools: Vec<String>,
+    gemini_builtin_tools: Vec<Value>,
     gemini_file_search_store_names: Vec<String>,
+    gemini_remote_mcp_servers: Vec<Value>,
+    gemini_store: bool,
+    gemini_service_tier: Option<String>,
+    gemini_tool_choice_override: Option<String>,
     user_id: Option<String>,
 }
 
@@ -181,6 +195,10 @@ impl Default for OpenAiCapabilities {
             kimi_formula_tools: Vec::new(),
             gemini_builtin_tools: Vec::new(),
             gemini_file_search_store_names: Vec::new(),
+            gemini_remote_mcp_servers: Vec::new(),
+            gemini_store: true,
+            gemini_service_tier: None,
+            gemini_tool_choice_override: None,
             user_id: None,
         }
     }

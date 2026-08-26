@@ -403,7 +403,10 @@ if ($configureGemini) {
         bridge_managed_credentials = $true
         identity = 'Google Gemini (gemini-3.7-flash)'
         capabilities = [ordered]@{
-            max_tool_result_chars = 16000
+            max_output_tokens = 65536
+            gemini_store = $true
+            gemini_service_tier = 'standard'
+            gemini_tool_choice_override = 'validated'
         }
     }
     if (Test-Path -LiteralPath $geminiProfile -PathType Leaf) {

@@ -75,18 +75,42 @@ fn gemini_count_token_parts(
                     .get(call_id)
                     .map(String::as_str)
                     .unwrap_or("unknown_function");
+                let translated_result = interaction_tool_result_value(
+                    part.get("content").unwrap_or(&Value::Null),
+                    max_tool_result_chars,
+                );
                 translated.push(json!({
                     "functionResponse": {
                         "name": name,
                         "response": {
-                            "result": interaction_tool_result_value(
-                                part.get("content").unwrap_or(&Value::Null),
-                                max_tool_result_chars
-                            ),
+                            "result": translated_result.result,
                             "is_error": part.get("is_error").and_then(Value::as_bool).unwrap_or(false)
                         }
                     }
                 }));
+                for document in translated_result.documents {
+                    if let Some(data) = document.get("data") {
+                        translated.push(json!({
+                            "inlineData": {
+                                "mimeType": document
+                                    .get("mime_type")
+                                    .cloned()
+                                    .unwrap_or_else(|| json!("application/pdf")),
+                                "data": data
+                            }
+                        }));
+                    } else if let Some(uri) = document.get("uri") {
+                        translated.push(json!({
+                            "fileData": {
+                                "mimeType": document
+                                    .get("mime_type")
+                                    .cloned()
+                                    .unwrap_or_else(|| json!("application/pdf")),
+                                "fileUri": uri
+                            }
+                        }));
+                    }
+                }
             }
             _ => {}
         }

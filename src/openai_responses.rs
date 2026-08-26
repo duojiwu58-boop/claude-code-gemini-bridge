@@ -221,8 +221,11 @@ fn translate_anthropic_to_responses(
             )
         })
         .flatten();
-    let (source_messages, names) = if let Some((_, names, _)) = &continuation {
-        (&messages[messages.len() - 1..], names.clone())
+    let (source_messages, names) = if let Some(continuation) = &continuation {
+        (
+            &messages[continuation.input_start..],
+            continuation.tool_names.clone(),
+        )
     } else {
         (&messages[..], HashMap::new())
     };
@@ -252,13 +255,16 @@ fn translate_anthropic_to_responses(
         "store".to_string(),
         Value::Bool(profile.openai_capabilities.responses_stateful),
     );
-    if let Some((id, _, continuation_kind)) = continuation {
+    if let Some(continuation) = continuation {
         info!(
             provider = %profile.file_name,
-            continuation = continuation_kind,
+            continuation = continuation.kind,
             "Continuing stored Responses request"
         );
-        body.insert("previous_response_id".to_string(), json!(id));
+        body.insert(
+            "previous_response_id".to_string(),
+            json!(continuation.previous_id),
+        );
     } else {
         let instructions = value_to_text(request.get("system").unwrap_or(&Value::Null));
         if !instructions.is_empty() {

@@ -129,6 +129,9 @@ where
     });
     let gemini_client = build_gemini_client(proxy_url.as_deref(), None)?;
     let gemini_thinking_level = load_persisted_gemini_thinking_level(&bridge_state_path);
+    let interaction_continuations = load_interaction_continuation_cache(
+        &interaction_continuation_state_path(&bridge_state_path),
+    );
 
     let state = Arc::new(AppState {
         gemini_transport: Arc::new(RwLock::new(GeminiTransport {
@@ -140,7 +143,7 @@ where
         upstream_url,
         model,
         thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
-        interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
+        interaction_continuations: Arc::new(RwLock::new(interaction_continuations)),
         vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
         routing: Arc::new(RwLock::new(ProviderRoutingState {
             profiles: loaded_profiles.profiles,
