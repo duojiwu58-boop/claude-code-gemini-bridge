@@ -1,5 +1,5 @@
 ﻿#ifndef AppVersion
-  #define AppVersion "0.7.0"
+  #define AppVersion "0.7.2"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\windows-x64"
@@ -44,6 +44,9 @@ Source: "{#SourceDir}\update-api-key.ps1"; DestDir: "{app}"; Flags: ignoreversio
 Source: "{#SourceDir}\uninstall.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\使用说明.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\PROVIDER_CONFIG.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\README.zh-CN.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\CHANGELOG.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\examples\providers\*"; DestDir: "{app}\examples\providers"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\scripts\*"; DestDir: "{app}\scripts"; Flags: ignoreversion recursesubdirs createallsubdirs

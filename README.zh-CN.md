@@ -78,6 +78,8 @@ Anthropic Messages · Agent · MCP · tools · thinking · media
 
 本项目对 Gemini 的支持范围明确以 Interactions 和本地开发为先：不实现传统 `generateContent` transport，也不实现依赖它的显式 `cachedContents` 生命周期，而是使用 Interactions 原生有状态续接与隐式缓存。File Search store 创建、本地目录云同步、独立 Files/Batch 管理 API、Live API 会话、后台 Interaction 管理以及 Computer Use 执行器目前也不在支持范围。已经实现的 Maps、已配置 store 的 File Search 查询、Remote MCP、Flex 和 Priority 仍可通过 profile 显式启用，但它们默认关闭，也不属于本地开发核心链路的验收承诺。
 
+Gemini 隐式缓存由 Google 管理；即使重复前缀满足条件，也**不保证**每个请求都会命中。桥接器会保持有状态 `previous_interaction_id` 续接及稳定的 interaction 级配置，把上游命中数映射到 Anthropic `usage.cache_read_input_tokens`，并在 `provider_metadata.google.interaction_usage.total_cached_tokens` 保留 Google 原始计数。数值为 0 只表示 Google 没有为该请求报告命中，不能单独据此判断桥接器故障。较大的稳定前缀在较短时间内重复请求可以提高命中概率；可确定创建的显式缓存仍不属于 Interactions transport。
+
 ### Qwen3.8 Max 推理注意事项
 
 - 仅提供 budget 时，Anthropic 与 Chat 路径在 8,192 以下使用 `low`、31,999 以下使用 `medium`、达到 31,999 后进入 `xhigh`；Responses 保留更细的 `<2K / <8K / <31,999 / >=31,999` → `low / medium / high / xhigh` 映射。这样 Claude Code 的 31,999-token ultrathink 上限能够进入 Qwen 最高档，常规轮次仍可控制费用。
@@ -113,7 +115,9 @@ http://127.0.0.1:18787
 
 Windows 服务名为 `ClaudeCodeBridge`。安装器会备份并更新 Claude Code 的 `settings.json`，让 Claude Code 始终连接这个稳定的本地地址。安装或升级后请重新启动正在运行的 Claude Code 会话，让进程取得最新配置；在启用本地鉴权之前启动的旧会话否则可能收到 `401 Unauthorized`。
 
-安装器还会生成随机 256-bit 本地桥接令牌，将其保存在受访问控制保护的 `C:\ProgramData\ClaudeCodeBridge\local-auth-token`，并自动配置 Claude Code、模型中心、停止脚本和 `gemini-image` MCP 携带该令牌；升级时会复用已有的有效令牌。运行时硬性拒绝所有非 loopback 监听地址。`/health` 与 `/v1/models` 保持为本机公开诊断；Messages、Responses、Token Count、MCP 以及全部 `/admin/*` 路由都必须提供正确的 Bearer token。直接从源码运行时，需通过 `GEMINI_BRIDGE_LOCAL_TOKEN` 提供至少 32 字符令牌，或用 `GEMINI_BRIDGE_LOCAL_TOKEN_FILE` 指向受保护文件。该凭据只用于验证本机调用者，绝不会被复用为 Gemini 或其他 Provider 的 API Key。
+安装器还会生成随机 256-bit 本地桥接令牌，将其保存在受访问控制保护的 `C:\ProgramData\ClaudeCodeBridge\local-auth-token`，并自动配置 Claude Code、模型中心、停止脚本和 `gemini-image` MCP 携带该令牌；升级时会复用已有的有效令牌。运行时硬性拒绝所有非 loopback 监听地址。`/health` 与 `/v1/models` 保持为本机公开诊断；Messages、Responses、Token Count、MCP 以及全部 `/admin/*` 路由都必须提供正确的 Bearer token。该凭据只用于验证本机调用者，绝不会被复用为 Gemini 或其他 Provider 的 API Key。
+
+源码开发时，`scripts\start-bridge.ps1` 会依次复用显式令牌、已安装的 `C:\ProgramData\ClaudeCodeBridge\local-auth-token` 或已有开发令牌；都不存在时，会原子创建 ACL 受保护的 `target\local-auth-token`。随附的停止和测试脚本会自动解析同一令牌。只有直接启动可执行文件时，才必须通过 `GEMINI_BRIDGE_LOCAL_TOKEN` 提供至少 32 字符令牌，或用 `GEMINI_BRIDGE_LOCAL_TOKEN_FILE` 指向受保护文件；需要其他开发令牌路径时可向启动脚本传入 `-LocalTokenFile`。
 
 提供 Gemini Key 时，安装器会创建原生 `gemini-interactions` profile；真实 Google 凭据仅保存在受保护的服务凭据文件中，不会重复写入 Provider JSON。
 
@@ -179,7 +183,7 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:18787/health'
 
 - `gemini-image`：Windows 安装器可为 Claude Code 注册 `generate_image`，使用 Gemini 图像模型生成预览并保存到系统“图片”目录下的 `ClaudeCodeBridge` 文件夹；
 - Kimi Formula：只暴露 Provider 中 `kimi_formula_tools` 明确列出的官方 Formula，默认关闭；
-- Google 服务端工具：`google_search`、`url_context`、`code_execution`、`google_maps` 和 File Search 均需在 Gemini profile 中显式启用；Maps/File Search 对象会保留原生选项；
+- Google 服务端工具：`google_search`、`url_context`、`code_execution`、`google_maps` 和 File Search 均需在 Gemini profile 中显式启用；Maps/File Search 对象会保留原生选项。由于 Gemini 不接受 `application/pdf` 与原生 Code Execution 同时出现，包含 PDF 输入的请求会仅省略 `code_execution` 并报告该降级；Search、URL Context、自定义函数及其他兼容工具仍保留，非 PDF 请求继续使用 Code Execution；
 - Gemini 原生 Remote MCP：通过 `gemini_remote_mcp_servers` 配置经过校验的 HTTPS Streamable HTTP server；可选鉴权 header 的值不会出现在管理输出中。
 
 服务端搜索、执行、Maps、已配置 store 的 File Search 查询、Remote MCP 以及 priority/flex 服务档位可能产生额外费用或要求预先创建资源。桥接器不会默认开启这些能力，也不会代为创建或同步其外部资源。

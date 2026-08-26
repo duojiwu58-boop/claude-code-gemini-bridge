@@ -56,6 +56,8 @@ It also generates a random local bridge token at:
 C:\ProgramData\ClaudeCodeBridge\local-auth-token
 Claude Code, the Model Center, shutdown scripts, and the Gemini image MCP use it automatically. A valid existing token is reused on upgrade; it is never used as an upstream provider API key.
 
+For source development, `scripts\start-bridge.ps1` reuses the installed token, an explicitly configured token, or an existing development token. If none exists, it securely creates `target\local-auth-token`; bundled stop and test scripts resolve the same token automatically. A direct executable launch must set `GEMINI_BRIDGE_LOCAL_TOKEN` or `GEMINI_BRIDGE_LOCAL_TOKEN_FILE`.
+
 4. Updating API Key
 
 Open "Configure or Update Gemini API Key" from the Start Menu and enter the new key.
@@ -79,6 +81,8 @@ To remove `C:\ProgramData\ClaudeCodeBridge`, delete it manually after confirming
 5. Streaming requests have no ten-minute whole-response deadline, but a stream with no bytes for two minutes is terminated; non-streaming requests retain the ten-minute limit.
 6. Vision Proxy fails explicitly instead of silently dropping untranslatable media and processes at most 16 historical media messages per request.
 7. Do not distribute configuration files containing API keys or the local bridge token.
+8. Gemini PDF requests automatically omit only native Code Execution because Google rejects that combination; Search, URL Context, local tools, and non-PDF Code Execution remain available.
+9. Gemini Interactions implicit-cache hits are managed by Google and are not guaranteed per request. A zero cached-token count does not by itself indicate a bridge failure.
 
 
 ================================================
@@ -130,6 +134,8 @@ C:\ProgramData\ClaudeCodeBridge\local-auth-token
 Claude Code、模型中心、停止脚本和 Gemini 生图 MCP 会自动使用该令牌，无需手工复制。
 升级时会复用已有的有效令牌；该令牌绝不会被用作上游 Provider API Key。
 
+源码开发时，`scripts\start-bridge.ps1` 会复用安装令牌、显式配置的令牌或已有开发令牌；都不存在时，会安全创建 `target\local-auth-token`。随附的停止和测试脚本会自动解析同一令牌。若直接启动可执行文件，则必须设置 `GEMINI_BRIDGE_LOCAL_TOKEN` 或 `GEMINI_BRIDGE_LOCAL_TOKEN_FILE`。
+
 四、更新 API Key
 
 从开始菜单打开“配置或更新 Gemini API Key”，输入新 Key。
@@ -153,3 +159,5 @@ Claude Code、模型中心、停止脚本和 Gemini 生图 MCP 会自动使用�
 5. 流式请求没有 10 分钟整流总时限，但连续两分钟无数据会终止；非流式请求仍保留 10 分钟上限。
 6. Vision Proxy 遇到无法转换的媒体会明确失败，不会静默丢图；单次请求最多处理 16 条历史媒体消息。
 7. 请勿将自己已经填写 API Key 的配置文件或本地桥接令牌转发给他人。
+8. Gemini PDF 请求会自动只省略 Google 不接受与 PDF 同时使用的原生 Code Execution；Search、URL Context、本地工具以及非 PDF 请求的 Code Execution 仍可使用。
+9. Gemini Interactions 的隐式缓存命中由 Google 管理，不保证每个请求命中；cached-token 为 0 不能单独说明桥接器故障。

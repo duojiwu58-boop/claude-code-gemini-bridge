@@ -1,5 +1,5 @@
 ﻿param(
-    [string]$Version = '0.7.0'
+    [string]$Version = '0.7.2'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -15,6 +15,9 @@ $appIcon = Join-Path `
 $settingsTemplate = Join-Path $projectDir 'claude-settings.example.json'
 $bridgeSettingsTemplate = Join-Path $projectDir 'claude-settings.bridge.json'
 $providerGuide = Join-Path $projectDir 'PROVIDER_CONFIG.md'
+$readmeEnglish = Join-Path $projectDir 'README.md'
+$readmeChinese = Join-Path $projectDir 'README.zh-CN.md'
+$changelog = Join-Path $projectDir 'CHANGELOG.md'
 $providerExamples = Join-Path $projectDir 'examples\providers'
 $licenseFile = Join-Path $projectDir 'LICENSE'
 $innoScript = Join-Path $projectDir 'packaging\inno\ClaudeCodeBridge.iss'
@@ -32,6 +35,9 @@ foreach ($requiredPath in @(
     $settingsTemplate
     $bridgeSettingsTemplate
     $providerGuide
+    $readmeEnglish
+    $readmeChinese
+    $changelog
     $providerExamples
     $licenseFile
     $innoScript
@@ -106,6 +112,15 @@ Copy-Item `
 Copy-Item `
     -LiteralPath $providerGuide `
     -Destination (Join-Path $stagingDir 'PROVIDER_CONFIG.md')
+Copy-Item `
+    -LiteralPath $readmeEnglish `
+    -Destination (Join-Path $stagingDir 'README.md')
+Copy-Item `
+    -LiteralPath $readmeChinese `
+    -Destination (Join-Path $stagingDir 'README.zh-CN.md')
+Copy-Item `
+    -LiteralPath $changelog `
+    -Destination (Join-Path $stagingDir 'CHANGELOG.md')
 New-Item `
     -ItemType Directory `
     -Path (Join-Path $stagingDir 'examples') `

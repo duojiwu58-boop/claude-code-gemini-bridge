@@ -124,7 +124,9 @@ Web Search 的 `web_search_20250305` 服务端工具在 Anthropic 路径上原�
 DeepSeek 服务端执行（实测：模型发出 `server_tool_use`，API 返回
 `web_search_tool_result`）；Chat fallback 无法服务端执行，桥接器会跳过该工具并
 发出 `x-claude-bridge-warning`，历史里的搜索结果以标题/URL 文本形式保留（正文
-`encrypted_content` 仅供客户端解密）。
+`encrypted_content` 仅供客户端解密）。Responses 转换同样不会把 Claude 的
+`web_search_*` 服务端工具冒充为客户端 function；需要上游 Responses 原生搜索时，
+应在确认供应商支持后通过 `capabilities.responses_builtin_tools` 显式启用。
 
 若希望 Claude Code 对 DeepSeek 默认请求最高 effort，应在 Claude Code 自己的
 `%USERPROFILE%\.claude\settings.json` 中设置 `env.CLAUDE_CODE_EFFORT_LEVEL` 为 `max`；
@@ -255,12 +257,22 @@ Usage 观测都不依赖 File Search、Remote MCP、Maps、Flex 或 Priority。G
 的 File Search 查询、Remote MCP、Flex 和 Priority 只作为默认关闭的 Interactions 可选配置保留，
 不属于本地开发核心链路的默认启用项或验收前置条件。
 
+Interactions 的隐式缓存由 Google 自动管理，不提供可强制插入或保证命中的 cache key。即使前缀
+满足当前模型条件并保持完全稳定，单次请求仍可能不命中；较大的共同前缀放在请求开头并在较短时间内
+重复发送，只能提高概率。上游 `usage.total_cached_tokens` 会映射为 Anthropic
+`usage.cache_read_input_tokens`，原始 usage 同时保存在
+`provider_metadata.google.interaction_usage`；两处为 0 表示本次上游未报告命中，不表示桥接器
+丢失缓存字段。有状态续接会使用 `previous_interaction_id`，但仍按 Google 契约重新发送工具、system
+instruction 和生成配置。需要确定性折扣的显式 `cachedContents` 不属于此 transport。
+
 Gemini 3.7 Flash 的输入窗口为 1,048,576 tokens、最大输出为 65,536 tokens，默认 Thinking
 档位为 `medium`。模型只接受 `low`、`medium`、`high`；桥接器会把 Claude 的
 `none`/`minimal` 映射到 `low`，把 `xhigh`/`max` 映射到 `high`，并继续丢弃 3.x
 不支持的 `temperature`、`top_p`、`top_k` 和 `candidate_count`。Interactions 流同时兼容
 官方资源 schema 的 `event_type`/`thought_summary`/`arguments_delta`，以及 3.7 迁移示例中的
-`type`/`thought`/`arguments`，并映射 cached、thought 和新旧 token usage 字段。
+`type`/`thought`/`arguments`；对象型 thought summary 会提取其中的文本，不会泄漏 JSON 包装串。
+若完整工具参数只出现在 `step.stop`，桥接器会在 `content_block_stop` 前补发一个完整
+`input_json_delta`，使 Claude Code 能重建真实输入。cached、thought 和新旧 token usage 字段都会映射。
 
 模型中心为活动的 Gemini 3.7 Flash Interactions profile 提供“低 / 中 / 高”即时选择。该值写入
 `bridge-state.json`，切换后从下一次请求生效，无需重启；它的优先级高于 Claude 请求携带的
@@ -284,7 +296,11 @@ Gemini 3.7 Flash 的输入窗口为 1,048,576 tokens、最大输出为 65,536 to
 限制搜索类型；Maps 对象可保留 `enable_widget`、`latitude`、`longitude`，File Search 对象可保留
 `metadata_filter`，这些字段不会在桥接层被展平。`gemini_file_search_store_names` 非空时还会增加或补全 Google 原生
 `file_search` 工具，并将这些 store 名称原样传给 Interactions API。这些工具由 Google 服务端执行；Claude Code/MCP 的本地工具仍
-作为自定义函数并存。若不希望服务端自行搜索或执行代码，将此数组设为空即可。
+作为自定义函数并存。若请求含 PDF，Google 不接受 `application/pdf` 与原生 Code Execution 同时出现，
+因此桥接器只对该请求省略 `code_execution`，并通过服务日志及
+`x-claude-bridge-warning` 响应头报告降级；
+Google Search、URL Context、自定义函数及其他兼容工具继续保留，非 PDF 请求不受影响。
+若不希望服务端自行搜索或执行代码，将此数组设为空即可。
 
 `gemini_remote_mcp_servers` 可向 Interactions 请求加入 Google 原生 Remote MCP 工具。例如：
 
@@ -338,6 +354,7 @@ Claude Code 请求在此 transport 上按下表映射：
 | `output_config.effort: low/medium/high`    | `thinking_level: low/medium/high`                                                                                  |
 | `output_config.effort: xhigh/max`          | 保守钳制为 `thinking_level: high`                                                                                  |
 | document 的 URL/base64/text/content source | 原生 `document` content，尽量保留 MIME type；工具结果中的 PDF 会移到紧随其后的合法 `user_input`               |
+| 含 PDF 且 profile 启用 `code_execution`    | 仅对本次请求省略原生 Code Execution 并报告兼容性降级；其他兼容工具保留                                            |
 | `service_tier: standard_only`              | `service_tier: standard`                                                                                           |
 | `service_tier: auto`                       | 不发送该字段，使用 Google 默认 `standard`，不会自动升级为付费 `priority`                                           |
 
@@ -347,8 +364,10 @@ Claude Code 请求在此 transport 上按下表映射：
 有界的本地估算回退，计数来源由上述响应头明确标注。
 
 普通响应和流式结束事件会通过
-`provider_metadata.google.interaction_server_tools` 原样回传已组装的服务端工具步骤，包括流式
-delta 中的参数、结果、错误和 opaque signature；Google 文本 annotations 则原样保存在
+`provider_metadata.google.interaction_server_tools` 回传有界的服务端工具诊断摘要。最多保留 32 个
+不同步骤；标识/状态字段会保留，`arguments`、`action`、`result`、`results`、`signature` 等值序列化后
+超过 4,096 字符时改为带 `truncated: true` 的预览，避免搜索结果或执行输出无界进入客户端响应。
+Google 文本 annotations 则原样保存在
 `provider_metadata.google.interaction_annotations`。Google Search 与 URL Context 的调用次数同时映射到 Anthropic
 标准 `usage.server_tool_use`。由于 Google 的搜索/URL 结果不包含 Anthropic 引用协议要求的
 加密内容或索引，桥接器不会伪造 `web_search_tool_result`、`web_fetch_tool_result` 或引用块。
@@ -551,7 +570,9 @@ DashScope/百炼兼容层支持的 `enable_thinking`、`thinking_budget` 等字�
 错误时，刷新会明确报错，不会静默回退。桥接器还兼容对象型工具参数、旧式
 `function_call`、标准 `refusal`、数组型文本内容，以及
 `prompt_tokens/completion_tokens` 和 `input_tokens/output_tokens` 两套 Usage
-命名。工具调用参数在标准 JSON 解析失败后只进行保守修复：未转义控制字符、闭合
+命名。OpenAI Chat 流式和 Responses 路径的输入、输出、缓存读取、缓存创建和 reasoning Usage
+计数兼容 JSON 数字与纯数字字符串；
+事件索引等结构字段仍要求真正的 JSON 数字。工具调用参数在标准 JSON 解析失败后只进行保守修复：未转义控制字符、闭合
 容器前的尾逗号和缺失的 `}`/`]` 可以修复，未闭合字符串不会被猜测补全。
 
 上游错误会映射回 Claude Code 所依赖的 Anthropic 契约：`429` 为
@@ -614,7 +635,10 @@ Code 客户端的入口设置，不是上游 Provider 配置，两者职责不�
 入口使用的 `ANTHROPIC_AUTH_TOKEN`、HTTP MCP header、模型中心和停止脚本。该令牌只验证
 本机调用者，不会作为 Gemini 或其他上游 Provider 的 API Key 转发。升级时会复用
 `C:\ProgramData\ClaudeCodeBridge\local-auth-token` 中已有的有效令牌；升级后应重启正在运行的
-Claude Code 会话。直接从源码运行时，必须设置至少 32 字符的
-`GEMINI_BRIDGE_LOCAL_TOKEN`，或让 `GEMINI_BRIDGE_LOCAL_TOKEN_FILE` 指向受保护的令牌文件。
+Claude Code 会话。源码开发使用 `scripts\start-bridge.ps1` 时，脚本会复用显式令牌、安装令牌或
+已有开发令牌；都不存在时，会先在空临时文件上收紧 ACL、写入随机令牌，再原子发布为
+`target\local-auth-token`。随附的停止和测试脚本会解析同一令牌。只有直接启动可执行文件时，才必须
+设置至少 32 字符的 `GEMINI_BRIDGE_LOCAL_TOKEN`，或让 `GEMINI_BRIDGE_LOCAL_TOKEN_FILE`
+指向受保护的令牌文件。
 除本机诊断用的 `/health` 和 `/v1/models` 外，Messages、Responses、Token Count、MCP 与
 全部 `/admin/*` 路由都需要 `Authorization: Bearer <local-token>`。

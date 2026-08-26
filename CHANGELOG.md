@@ -9,13 +9,21 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 
 ## [Unreleased]
 
+## [v0.7.2] - 2026-08-27
+
 ### Local Security and Reliability Remediation
 
 - Enforced loopback-only binding and authenticated Messages, Responses, token-count, MCP, and admin routes with an installer-generated 256-bit local token. Claude settings, MCP registration, Model Center, and shutdown scripts now receive the token automatically; upgrades reuse a valid installed token, and local authentication is no longer reused as an upstream provider credential.
+- Source-development launch, stop, and test scripts now resolve the same local token automatically. When no installed, explicit, or existing development token is available, the launcher creates `target\local-auth-token` through an exclusive same-directory temporary file whose ACL is protected before any secret bytes are written, then atomically publishes it.
 - Removed the ten-minute whole-response deadline from streaming requests while retaining connection, idle, and non-streaming deadlines. Added cumulative 8 MiB streamed tool-argument bounds and preserved inline Gemini and object-shaped Responses arguments instead of silently replacing them with `{}`.
+- Completed Gemini Interactions stream fidelity for tool parameters that appear only on `step.stop`: the bridge now emits a full `input_json_delta` before `content_block_stop`, so Claude Code reconstructs the same input retained by continuation state. Object-shaped non-streaming thought summaries are decoded to plain text rather than serialized JSON wrappers.
 - Made Vision Proxy fail closed on untranslatable media, bounded historical media work, and parallelized accepted jobs with ordered injection. Continuation recovery is now error-specific, cache eviction refreshes recency, and unknown Gemini stream events are observable without treating incomplete streams as successful.
-- Redacted proxy userinfo from public management output and logs, allowlisted Responses built-in/server-tool types, and accepted digit-only string forms for primary token-limit fields.
+- Redacted proxy userinfo from public management output and logs, allowlisted Responses built-in/server-tool types, and accepted digit-only string forms for primary token-limit fields plus OpenAI Chat streaming/Responses usage. Anthropic `web_search_*` declarations are no longer mistranslated as ordinary Responses functions; provider-native Responses tools remain explicitly opt-in.
+- Bounded Gemini/Responses server-tool metadata to 32 diagnostic summaries and replaced any serialized argument/action/result/signature value above 4,096 characters with an explicit truncated preview, preventing unbounded search or execution output from entering client responses.
+- Fixed Gemini PDF requests under profiles that enable native Code Execution: the bridge omits only `code_execution` for the affected request, reports the compatibility downgrade, and retains Search, URL Context, custom functions, and other compatible tools. Non-PDF Code Execution is unchanged.
+- Documented and live-verified Gemini Interactions implicit caching as upstream-managed and probabilistic. Reported hits map exactly to Anthropic `usage.cache_read_input_tokens` and remain available in raw Google provider metadata; an eligible request that reports zero cached tokens is not by itself a bridge failure.
 - Made Windows JSON settings writes atomic, stopped unhealthy newly installed services, recorded a protected pre-install Claude environment snapshot, and restored unchanged bridge-managed values during uninstall.
+- Expanded the locked Rust regression suite to 187 passing tests, including PDF/tool compatibility, bounded server-tool traces, stop-only tool arguments, thought-summary normalization, poisoned continuation-cache recovery, Responses web-search filtering, and numeric-string usage.
 
 ## [v0.7.0] - 2026-08-26
 
@@ -306,13 +314,21 @@ All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** 
 
 ## [未发布]
 
+## [v0.7.2] - 2026-08-27
+
 ### 本地安全与可靠性修复
 
 - 强制只允许 loopback 监听，并用安装器生成的 256-bit 随机本地令牌保护 Messages、Responses、Token Count、MCP 与全部管理路由。Claude settings、MCP 注册、模型中心和停止脚本会自动取得令牌；升级会复用已有有效令牌，本地鉴权令牌也不再被误作上游 Provider 凭据。
+- 源码开发的启动、停止和测试脚本现在会自动解析同一本地令牌。没有安装令牌、显式令牌或已有开发令牌时，启动脚本会创建同目录独占临时文件，在写入任何密钥字节前先保护 ACL，再原子发布为 `target\local-auth-token`。
 - 流式请求不再受 10 分钟整流总时限截断，同时保留连接、空闲和非流式超时。流式工具参数新增累计 8 MiB 上限；Gemini 内联参数与 Responses 对象参数不再被静默替换为 `{}`。
+- 补全 Gemini Interactions 中仅在 `step.stop` 出现的工具参数：桥接器会在 `content_block_stop` 前发送完整 `input_json_delta`，使 Claude Code 重建的输入与续接状态一致。非流式对象型 thought summary 会解码为纯文本，不再输出 JSON 包装串。
 - Vision Proxy 对无法转换的媒体改为明确失败，限制历史媒体任务数量，并在有界并发分析后按消息顺序注入。续接恢复改为错误特异判断，缓存淘汰会刷新最近使用顺序，未知 Gemini 流事件可观测但不会掩盖不完整流。
-- 管理输出与日志会脱敏代理 URL 的用户信息，Responses 内建/服务端工具类型改为 allowlist，并兼容主要 token 限制字段的纯数字字符串形式。
+- 管理输出与日志会脱敏代理 URL 的用户信息，Responses 内建/服务端工具类型改为 allowlist，并兼容主要 token 限制字段及 OpenAI Chat 流式/Responses Usage 的纯数字字符串形式。Anthropic `web_search_*` 声明不再被错误转换成普通 Responses function；供应商原生 Responses 工具仍需显式启用。
+- Gemini/Responses 服务端工具 metadata 最多保留 32 条诊断摘要；参数、动作、结果或签名值序列化后超过 4,096 字符时会替换为明确的截断预览，避免搜索或代码执行输出无界进入客户端响应。
+- 修复启用原生 Code Execution 的 profile 处理 Gemini PDF 请求时失败的问题：只对受影响请求省略 `code_execution` 并报告兼容性降级，Search、URL Context、自定义函数及其他兼容工具继续保留；非 PDF 请求不受影响。
+- 文档化并在线验证 Gemini Interactions 隐式缓存由上游管理且命中具有概率性。命中值会精确映射到 Anthropic `usage.cache_read_input_tokens` 并保留在 Google 原始 provider metadata；满足条件但 cached tokens 为 0 不能单独说明桥接器故障。
 - Windows JSON 配置改为原子写入；安装后健康检查失败会停止异常服务；安装器保存受保护的 Claude 环境变量安装前快照，卸载时只恢复仍保持桥接器安装值的项目。
+- 锁定的 Rust 回归测试扩展到 187 个且全部通过，新增覆盖 PDF/工具兼容、服务端工具摘要边界、stop-only 工具参数、thought summary 规范化、中毒续接缓存恢复、Responses web-search 过滤及数字字符串 Usage。
 
 ## [v0.7.0] - 2026-08-26
 
