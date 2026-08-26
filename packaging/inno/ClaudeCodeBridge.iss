@@ -1,5 +1,5 @@
 ﻿#ifndef AppVersion
-  #define AppVersion "0.5.0"
+  #define AppVersion "0.7.0"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\windows-x64"
