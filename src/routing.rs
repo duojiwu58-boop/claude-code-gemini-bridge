@@ -677,9 +677,13 @@ async fn forward_anthropic_profile(
         .collect::<Vec<_>>();
     // The response body owns the reqwest stream. If Claude Code disconnects,
     // Hyper drops this body and the upstream response stream with it, which
-    // cancels further socket reads. The client-wide timeout also bounds
-    // providers that ignore the closed connection and never finish a body.
-    let body = Body::from_stream(upstream.bytes_stream());
+    // cancels further socket reads. The stream wrapper bounds a connected
+    // upstream that stops producing response bytes without imposing a total
+    // deadline on long responses that continue making progress.
+    let body = Body::from_stream(anthropic_passthrough_stream(
+        upstream.bytes_stream(),
+        UPSTREAM_STREAM_IDLE_TIMEOUT,
+    ));
     let mut builder = Response::builder()
         .status(status)
         .header("content-type", content_type)
@@ -697,6 +701,40 @@ async fn forward_anthropic_profile(
             &format!("Cannot build provider response: {err}"),
         )
     })
+}
+
+fn anthropic_passthrough_stream<S, B, E>(
+    byte_stream: S,
+    idle_timeout: Duration,
+) -> impl Stream<Item = Result<B, std::io::Error>>
+where
+    S: Stream<Item = Result<B, E>> + Send + 'static,
+    B: Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    stream::unfold(
+        Some(Box::pin(byte_stream)),
+        move |byte_stream| async move {
+            let mut byte_stream = byte_stream?;
+            match tokio::time::timeout(idle_timeout, byte_stream.next()).await {
+                Ok(Some(Ok(bytes))) => Some((Ok(bytes), Some(byte_stream))),
+                Ok(Some(Err(err))) => Some((
+                    Err(std::io::Error::other(format!(
+                        "Anthropic upstream stream failed: {err}"
+                    ))),
+                    None,
+                )),
+                Ok(None) => None,
+                Err(_) => Some((
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Anthropic upstream stream was idle for too long",
+                    )),
+                    None,
+                )),
+            }
+        },
+    )
 }
 
 fn apply_anthropic_forward_headers(

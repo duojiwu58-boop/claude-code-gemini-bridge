@@ -4573,6 +4573,23 @@ async fn anthropic_forwarding_preserves_upstream_rate_limit_metadata() {
     server.abort();
 }
 
+#[tokio::test]
+async fn anthropic_passthrough_stream_aborts_after_idle_timeout() {
+    let upstream =
+        stream::once(async { Ok::<_, Infallible>("first chunk") }).chain(stream::pending());
+    let bounded = anthropic_passthrough_stream(upstream, Duration::from_millis(20));
+    tokio::pin!(bounded);
+
+    assert_eq!(bounded.next().await.unwrap().unwrap(), "first chunk");
+    let error = tokio::time::timeout(Duration::from_secs(1), bounded.next())
+        .await
+        .expect("idle upstream body must be bounded")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(bounded.next().await.is_none());
+}
+
 #[test]
 fn model_listing_uses_active_profile_and_known_claude5_limits() {
     let mut profile = test_provider_profile(

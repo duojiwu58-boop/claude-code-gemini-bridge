@@ -7,20 +7,20 @@ repository = "https://github.com/duojiwu58-boop/claude-code-multi-model-agent-ru
 license = "GPL-3.0-only"
 
 [dependencies]
-axum = "=0.7.5"
+axum = "=0.8.9"
 base64 = "=0.22.1"
 futures-util = "=0.3.31"
 idna_adapter = "=1.0.0"
 indexmap = "=2.2.6"
-reqwest = { version = "=0.11.27", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "=0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
 serde_json = "=1.0.117"
 sha2 = "=0.10.8"
-tokio = { version = "=1.37.0", features = ["macros", "rt-multi-thread", "signal", "time"] }
-tower-http = { version = "=0.5.2", features = ["limit", "trace"] }
-tracing = "=0.1.40"
+tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tower-http = { version = "=0.6.11", features = ["limit", "trace"] }
+tracing = "=0.1.44"
 tracing-appender = "=0.2.5"
-tracing-subscriber = { version = "=0.3.18", features = ["env-filter"] }
-url = "=2.5.0"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
+url = "=2.5.8"
 uuid = { version = "=1.8.0", features = ["v4"] }
-windows-sys = { version = "=0.52.0", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "=0.61.2", features = ["Win32_Storage_FileSystem"] }
 windows-service = "=0.8.1"
