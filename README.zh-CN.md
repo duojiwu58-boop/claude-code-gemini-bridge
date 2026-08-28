@@ -4,7 +4,7 @@
 
 > 面向 Windows Claude Code 的深度语义网关与多模型 Agent Runtime。
 
-![社交平台声明截图](gui/delphi11/ClaudeBridgeManager/assets/ClaudeBridgeManager-screenshot.png)
+![Claude Code 模型中心可在 Gemini、DeepSeek、Kimi、Qwen 等提供商之间免重启切换](gui/delphi11/ClaudeBridgeManager/assets/ClaudeBridgeManager-screenshot.png)
 
 以 Claude Code 作为稳定的编码智能体入口，同时在后端选用 Gemini、DeepSeek、Qwen、Kimi、OpenRouter Claude 或其他兼容模型。桥接器保留真实 Claude Code 任务所依赖的推理、流式输出、工具、状态、用量和错误语义，而不是把所有提供商压缩成“HTTP 200 加一段文本”。
 
