@@ -6943,7 +6943,7 @@ fn translates_interactions_stream_and_remembers_tool_continuation() {
     translator
             .process_payload(r#"{"event_type":"interaction.completed","interaction":{"id":"interaction-stream-1","status":"requires_action","usage":{"total_input_tokens":10,"total_output_tokens":5}}}"#)
             .unwrap();
-    assert_eq!(translator.finish().unwrap().len(), 2);
+    assert_eq!(translator.finish().unwrap().len(), 5);
     assert_eq!(translator.assistant_content[0]["type"], "thinking");
     assert_eq!(translator.assistant_content[0]["signature"], "sig-1");
     assert_eq!(translator.assistant_content[1]["type"], "tool_use");
@@ -6955,6 +6955,50 @@ fn translates_interactions_stream_and_remembers_tool_continuation() {
         .unwrap();
     assert_eq!(call.interaction_id, "interaction-stream-1");
     assert_eq!(call.name, "lookup");
+}
+
+#[test]
+fn defers_parallel_interaction_tool_blocks_until_terminal_batch() {
+    let continuations = Arc::new(RwLock::new(InteractionContinuationCache::default()));
+    let mut translator = GeminiInteractionsStreamTranslator::new(
+        "gemini-3.7-flash".to_string(),
+        "gemini-interactions.json".to_string(),
+        json!({
+            "messages": [{"role": "user", "content": "Read both files"}],
+            "stream": true
+        }),
+        continuations,
+        8,
+        true,
+    );
+    assert_eq!(translator.start_events().unwrap().len(), 1);
+
+    for payload in [
+        r#"{"type":"interaction.created","interaction":{"id":"interaction-parallel-tools","status":"in_progress"}}"#,
+        r#"{"type":"step.start","index":0,"step":{"type":"function_call","id":"call-first","name":"read_file","arguments":{"path":"first.txt"}}}"#,
+        r#"{"type":"step.stop","index":0}"#,
+        r#"{"type":"step.start","index":1,"step":{"type":"function_call","id":"call-second","name":"read_file","arguments":{"path":"second.txt"}}}"#,
+        r#"{"type":"step.stop","index":1}"#,
+        r#"{"type":"interaction.requires_action","interaction":{"id":"interaction-parallel-tools","status":"requires_action"}}"#,
+    ] {
+        assert!(
+            translator.process_payload(payload).unwrap().is_empty(),
+            "tool events must stay behind the batch barrier until the Interaction terminates"
+        );
+    }
+
+    let finish_events = translator.finish().unwrap();
+    assert_eq!(finish_events.len(), 8);
+    let event_debug = format!("{finish_events:?}");
+    let first = event_debug.find("call-first").unwrap();
+    let second = event_debug.find("call-second").unwrap();
+    let message_stop = event_debug.rfind("message_stop").unwrap();
+    assert!(first < second);
+    assert!(second < message_stop);
+    assert_eq!(event_debug.matches("content_block_stop").count(), 4);
+    assert_eq!(event_debug.matches("message_stop").count(), 2);
+    assert_eq!(translator.assistant_content.len(), 2);
+    assert_eq!(translator.calls.len(), 2);
 }
 
 #[test]
@@ -7003,6 +7047,11 @@ fn preserves_gemini_stream_tool_arguments_only_present_on_stop() {
     translator.start_events().unwrap();
     translator
         .process_payload(
+            r#"{"type":"interaction.created","interaction":{"id":"interaction-stop-inline","status":"in_progress"}}"#,
+        )
+        .unwrap();
+    translator
+        .process_payload(
             r#"{"type":"step.start","index":0,"step":{"type":"function_call","id":"call-stop-inline","name":"lookup","arguments":{}}}"#,
         )
         .unwrap();
@@ -7011,8 +7060,15 @@ fn preserves_gemini_stream_tool_arguments_only_present_on_stop() {
             r#"{"type":"step.stop","index":0,"step":{"type":"function_call","id":"call-stop-inline","name":"lookup","arguments":{"key":"omega"}}}"#,
         )
         .unwrap();
-    assert_eq!(stop_events.len(), 2);
-    let event_debug = format!("{stop_events:?}");
+    assert!(stop_events.is_empty());
+    translator
+        .process_payload(
+            r#"{"type":"interaction.requires_action","interaction":{"id":"interaction-stop-inline","status":"requires_action"}}"#,
+        )
+        .unwrap();
+    let finish_events = translator.finish().unwrap();
+    assert_eq!(finish_events.len(), 5);
+    let event_debug = format!("{finish_events:?}");
     let delta = event_debug
         .find("content_block_delta")
         .expect("stop-only arguments must be sent to the SSE client");
@@ -7155,7 +7211,7 @@ fn treats_gemini_37_requires_action_as_a_terminal_tool_stream_event() {
         translator.process_payload(payload).unwrap();
     }
 
-    assert_eq!(translator.finish().unwrap().len(), 2);
+    assert_eq!(translator.finish().unwrap().len(), 5);
     assert_eq!(translator.assistant_content[0]["type"], "tool_use");
     assert_eq!(translator.assistant_content[0]["input"]["city"], "Boston");
 }

@@ -33,6 +33,7 @@ struct GeminiInteractionsStreamTranslator {
     next_content_index: usize,
     active_blocks: IndexMap<usize, ActiveInteractionStreamingBlock>,
     active_server_tools: IndexMap<usize, Value>,
+    deferred_tool_batch_events: Option<Vec<Event>>,
     assistant_content: Vec<Value>,
     calls: Vec<(String, String)>,
     server_tools: InteractionServerToolTrace,
@@ -65,6 +66,7 @@ impl GeminiInteractionsStreamTranslator {
             next_content_index: 0,
             active_blocks: IndexMap::new(),
             active_server_tools: IndexMap::new(),
+            deferred_tool_batch_events: None,
             assistant_content: Vec::new(),
             calls: Vec::new(),
             server_tools: InteractionServerToolTrace::default(),
@@ -117,7 +119,7 @@ impl GeminiInteractionsStreamTranslator {
         if let Some(usage) = event.pointer("/metadata/total_usage") {
             self.capture_usage(usage);
         }
-        match event_type {
+        let events = match event_type {
             "interaction.created"
             | "interaction.in_progress"
             | "interaction.requires_action"
@@ -156,6 +158,12 @@ impl GeminiInteractionsStreamTranslator {
                 );
                 Ok(Vec::new())
             }
+        }?;
+        if let Some(deferred) = self.deferred_tool_batch_events.as_mut() {
+            deferred.extend(events);
+            Ok(Vec::new())
+        } else {
+            Ok(events)
         }
     }
 
@@ -251,6 +259,7 @@ impl GeminiInteractionsStreamTranslator {
                 json!({"type": "text", "text": ""}),
             ),
             "function_call" => {
+                self.deferred_tool_batch_events.get_or_insert_with(Vec::new);
                 let id = step
                     .get("id")
                     .and_then(Value::as_str)
@@ -637,7 +646,7 @@ impl GeminiInteractionsStreamTranslator {
         }
         let stop_reason = interaction_stop_reason(status, !self.calls.is_empty());
         self.finished = true;
-        let mut events = Vec::new();
+        let mut events = self.deferred_tool_batch_events.take().unwrap_or_default();
         let mut delta = json!({"stop_reason": stop_reason, "stop_sequence": Value::Null});
         if let Some(metadata) = self.server_tools.provider_metadata(
             &self.usage,
