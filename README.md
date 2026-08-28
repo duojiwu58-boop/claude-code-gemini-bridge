@@ -4,7 +4,7 @@
 
 > A deeply adapted semantic gateway and multi-model Agent Runtime for Claude Code on Windows.
 
-![Claude Code Model Center switching between Gemini, DeepSeek, Kimi, Qwen, and other providers without a restart](gui/delphi11/ClaudeBridgeManager/assets/ClaudeBridgeManager-screenshot.png)
+![Screenshot of a social-media statement](gui/delphi11/ClaudeBridgeManager/assets/ClaudeBridgeManager-screenshot.png)
 
 Use Claude Code as one stable coding-agent entry point while choosing Gemini, DeepSeek, Qwen, Kimi, OpenRouter Claude, or another compatible model behind it. The bridge preserves the reasoning, streaming, tools, state, usage, and error semantics that a real Claude Code task depends on instead of reducing every provider to “HTTP 200 plus text.”
 
