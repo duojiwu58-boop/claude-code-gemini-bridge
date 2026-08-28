@@ -1,7 +1,7 @@
 # Changelog / 更新日志
 
-All notable changes to the **Claude Code ↔ Gemini Deep-Compatibility Bridge** project will be documented in this file.  
-本项目的所有重要更新记录均将在此文档中记录。
+All notable changes to **Claude Code Multi-Model Agent Runtime** will be documented in this file.
+**Claude Code 多模型智能体运行时**的所有重要更新均将在此文档中记录。
 
 ---
 

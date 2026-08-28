@@ -1,5 +1,5 @@
-Claude Code Multi-Model Bridge (Windows x64)
-================================================
+Claude Code Multi-Model Agent Runtime (Windows x64)
+===========================================================
 
 ENGLISH VERSION
 ------------------------------------------------

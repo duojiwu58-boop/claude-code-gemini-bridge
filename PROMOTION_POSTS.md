@@ -6,16 +6,16 @@
 
 ## 1. V2EX (程序员 / AI 节点)
 
-**标题：** 开源了一个专为 Claude Code 打造的 Gemini 3.6 深度适配桥接器（Rust + Windows Service + Delphi GUI）
+**标题：** 开源了一个专为 Claude Code 打造的多模型智能体运行时（Rust + Windows Service + Delphi GUI）
 
 **正文：**
 
 大家好！最近 Claude Code 越来越火，终端 Agent 体验确实非常丝滑。但由于各种协议细节（思维链流式、Tool Call 签名、多模态、Schema 校验等），直接把 Claude Code 接到 Gemini 上往往会遇到各种 400 报错、卡死或思维链丢失。
 
-为了让 Gemini 3.7 Flash 的极速推理、大上下文和超强性能在 Claude Code 中 **100% 完全发挥**，我用 Rust 和 Delphi 写了这个深度的协议适配桥接服务并开源了：
+为了让 Gemini 3.7 Flash 的极速推理、大上下文和超强性能在 Claude Code 中 **100% 完全发挥**，我用 Rust 和 Delphi 写了这个深度协议适配的多模型智能体运行时并开源了：
 
-👉 **GitHub 仓库：** https://github.com/duojiwu58-boop/claude-code-gemini-bridge
-📦 **Release v0.1.3 下载：** https://github.com/duojiwu58-boop/claude-code-gemini-bridge/releases/tag/v0.1.3
+👉 **GitHub 仓库：** https://github.com/duojiwu58-boop/claude-code-multi-model-agent-runtime
+📦 **Release v0.1.3 下载：** https://github.com/duojiwu58-boop/claude-code-multi-model-agent-runtime/releases/tag/v0.1.3
 
 ### 💡 为什么它不同于普通 API 转发器？
 
@@ -34,7 +34,7 @@
 
 ## 2. Reddit (`r/ClaudeAI` / `r/GoogleGemini` / `r/LocalLLaMA`)
 
-**Title:** [Open Source] A deep-compatibility Rust bridge to run Gemini 3.7 Flash as a first-class backend for Claude Code (with Windows Service & Native GUI)
+**Title:** [Open Source] Claude Code Multi-Model Agent Runtime with deep Gemini 3.7 Flash compatibility (Windows Service & Native GUI)
 
 **Body:**
 
@@ -42,10 +42,10 @@ Hi everyone!
 
 Claude Code's terminal agent interface is fantastic, but using Google Gemini 3.7 Flash as its backend through generic API proxies usually falls apart due to missing thinking streams, schema validation errors on MCP tools, or broken `thought_signature` state in multi-turn tool loops.
 
-I built and open-sourced **`claude-code-gemini-bridge`**, a protocol-aware Rust bridge designed specifically to make Gemini behave like a native Claude Code backend:
+I built and open-sourced **Claude Code Multi-Model Agent Runtime** (`claude-code-multi-model-agent-runtime`), a protocol-aware Rust runtime designed to make Gemini behave like a native Claude Code backend:
 
-🚀 **GitHub Repo:** https://github.com/duojiwu58-boop/claude-code-gemini-bridge
-📦 **Release v0.1.3:** https://github.com/duojiwu58-boop/claude-code-gemini-bridge/releases/tag/v0.1.3
+🚀 **GitHub Repo:** https://github.com/duojiwu58-boop/claude-code-multi-model-agent-runtime
+📦 **Release v0.1.3:** https://github.com/duojiwu58-boop/claude-code-multi-model-agent-runtime/releases/tag/v0.1.3
 
 ### Key Features:
 - 🧠 **Streaming Thinking Blocks**: Maps Gemini `reasoning_content`/`thinking` directly into Anthropic SSE `thinking_delta` events with proper state-machine closing.
@@ -63,9 +63,9 @@ Pre-built standalone executables (`Setup.exe` & `ZIP`) are available under Relea
 
 **推文内容：**
 
-🚀 Open-sourced **claude-code-gemini-bridge** v0.1.3!
+🚀 Open-sourced **Claude Code Multi-Model Agent Runtime** (`claude-code-multi-model-agent-runtime`) v0.1.3!
 
-A protocol-aware Rust bridge that makes @GoogleAI Gemini 3.7 Flash run as a first-class backend inside @AnthropicAI Claude Code!
+A protocol-aware Rust Agent Runtime that makes @GoogleAI Gemini 3.7 Flash run as a first-class backend inside @AnthropicAI Claude Code!
 
 ✨ Real-time Thinking Stream
 🔑 Thought Signature Loop
@@ -73,7 +73,7 @@ A protocol-aware Rust bridge that makes @GoogleAI Gemini 3.7 Flash run as a firs
 📄 PDF & Vision Tool Results
 🖥️ Delphi GUI & Windows Service
 
-🔗 https://github.com/duojiwu58-boop/claude-code-gemini-bridge
+🔗 https://github.com/duojiwu58-boop/claude-code-multi-model-agent-runtime
 
 #ClaudeCode #Gemini #Rust #OpenSource #AI
 
@@ -81,7 +81,7 @@ A protocol-aware Rust bridge that makes @GoogleAI Gemini 3.7 Flash run as a firs
 
 ## 4. 掘金 / 知乎 / 微信公众号 / 博客
 
-**标题：** 让 Gemini 3.7 Flash 成为 Claude Code 的超级大脑：深度协议适配桥接器开源！
+**标题：** 让 Gemini 3.7 Flash 成为 Claude Code 的超级大脑：多模型智能体运行时开源！
 
 **摘要：** 针对 Claude Code 的思考流、Tool Call 签名、多模态、Schema 递归清洗和安全拦截等边界行为进行深度适配，无需重启终端即可热切换模型。提供一键 Setup 安装包与免安装 ZIP。
 

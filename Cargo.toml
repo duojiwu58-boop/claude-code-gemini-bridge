@@ -2,8 +2,8 @@
 name = "claude-bridge"
 version = "0.7.2"
 edition = "2021"
-description = "Claude Code <-> Gemini deep-compatibility bridge with live model switching"
-repository = "https://github.com/duojiwu58-boop/claude-code-gemini-bridge"
+description = "Multi-model Agent Runtime for Claude Code with deep semantic adaptation and live model switching"
+repository = "https://github.com/duojiwu58-boop/claude-code-multi-model-agent-runtime"
 license = "GPL-3.0-only"
 
 [dependencies]

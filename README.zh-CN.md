@@ -1,8 +1,8 @@
-# Claude Code 多模型桥接器
+# Claude Code 多模型智能体运行时
 
 [English](README.md) | **简体中文**
 
-> 面向 Windows Claude Code 的深度语义网关与多模型 Agent Runtime。
+> 面向 Windows Claude Code 的深度语义网关。
 
 ![Claude Code 模型中心可在 Gemini、DeepSeek、Kimi、Qwen 等提供商之间免重启切换](gui/delphi11/ClaudeBridgeManager/assets/ClaudeBridgeManager-screenshot.png)
 
@@ -50,7 +50,7 @@
               Anthropic Messages · MCP · 本地工具 · 媒体
                                   │
                                   ▼
-                       Claude Code 多模型桥接器
+                   Claude Code 多模型智能体运行时
           语义解码 · 能力映射 · 状态 · SSE · 诊断 · 鉴权
                          用量 · 热切换模型
                      ┌────────────┴────────────┐
@@ -80,7 +80,7 @@
 
 ### 1. 安装
 
-从 [GitHub Releases](https://github.com/duojiwu58-boop/claude-code-gemini-bridge/releases/latest) 下载：
+从 [GitHub Releases](https://github.com/duojiwu58-boop/claude-code-multi-model-agent-runtime/releases/latest) 下载：
 
 - `ClaudeCodeBridge-<version>-Setup.exe`：推荐；安装服务、模型中心、开始菜单入口、`gemini-image` MCP 注册和卸载器。
 - `ClaudeCodeBridge-<version>-windows-x64.zip`：完整解压后运行 `Install.cmd`。

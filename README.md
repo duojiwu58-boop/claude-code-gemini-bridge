@@ -1,8 +1,8 @@
-# Claude Code Multi-Model Bridge
+# Claude Code Multi-Model Agent Runtime
 
 **English** | [简体中文](README.zh-CN.md)
 
-> A deeply adapted semantic gateway and multi-model Agent Runtime for Claude Code on Windows.
+> A deeply adapted semantic gateway for Claude Code on Windows.
 
 ![Claude Code Model Center switching between Gemini, DeepSeek, Kimi, Qwen, and other providers without a restart](gui/delphi11/ClaudeBridgeManager/assets/ClaudeBridgeManager-screenshot.png)
 
@@ -50,7 +50,7 @@ The labels below deliberately separate live evidence from source-level support.
               Anthropic Messages · MCP · local tools · media
                                   │
                                   ▼
-                   Claude Code Multi-Model Bridge
+               Claude Code Multi-Model Agent Runtime
           semantic decode · capability mapping · state · SSE
                 diagnostics · auth · usage · model switching
                      ┌────────────┴────────────┐
@@ -80,7 +80,7 @@ The bridge chooses the least-lossy configured transport, not a universal lowest 
 
 ### 1. Install
 
-Download from [GitHub Releases](https://github.com/duojiwu58-boop/claude-code-gemini-bridge/releases/latest):
+Download from [GitHub Releases](https://github.com/duojiwu58-boop/claude-code-multi-model-agent-runtime/releases/latest):
 
 - `ClaudeCodeBridge-<version>-Setup.exe`: recommended; installs the service, Model Center, Start Menu entries, `gemini-image` MCP registration, and uninstaller.
 - `ClaudeCodeBridge-<version>-windows-x64.zip`: extract the complete archive, then run `Install.cmd`.
