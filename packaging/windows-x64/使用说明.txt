@@ -29,6 +29,7 @@ ClaudeCodeBridge
 The installer creates a Start Menu shortcut and optionally a Desktop shortcut.
 The GUI allows inspecting bridge status, reloading profiles, and switching active models live.
 Gemini proxy settings can be inspected, edited, tested, and applied instantly from the GUI without reinstalling or restarting the service (clearing proxy and saving selects direct connection).
+The installer registers claude-computer-host.exe as the local gemini-computer stdio MCP server. Claude Code starts and manages it automatically; Model Center does not need to be open. Browser launches an isolated localhost-only 1440x900 browser. Desktop asks the signed-in user to select a window only when computer_start runs. High-risk batches show a one-shot Host confirmation dialog. See COMPUTER_USE.md.
 
 The GUI reads bridge-owned provider profiles from:
 %USERPROFILE%\.claude\bridge-providers\*.json
@@ -86,6 +87,7 @@ To remove `C:\ProgramData\ClaudeCodeBridge`, delete it manually after confirming
 7. Do not distribute configuration files containing API keys or the local bridge token.
 8. Gemini PDF requests automatically omit only native Code Execution because Google rejects that combination; Search, URL Context, local tools, and non-PDF Code Execution remain available.
 9. Gemini Interactions implicit-cache hits are managed by Google and are not guaranteed per request. A zero cached-token count does not by itself indicate a bridge failure.
+10. v0.8.0 adapts the native Computer Use capability newly provided by Gemini 3.8 Flash. Gemini plans actions, Claude Code manages the local stdio MCP Host, and the signed-in-user Host executes them without a second model or Model Center window. Browser navigation is limited to localhost/127.0.0.1/[::1], sessions are capped at 50 steps or 15 minutes, and computer_cancel closes the active lifecycle exactly once.
 
 
 ================================================
@@ -117,6 +119,7 @@ ClaudeCodeBridge
 安装程序会创建开始菜单快捷方式，也可以按需创建桌面快捷方式。
 GUI 可以查看桥接状态、重新加载配置并实时切换模型。
 Gemini 代理可在 GUI 中随时检测、修改、测试并立即生效，无需重新安装或重启服务；清空后保存表示直连。
+安装器会把 claude-computer-host.exe 注册为本地 gemini-computer stdio MCP Server，由 Claude Code 自动拉起和管理，无需打开模型中心。Browser 启动仅允许 localhost 的隔离 1440×900 浏览器；Desktop 只在 computer_start 执行时要求真实用户选窗。高风险批次由 Host 弹出一次性安全确认。详见 COMPUTER_USE.md。
 
 不使用 Gemini 时，GUI 会读取已有的
 %USERPROFILE%\.claude\settings - *.json
@@ -167,3 +170,4 @@ Claude Code、模型中心、停止脚本和 Gemini 生图 MCP 会自动使用�
 7. 请勿将自己已经填写 API Key 的配置文件或本地桥接令牌转发给他人。
 8. Gemini PDF 请求会自动只省略 Google 不接受与 PDF 同时使用的原生 Code Execution；Search、URL Context、本地工具以及非 PDF 请求的 Code Execution 仍可使用。
 9. Gemini Interactions 的隐式缓存命中由 Google 管理，不保证每个请求命中；cached-token 为 0 不能单独说明桥接器故障。
+10. v0.8.0 针对 Gemini 3.8 Flash 新提供的原生 Computer Use 能力完成适配：Gemini 决策，Claude Code 管理本地 stdio MCP Host，用户态 Host 执行，不调用第二个模型，也不要求打开模型中心。Browser 仅允许 localhost/127.0.0.1/[::1]，会话限制为 50 步或 15 分钟；computer_cancel 会且只会关闭一次当前生命周期。

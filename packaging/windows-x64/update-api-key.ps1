@@ -1,8 +1,20 @@
 ﻿$ErrorActionPreference = 'Stop'
 
+# ---------------------------------------------------------------------------
+# PowerShell 2.0 (Windows 7 SP1) compatible helpers.
+# ---------------------------------------------------------------------------
+
+function Test-StringNullOrWhitespace {
+    param([string]$Value)
+    if ([string]::IsNullOrEmpty($Value)) {
+        return $true
+    }
+    return $Value.Trim().Length -eq 0
+}
+
 function Test-IsAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+    $principal = New-Object -TypeName Security.Principal.WindowsPrincipal -ArgumentList @($identity)
     return $principal.IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator
     )
@@ -10,7 +22,7 @@ function Test-IsAdministrator {
 
 if (-not (Test-IsAdministrator)) {
     $elevationArguments = (
-        '-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $PSCommandPath
+        '-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $MyInvocation.MyCommand.Path
     )
     $elevated = Start-Process `
         -FilePath 'powershell.exe' `
@@ -26,8 +38,8 @@ if ($null -eq (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)) {
     throw 'ClaudeCodeBridge 服务尚未安装。'
 }
 
-$installScript = Join-Path (Split-Path -Parent $PSCommandPath) 'install.ps1'
-if (-not (Test-Path -LiteralPath $installScript -PathType Leaf)) {
+$installScript = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'install.ps1'
+if (-not [System.IO.File]::Exists($installScript)) {
     throw "找不到 Gemini 配置程序：$installScript"
 }
 
@@ -39,7 +51,7 @@ try {
 finally {
     [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($keyPointer)
 }
-if ([string]::IsNullOrWhiteSpace($apiKey)) {
+if (Test-StringNullOrWhitespace ($apiKey)) {
     throw 'API Key 不能为空。'
 }
 
@@ -50,7 +62,7 @@ try {
     [System.IO.File]::WriteAllText(
         $temporaryKeyFile,
         $apiKey,
-        [System.Text.UTF8Encoding]::new($false)
+        (New-Object -TypeName System.Text.UTF8Encoding -ArgumentList @($false))
     )
     $apiKey = $null
     & $installScript `
@@ -60,8 +72,8 @@ try {
 }
 finally {
     $apiKey = $null
-    if (Test-Path -LiteralPath $temporaryKeyFile -PathType Leaf) {
-        Remove-Item -LiteralPath $temporaryKeyFile -Force
+    if ([System.IO.File]::Exists($temporaryKeyFile)) {
+        Remove-Item -Path $temporaryKeyFile -Force
     }
 }
 

@@ -159,7 +159,7 @@ fn gemini_count_tokens_request(
             json!({"parts": [{"text": system}]}),
         );
     }
-    let functions: Vec<Value> = translated_interaction_tools(request, &profile.openai_capabilities)
+    let functions: Vec<Value> = translated_interaction_tools(request, &profile.openai_capabilities)?
         .into_iter()
         .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("function"))
         .map(|tool| {

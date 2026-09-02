@@ -7,6 +7,7 @@ uses
   Winapi.Messages,
   Winapi.CommCtrl,
   Winapi.UxTheme,
+  Winapi.ShellAPI,
   System.SysUtils,
   System.Classes,
   System.Generics.Collections,
@@ -44,6 +45,21 @@ type
     Stamp: string;
     SettingsDir: string;
     Detail: string;
+    ComputerHostConnected: Boolean;
+    ComputerSessionActive: Boolean;
+    ComputerStatus: string;
+    ComputerUrl: string;
+    ComputerIntent: string;
+    ComputerSelectedWindow: string;
+    ComputerSelectedHwnd: string;
+    ComputerApprovalPending: Boolean;
+    ComputerApprovalSession: string;
+    ComputerApprovalBatch: string;
+    ComputerApprovalHash: string;
+    ComputerApprovalText: string;
+    ComputerScreenshotData: string;
+    ComputerScreenshotHash: string;
+    ComputerLogs: string;
   end;
 
   TMainForm = class(TForm)
@@ -70,6 +86,22 @@ type
     FLogPanel: TPanel;
     FLogTitleLabel: TLabel;
     FLogMemo: TMemo;
+    FComputerPanel: TPanel;
+    FComputerTitleLabel: TLabel;
+    FComputerStatusLabel: TLabel;
+    FComputerUrlLabel: TLabel;
+    FComputerUrlEdit: TEdit;
+    FComputerEnvironment: TComboBox;
+    FComputerEnableButton: TButton;
+    FComputerStopButton: TButton;
+    FComputerWindowButton: TButton;
+    FComputerIntentLabel: TLabel;
+    FComputerApprovalLabel: TLabel;
+    FComputerAllowButton: TButton;
+    FComputerRejectButton: TButton;
+    FComputerPolicyLabel: TLabel;
+    FComputerImage: TImage;
+    FComputerLogMemo: TMemo;
     FStatusBar: TStatusBar;
     FRefreshButton: TButton;
     FSwitchButton: TButton;
@@ -85,6 +117,9 @@ type
     FThinkingLevel: string;
     FUpdatingThinkingUi: Boolean;
     FWorkerCount: Integer;
+    FComputerApprovalSession: string;
+    FComputerApprovalBatch: string;
+    FComputerApprovalHash: string;
     procedure FormShown(Sender: TObject);
     procedure FormResize(Sender: TObject);
     procedure RefreshClick(Sender: TObject);
@@ -93,6 +128,12 @@ type
     procedure StopClick(Sender: TObject);
     procedure ThinkingLevelClick(Sender: TObject);
     procedure PollTimer(Sender: TObject);
+    procedure ComputerEnableClick(Sender: TObject);
+    procedure ComputerEnvironmentChange(Sender: TObject);
+    procedure ComputerStopClick(Sender: TObject);
+    procedure ComputerWindowClick(Sender: TObject);
+    procedure ComputerAllowClick(Sender: TObject);
+    procedure ComputerRejectClick(Sender: TObject);
     procedure ProfileDblClick(Sender: TObject);
     procedure ListSelectItem(Sender: TObject; Item: TListItem;
       Selected: Boolean);
@@ -109,6 +150,9 @@ type
     procedure ApplyStatusSnapshot(const ASnapshot: TStatusSnapshot;
       const AQuiet: Boolean);
     procedure ApplyThinkingControls(const ASnapshot: TStatusSnapshot);
+    procedure ApplyComputerSnapshot(const ASnapshot: TStatusSnapshot);
+    procedure DecideComputerApprovalAsync(const AApprove: Boolean);
+    procedure StopComputerAsync;
     procedure FillProfileList(const ARows: TArray<TProfileRow>);
     procedure AdjustProfileColumns;
     procedure SetBridgeState(const AOnline: Boolean; const ADetail: string);
@@ -121,6 +165,7 @@ type
     function FindBridgeRoot: string;
     function ResolveBridgeUrl: string;
     function ReadLocalAuthToken: string;
+    function LocalAuthTokenPath: string;
     function ReadStateListen(const AStatePath: string): string;
     function ReadServiceStateFilePath: string;
     function RunPowerShellScript(const AScriptPath: string): Cardinal;
@@ -163,10 +208,10 @@ begin
     LStage := '设置窗口属性';
     Caption := 'Claude Code 模型中心';
     Width := 1020;
-    Height := 760;
+    Height := 940;
     Position := poScreenCenter;
     Constraints.MinWidth := 900;
-    Constraints.MinHeight := 650;
+    Constraints.MinHeight := 820;
     Color := $00F5F5F5;
     Font.Name := 'Segoe UI';
     Font.Size := 10;
@@ -351,6 +396,127 @@ begin
   FLogMemo.Font.Name := 'Cascadia Mono';
   FLogMemo.Font.Size := 9;
 
+  FComputerPanel := TPanel.Create(Self);
+  FComputerPanel.Parent := FContentPanel;
+  FComputerPanel.Align := alBottom;
+  FComputerPanel.AlignWithMargins := True;
+  FComputerPanel.Margins.SetBounds(0, 12, 0, 0);
+  FComputerPanel.Height := 62;
+  FComputerPanel.BevelOuter := bvNone;
+  FComputerPanel.Color := clWhite;
+  FComputerPanel.ParentBackground := False;
+
+  FComputerTitleLabel := TLabel.Create(Self);
+  FComputerTitleLabel.Parent := FComputerPanel;
+  FComputerTitleLabel.SetBounds(16, 12, 220, 24);
+  FComputerTitleLabel.Caption := 'Computer Use MCP';
+  FComputerTitleLabel.Font.Style := [fsBold];
+  FComputerTitleLabel.Font.Size := 11;
+
+  FComputerStatusLabel := TLabel.Create(Self);
+  FComputerStatusLabel.Parent := FComputerPanel;
+  FComputerStatusLabel.SetBounds(180, 15, 760, 20);
+  FComputerStatusLabel.Caption := '由 Claude Code 自动拉起；选窗和安全确认由 Host 按需弹出';
+
+  FComputerEnvironment := TComboBox.Create(Self);
+  FComputerEnvironment.Parent := FComputerPanel;
+  FComputerEnvironment.SetBounds(16, 44, 105, 28);
+  FComputerEnvironment.Style := csDropDownList;
+  FComputerEnvironment.Items.Add('Browser');
+  FComputerEnvironment.Items.Add('Desktop');
+  FComputerEnvironment.ItemIndex := 0;
+  FComputerEnvironment.OnChange := ComputerEnvironmentChange;
+  FComputerEnvironment.Visible := False;
+
+  FComputerUrlLabel := TLabel.Create(Self);
+  FComputerUrlLabel.Parent := FComputerPanel;
+  FComputerUrlLabel.SetBounds(132, 48, 62, 20);
+  FComputerUrlLabel.Caption := '本地 URL';
+  FComputerUrlLabel.Visible := False;
+
+  FComputerUrlEdit := TEdit.Create(Self);
+  FComputerUrlEdit.Parent := FComputerPanel;
+  FComputerUrlEdit.SetBounds(195, 44, 284, 28);
+  FComputerUrlEdit.Text := 'http://127.0.0.1:3000/';
+  FComputerUrlEdit.Visible := False;
+
+  FComputerEnableButton := TButton.Create(Self);
+  FComputerEnableButton.Parent := FComputerPanel;
+  FComputerEnableButton.SetBounds(489, 42, 92, 32);
+  FComputerEnableButton.Caption := '启用 Host';
+  FComputerEnableButton.OnClick := ComputerEnableClick;
+  FComputerEnableButton.Visible := False;
+
+  FComputerStopButton := TButton.Create(Self);
+  FComputerStopButton.Parent := FComputerPanel;
+  FComputerStopButton.SetBounds(589, 42, 92, 32);
+  FComputerStopButton.Caption := '立即停止';
+  FComputerStopButton.OnClick := ComputerStopClick;
+  FComputerStopButton.Visible := False;
+
+  FComputerWindowButton := TButton.Create(Self);
+  FComputerWindowButton.Parent := FComputerPanel;
+  FComputerWindowButton.SetBounds(589, 80, 92, 28);
+  FComputerWindowButton.Caption := '选择窗口';
+  FComputerWindowButton.Enabled := False;
+  FComputerWindowButton.OnClick := ComputerWindowClick;
+  FComputerWindowButton.Visible := False;
+
+  FComputerIntentLabel := TLabel.Create(Self);
+  FComputerIntentLabel.Parent := FComputerPanel;
+  FComputerIntentLabel.SetBounds(16, 82, 560, 20);
+  FComputerIntentLabel.Caption := 'Gemini intent：-';
+  FComputerIntentLabel.Visible := False;
+
+  FComputerApprovalLabel := TLabel.Create(Self);
+  FComputerApprovalLabel.Parent := FComputerPanel;
+  FComputerApprovalLabel.SetBounds(16, 108, 460, 38);
+  FComputerApprovalLabel.AutoSize := False;
+  FComputerApprovalLabel.WordWrap := True;
+  FComputerApprovalLabel.Caption := '待确认动作：无';
+  FComputerApprovalLabel.Visible := False;
+
+  FComputerAllowButton := TButton.Create(Self);
+  FComputerAllowButton.Parent := FComputerPanel;
+  FComputerAllowButton.SetBounds(489, 112, 92, 30);
+  FComputerAllowButton.Caption := '允许一次';
+  FComputerAllowButton.Enabled := False;
+  FComputerAllowButton.OnClick := ComputerAllowClick;
+  FComputerAllowButton.Visible := False;
+
+  FComputerRejectButton := TButton.Create(Self);
+  FComputerRejectButton.Parent := FComputerPanel;
+  FComputerRejectButton.SetBounds(589, 112, 92, 30);
+  FComputerRejectButton.Caption := '拒绝';
+  FComputerRejectButton.Enabled := False;
+  FComputerRejectButton.OnClick := ComputerRejectClick;
+  FComputerRejectButton.Visible := False;
+
+  FComputerPolicyLabel := TLabel.Create(Self);
+  FComputerPolicyLabel.Parent := FComputerPanel;
+  FComputerPolicyLabel.SetBounds(16, 150, 665, 20);
+  FComputerPolicyLabel.Caption := '限制：50 步 / 15 分钟 ｜ Desktop 仅限所选窗口及同进程对话框';
+  FComputerPolicyLabel.Font.Color := $00606060;
+  FComputerPolicyLabel.Visible := False;
+
+  FComputerLogMemo := TMemo.Create(Self);
+  FComputerLogMemo.Parent := FComputerPanel;
+  FComputerLogMemo.SetBounds(16, 174, 665, 56);
+  FComputerLogMemo.ReadOnly := True;
+  FComputerLogMemo.ScrollBars := ssVertical;
+  FComputerLogMemo.Font.Name := 'Cascadia Mono';
+  FComputerLogMemo.Font.Size := 8;
+  FComputerLogMemo.Visible := False;
+
+  FComputerImage := TImage.Create(Self);
+  FComputerImage.Parent := FComputerPanel;
+  FComputerImage.SetBounds(697, 42, 280, 188);
+  FComputerImage.Stretch := True;
+  FComputerImage.Proportional := True;
+  FComputerImage.Center := True;
+  FComputerImage.Anchors := [akTop, akRight, akBottom];
+  FComputerImage.Visible := False;
+
   FListPanel := TPanel.Create(Self);
   FListPanel.Parent := FContentPanel;
   FListPanel.Align := alClient;
@@ -461,6 +627,12 @@ begin
   begin
     FStatusBar.Panels[0].Width := FStatusBar.ClientWidth * 2 div 5;
     FStatusBar.Panels[1].Width := FStatusBar.ClientWidth * 3 div 10;
+  end;
+
+  if Assigned(FComputerImage) and Assigned(FComputerPanel) then
+  begin
+    FComputerImage.Left := FComputerPanel.ClientWidth - EDGE_MARGIN -
+      FComputerImage.Width;
   end;
 
   AdjustProfileColumns;
@@ -721,22 +893,25 @@ begin
 end;
 
 function TMainForm.ReadLocalAuthToken: string;
+begin
+  if not FileExists(LocalAuthTokenPath) then
+    raise Exception.Create('找不到桥接器本地认证令牌，请重新运行安装程序');
+  Result := Trim(TFile.ReadAllText(LocalAuthTokenPath, TEncoding.UTF8));
+  if Length(Result) < 32 then
+    raise Exception.Create('桥接器本地认证令牌无效，请重新运行安装程序');
+end;
+
+function TMainForm.LocalAuthTokenPath: string;
 var
   LProgramData: string;
-  LTokenPath: string;
 begin
   LProgramData := GetEnvironmentVariable('ProgramData');
   if LProgramData = '' then
     raise Exception.Create('无法定位 ProgramData，不能读取桥接器本地认证令牌');
-  LTokenPath := TPath.Combine(
+  Result := TPath.Combine(
     TPath.Combine(LProgramData, 'ClaudeCodeBridge'),
     'local-auth-token'
   );
-  if not FileExists(LTokenPath) then
-    raise Exception.Create('找不到桥接器本地认证令牌，请重新运行安装程序');
-  Result := Trim(TFile.ReadAllText(LTokenPath, TEncoding.UTF8));
-  if Length(Result) < 32 then
-    raise Exception.Create('桥接器本地认证令牌无效，请重新运行安装程序');
 end;
 
 function TMainForm.ResolveBridgeUrl: string;
@@ -913,6 +1088,7 @@ begin
     if ASnapshot.SettingsDir <> '' then
       FStatusBar.Panels[1].Text := '配置目录：' + ASnapshot.SettingsDir;
     ApplyThinkingControls(ASnapshot);
+    ApplyComputerSnapshot(ASnapshot);
     LStampChanged :=
       (ASnapshot.Stamp <> '') and (ASnapshot.Stamp <> FSettingsStamp);
     if LStampChanged then
@@ -925,6 +1101,7 @@ begin
   begin
     SetBridgeState(False, ASnapshot.Detail);
     ApplyThinkingControls(ASnapshot);
+    ApplyComputerSnapshot(ASnapshot);
     if not AQuiet then
       AppendLog('状态检查失败：' + ASnapshot.Detail);
   end;
@@ -936,7 +1113,7 @@ var
 begin
   LSupported := ASnapshot.Online and ASnapshot.HasProfile and
     SameText(ASnapshot.Transport, 'gemini-interactions') and
-    SameText(ASnapshot.Model, 'gemini-3.7-flash');
+    (ASnapshot.ThinkingLevel <> '');
   FUpdatingThinkingUi := True;
   try
     if LSupported then
@@ -958,11 +1135,260 @@ begin
       FThinkingLevel := '';
       FThinkingGroup.ItemIndex := -1;
       FThinkingGroup.Enabled := False;
-      FThinkingGroup.Caption := 'Gemini Thinking（仅 3.7 Flash）';
+      FThinkingGroup.Caption := 'Gemini Thinking（3.7+ Flash）';
     end;
   finally
     FUpdatingThinkingUi := False;
   end;
+end;
+
+procedure TMainForm.ApplyComputerSnapshot(const ASnapshot: TStatusSnapshot);
+begin
+  FComputerStatusLabel.Caption :=
+    '由 Claude Code 自动拉起；选窗和安全确认由 Host 按需弹出';
+end;
+
+procedure TMainForm.ComputerEnableClick(Sender: TObject);
+begin
+  MessageDlg('Computer Host 已改为 Claude Code 托管的本地 stdio MCP，' +
+    '无需从模型中心启动。', mtInformation, [mbOK], 0);
+end;
+
+procedure TMainForm.ComputerEnvironmentChange(Sender: TObject);
+begin
+  FComputerUrlLabel.Enabled := FComputerEnvironment.ItemIndex = 0;
+  FComputerUrlEdit.Enabled := FComputerEnvironment.ItemIndex = 0;
+  FComputerWindowButton.Enabled := (FComputerEnvironment.ItemIndex = 1) and
+    (Pos('Host：已连接', FComputerStatusLabel.Caption) > 0) and
+    (Pos('会话：运行中', FComputerStatusLabel.Caption) = 0);
+  if FComputerEnvironment.ItemIndex = 1 then
+    FComputerPolicyLabel.Caption := 'Desktop：WGC 截图 + SendInput，仅限所选 HWND、子窗口和同进程对话框'
+  else
+    FComputerPolicyLabel.Caption := 'Browser：最大 50 步 / 15 分钟，仅允许 localhost、127.0.0.1、::1';
+end;
+
+procedure TMainForm.ComputerStopClick(Sender: TObject);
+begin
+  StopComputerAsync;
+end;
+
+procedure TMainForm.ComputerWindowClick(Sender: TObject);
+var
+  LClient: THTTPClient;
+  LResponse: TJSONObject;
+  LWindows: TJSONArray;
+  LWindow: TJSONObject;
+  LHandles: TStringList;
+  LDialog: TForm;
+  LList: TListBox;
+  LOk: TButton;
+  LCancel: TButton;
+  LIndex: Integer;
+  LBlocked: Integer;
+  LRequest: TJSONObject;
+  LSelectedResponse: TJSONObject;
+  LTitle: string;
+  LPath: string;
+begin
+  if FComputerEnvironment.ItemIndex <> 1 then
+  begin
+    MessageDlg('请先把环境切换为 Desktop。', mtInformation, [mbOK], 0);
+    Exit;
+  end;
+  LHandles := TStringList.Create;
+  try
+    try
+      LBlocked := 0;
+      LClient := NewHttpClient(ACTION_RESPONSE_TIMEOUT_MS);
+      try
+        LResponse := GetJsonWith(LClient, '/admin/computer/windows');
+        try
+          if not (LResponse.Values['windows'] is TJSONArray) then
+            raise Exception.Create('Computer Host 未返回窗口列表。');
+          LWindows := TJSONArray(LResponse.Values['windows']);
+          LDialog := TForm.Create(Self);
+          try
+          LDialog.Caption := '选择 Desktop Computer Use 目标窗口';
+          LDialog.Position := poOwnerFormCenter;
+          LDialog.BorderStyle := bsDialog;
+          LDialog.ClientWidth := 720;
+          LDialog.ClientHeight := 390;
+          LList := TListBox.Create(LDialog);
+          LList.Parent := LDialog;
+          LList.SetBounds(16, 16, 688, 318);
+          LList.Anchors := [akLeft, akTop, akRight, akBottom];
+          LList.ItemHeight := 22;
+          for LIndex := 0 to LWindows.Count - 1 do
+            if LWindows.Items[LIndex] is TJSONObject then
+            begin
+              LWindow := TJSONObject(LWindows.Items[LIndex]);
+              if JsonBool(LWindow, 'eligible') then
+              begin
+                LTitle := JsonText(LWindow, 'title');
+                LPath := ExtractFileName(JsonText(LWindow, 'process_path'));
+                LList.Items.Add(Format('%s  —  %s  [HWND %s]',
+                  [LTitle, LPath, JsonText(LWindow, 'hwnd')]));
+                LHandles.Add(JsonText(LWindow, 'hwnd'));
+              end
+              else
+                Inc(LBlocked);
+            end;
+          if LList.Items.Count > 0 then
+            LList.ItemIndex := 0;
+          LOk := TButton.Create(LDialog);
+          LOk.Parent := LDialog;
+          LOk.SetBounds(512, 346, 92, 30);
+          LOk.Caption := '选择';
+          LOk.ModalResult := mrOk;
+          LOk.Default := True;
+          LOk.Enabled := LList.Items.Count > 0;
+          LCancel := TButton.Create(LDialog);
+          LCancel.Parent := LDialog;
+          LCancel.SetBounds(612, 346, 92, 30);
+          LCancel.Caption := '取消';
+          LCancel.ModalResult := mrCancel;
+          LCancel.Cancel := True;
+          if LList.Items.Count = 0 then
+          begin
+            MessageDlg(Format('没有可选窗口（%d 个窗口因提权、敏感程序或不可访问被阻止）。',
+              [LBlocked]), mtWarning, [mbOK], 0);
+            Exit;
+          end;
+          if LDialog.ShowModal <> mrOk then
+            Exit;
+          LRequest := TJSONObject.Create;
+          try
+            LRequest.AddPair('target_hwnd', LHandles[LList.ItemIndex]);
+            LSelectedResponse := PostJsonWith(LClient,
+              '/admin/computer/select-window', LRequest.ToJSON);
+            LSelectedResponse.Free;
+          finally
+            LRequest.Free;
+          end;
+          AppendLog('已明确选择 Desktop 目标：' + LList.Items[LList.ItemIndex] +
+            Format('；另有 %d 个窗口被安全策略排除。', [LBlocked]));
+          finally
+            LDialog.Free;
+          end;
+        finally
+          LResponse.Free;
+        end;
+      finally
+        LClient.Free;
+      end;
+      RefreshStatusAsync(True);
+    except
+      on E: Exception do
+        MessageDlg('选择 Desktop 窗口失败：' + E.Message, mtError, [mbOK], 0);
+    end;
+  finally
+    LHandles.Free;
+  end;
+end;
+
+procedure TMainForm.ComputerAllowClick(Sender: TObject);
+begin
+  DecideComputerApprovalAsync(True);
+end;
+
+procedure TMainForm.ComputerRejectClick(Sender: TObject);
+begin
+  DecideComputerApprovalAsync(False);
+end;
+
+procedure TMainForm.DecideComputerApprovalAsync(const AApprove: Boolean);
+var
+  LSession: string;
+  LBatch: string;
+  LHash: string;
+begin
+  LSession := FComputerApprovalSession;
+  LBatch := FComputerApprovalBatch;
+  LHash := FComputerApprovalHash;
+  if (LSession = '') or (LBatch = '') or (LHash = '') then
+    Exit;
+  Inc(FWorkerCount);
+  TThread.CreateAnonymousThread(
+    procedure
+    var
+      LClient: THTTPClient;
+      LRequest: TJSONObject;
+      LResponse: TJSONObject;
+      LError: string;
+      LPath: string;
+    begin
+      LError := '';
+      try
+        LRequest := TJSONObject.Create;
+        try
+          LRequest.AddPair('session_id', LSession);
+          LRequest.AddPair('batch_id', LBatch);
+          LRequest.AddPair('action_hash', LHash);
+          if AApprove then
+            LPath := '/admin/computer/approve'
+          else
+            LPath := '/admin/computer/reject';
+          LClient := NewHttpClient(ACTION_RESPONSE_TIMEOUT_MS);
+          try
+            LResponse := PostJsonWith(LClient, LPath, LRequest.ToJSON);
+            LResponse.Free;
+          finally
+            LClient.Free;
+          end;
+        finally
+          LRequest.Free;
+        end;
+      except
+        on E: Exception do
+          LError := E.Message;
+      end;
+      QueueToMain(
+        procedure
+        begin
+          if LError <> '' then
+            AppendLog('Computer Use 审批失败：' + LError)
+          else if AApprove then
+            AppendLog('已由真实用户允许本批动作一次。')
+          else
+            AppendLog('已拒绝本批 Computer Use 动作。');
+          RefreshStatusAsync(True);
+        end);
+    end).Start;
+end;
+
+procedure TMainForm.StopComputerAsync;
+begin
+  Inc(FWorkerCount);
+  TThread.CreateAnonymousThread(
+    procedure
+    var
+      LClient: THTTPClient;
+      LResponse: TJSONObject;
+      LError: string;
+    begin
+      LError := '';
+      try
+        LClient := NewHttpClient(ACTION_RESPONSE_TIMEOUT_MS);
+        try
+          LResponse := PostJsonWith(LClient, '/admin/computer/cancel', '{}');
+          LResponse.Free;
+        finally
+          LClient.Free;
+        end;
+      except
+        on E: Exception do
+          LError := E.Message;
+      end;
+      QueueToMain(
+        procedure
+        begin
+          if LError <> '' then
+            AppendLog('Computer Use 停止失败：' + LError)
+          else
+            AppendLog('Computer Use 会话已立即停止。');
+          RefreshStatusAsync(True);
+        end);
+    end).Start;
 end;
 
 procedure TMainForm.StartProfilesRefresh(const AQuiet: Boolean);

@@ -745,6 +745,7 @@ async fn vision_proxy_calls_provider_once_and_reuses_base64_cache() {
         model: "fallback".to_string(),
         thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
         interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
+        computer: Arc::new(ComputerBroker),
         vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
         routing: Arc::new(RwLock::new(ProviderRoutingState {
             profiles: vec![target.clone(), source],
@@ -832,6 +833,7 @@ async fn mcp_generate_image_calls_gemini_saves_file_and_returns_preview() {
         model: "fallback".to_string(),
         thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
         interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
+        computer: Arc::new(ComputerBroker),
         vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
         routing: Arc::new(RwLock::new(ProviderRoutingState {
             profiles: Vec::new(),
@@ -964,6 +966,7 @@ async fn configured_kimi_formula_is_exposed_and_executed_only_when_enabled() {
         model: "bridge-router".to_string(),
         thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
         interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
+        computer: Arc::new(ComputerBroker),
         vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
         routing: Arc::new(RwLock::new(ProviderRoutingState {
             profiles: vec![profile],
@@ -1524,12 +1527,51 @@ fn validates_gemini_thinking_level_admin_requests() {
     assert!(gemini_thinking_level_from_admin_request(&json!({})).is_err());
 }
 
+#[test]
+fn gemini_flash_thinking_controls_support_37_and_newer_versions() {
+    let mut profile = interactions_test_profile("gemini.json");
+    for model in [
+        "gemini-3.7-flash",
+        "gemini-3.8-flash",
+        "gemini-3.10-flash",
+        "gemini-3.8-flash-preview",
+        "Gemini-4.0-Flash",
+    ] {
+        profile.model = model.to_string();
+        assert!(supports_gemini_flash_thinking_levels(&profile), "{model}");
+    }
+
+    for model in [
+        "gemini-3.6-flash",
+        "gemini-3.8-pro",
+        "gemini-flash",
+        "other-4.0-flash",
+    ] {
+        profile.model = model.to_string();
+        assert!(!supports_gemini_flash_thinking_levels(&profile), "{model}");
+    }
+
+    profile.model = "gemini-3.8-flash".to_string();
+    profile.transport = ProviderTransport::OpenAiChat;
+    assert!(!supports_gemini_flash_thinking_levels(&profile));
+
+    assert_eq!(
+        normalize_gemini_thinking_level("minimal", "gemini-4.0-flash"),
+        Some("low")
+    );
+    assert_eq!(
+        normalize_gemini_thinking_level("max", "gemini-4.0-flash"),
+        Some("high")
+    );
+}
+
 #[tokio::test]
 async fn admin_gemini_thinking_level_is_hot_persisted_and_profile_scoped() {
     let root = env::temp_dir().join(format!("claude-bridge-thinking-admin-{}", Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
     let state_path = root.join("bridge-state.json");
-    let profile = interactions_test_profile("gemini-3.7-flash.json");
+    let mut profile = interactions_test_profile("gemini-3.8-flash.json");
+    profile.model = "gemini-3.8-flash".to_string();
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
     let state = Arc::new(AppState {
         gemini_transport: Arc::new(RwLock::new(GeminiTransport {
@@ -1540,13 +1582,14 @@ async fn admin_gemini_thinking_level_is_hot_persisted_and_profile_scoped() {
         fallback_api_key: Some("test-key".to_string()),
         local_auth_token: "test-local-token-that-is-long-enough-1234567890".to_string(),
         upstream_url: "https://example.invalid".to_string(),
-        model: "gemini-3.7-flash".to_string(),
+        model: "gemini-3.8-flash".to_string(),
         thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
         interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
+        computer: Arc::new(ComputerBroker),
         vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
         routing: Arc::new(RwLock::new(ProviderRoutingState {
             profiles: vec![profile],
-            active_file: "gemini-3.7-flash.json".to_string(),
+            active_file: "gemini-3.8-flash.json".to_string(),
             source: ProviderProfileSource::Native,
         })),
         shutdown_tx,
@@ -5044,7 +5087,7 @@ fn interactions_test_profile(file_name: &str) -> ProviderProfile {
         file_name: file_name.to_string(),
         display_name: "Gemini Interactions".to_string(),
         source: ProviderProfileSource::Native,
-        model: "gemini-3.7-flash".to_string(),
+        model: DEFAULT_GEMINI_MODEL.to_string(),
         context_window: None,
         upstream_identity: None,
         identity_override: true,
@@ -5098,7 +5141,7 @@ fn accepts_native_gemini_builtin_tool_options_without_flattening_them() {
         OpenAiCapabilities::gemini_interactions(),
     )
     .unwrap();
-    let tools = translated_interaction_tools(&json!({}), &capabilities);
+    let tools = translated_interaction_tools(&json!({}), &capabilities).unwrap();
 
     assert_eq!(tools[0], json!({"type": "url_context"}));
     assert_eq!(
@@ -5112,6 +5155,126 @@ fn accepts_native_gemini_builtin_tool_options_without_flattening_them() {
         tools[2],
         json!({"type": "google_maps", "enable_widget": true})
     );
+}
+
+#[test]
+fn maps_latest_anthropic_server_tools_to_gemini_native_tools_and_deduplicates() {
+    let mut capabilities = OpenAiCapabilities::gemini_interactions();
+    capabilities.gemini_builtin_tools = vec![
+        json!({
+            "type": "google_search",
+            "search_types": ["web_search", "image_search"]
+        }),
+        json!({"type": "url_context"}),
+    ];
+    let request = json!({
+        "tools": [
+            {"type": "web_search_20260318", "name": "web_search"},
+            {"type": "web_fetch_20260318", "name": "web_fetch"},
+            {"type": "code_execution_20260521", "name": "code_execution"},
+            {
+                "name": "read_file",
+                "description": "Read a local file",
+                "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}
+            }
+        ]
+    });
+
+    let tools = translated_interaction_tools(&request, &capabilities).unwrap();
+    assert_eq!(tools.len(), 4);
+    assert_eq!(tools[0]["type"], "google_search");
+    assert_eq!(tools[0]["search_types"][1], "image_search");
+    assert_eq!(tools[1]["type"], "url_context");
+    assert_eq!(tools[2]["type"], "code_execution");
+    assert_eq!(tools[3]["type"], "function");
+    assert_eq!(tools[3]["name"], "read_file");
+}
+
+#[test]
+fn diagnoses_server_tool_controls_and_schema_less_client_toolsets() {
+    let request = json!({
+        "tools": [
+            {
+                "type": "web_search_20260318",
+                "name": "web_search",
+                "allowed_domains": ["example.com"],
+                "max_uses": 3
+            },
+            {"type": "computer_toolset_20260801"},
+            {"type": "browser_toolset_20260801"}
+        ]
+    });
+
+    let diagnostics = gemini_interaction_request_diagnostics(&request).join("\n");
+    assert!(diagnostics.contains("google_search"));
+    assert!(diagnostics.contains("allowed_domains"));
+    assert!(diagnostics.contains("max_uses"));
+    assert!(diagnostics.contains("computer_toolset_20260801"));
+    assert!(diagnostics.contains("browser_toolset_20260801"));
+    assert!(diagnostics.contains("MCP browser tool"));
+}
+
+#[test]
+fn expands_anthropic_bash_editor_and_memory_tools_for_gemini_client_execution() {
+    let request = json!({
+        "tools": [
+            {"type": "bash_20250124", "name": "bash"},
+            {
+                "type": "text_editor_20250728",
+                "name": "str_replace_based_edit_tool",
+                "max_characters": 12000
+            },
+            {"type": "memory_20250818", "name": "memory"}
+        ]
+    });
+    let capabilities = OpenAiCapabilities::gemini_interactions();
+
+    let tools = translated_interaction_tools(&request, &capabilities).unwrap();
+    assert_eq!(tools.len(), 3);
+    assert_eq!(tools[0]["name"], "bash");
+    assert_eq!(
+        tools[0]["parameters"]["properties"]["command"]["type"],
+        "string"
+    );
+    assert_eq!(tools[1]["name"], "str_replace_based_edit_tool");
+    assert!(tools[1]["description"].as_str().unwrap().contains("12000"));
+    assert_eq!(
+        tools[1]["parameters"]["properties"]["command"]["enum"],
+        json!(["view", "str_replace", "create", "insert"])
+    );
+    assert_eq!(tools[2]["name"], "memory");
+    assert!(tools[2]["parameters"]["properties"]["command"]["enum"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("rename")));
+
+    let diagnostics = gemini_interaction_request_diagnostics(&request).join("\n");
+    assert!(diagnostics.contains("bash_20250124"));
+    assert!(diagnostics.contains("text_editor_20250728"));
+    assert!(diagnostics.contains("memory_20250818"));
+}
+
+#[test]
+fn replaces_anthropic_tool_search_with_eager_function_exposure() {
+    let request = json!({
+        "tools": [
+            {"type": "tool_search_tool_bm25_20251119", "name": "tool_search"},
+            {
+                "name": "read_issue",
+                "description": "Read one issue",
+                "defer_loading": true,
+                "input_schema": {"type": "object", "properties": {"id": {"type": "integer"}}}
+            }
+        ]
+    });
+    let capabilities = OpenAiCapabilities::gemini_interactions();
+
+    let tools = translated_interaction_tools(&request, &capabilities).unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["name"], "read_issue");
+    assert!(gemini_interaction_request_diagnostics(&request)
+        .join("\n")
+        .contains("eagerly exposing"));
 }
 
 #[test]
@@ -5210,6 +5373,23 @@ fn detects_and_removes_only_mixed_interaction_server_tools() {
     assert!(!interaction_request_has_mixed_tools(&request));
     assert_eq!(request["tools"].as_array().unwrap().len(), 1);
     assert_eq!(request["tools"][0]["name"], "read_file");
+
+    let mut computer_request = json!({
+        "tools": [
+            {"type": "computer_use", "environment": "browser", "enable_prompt_injection_detection": true},
+            {"type": "google_search"},
+            {"type": "function", "name": "read_file"}
+        ]
+    });
+    assert!(is_mixed_interaction_tools_error(
+        400,
+        "'computer_use' and 'google_search' cannot be combined in the same request"
+    ));
+    assert!(remove_interaction_tools_incompatible_with_computer_use(
+        &mut computer_request
+    ));
+    assert_eq!(computer_request["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(computer_request["tools"][0]["type"], "computer_use");
 }
 
 #[test]
@@ -5263,7 +5443,7 @@ fn configures_google_maps_and_native_file_search() {
         capabilities.gemini_tool_choice_override.as_deref(),
         Some("validated")
     );
-    let tools = translated_interaction_tools(&json!({}), &capabilities);
+    let tools = translated_interaction_tools(&json!({}), &capabilities).unwrap();
     assert_eq!(tools[0]["enable_widget"], true);
     assert_eq!(tools[0]["latitude"], 31.2304);
     assert_eq!(tools[0]["longitude"], 121.4737);
@@ -5378,7 +5558,7 @@ fn configures_native_remote_mcp_without_exposing_header_values() {
     )
     .unwrap();
 
-    let tools = translated_interaction_tools(&json!({}), &capabilities);
+    let tools = translated_interaction_tools(&json!({}), &capabilities).unwrap();
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0]["type"], "mcp_server");
     assert_eq!(tools[0]["name"], "weather_tools");
@@ -5402,6 +5582,150 @@ fn configures_native_remote_mcp_without_exposing_header_values() {
         "<redacted>"
     );
     assert!(!public.to_string().contains("remote-secret"));
+}
+
+#[test]
+fn maps_anthropic_request_mcp_connector_to_gemini_remote_mcp() {
+    let request = json!({
+        "mcp_servers": [{
+            "type": "url",
+            "name": "project-tools",
+            "url": "https://mcp.example.com/mcp",
+            "authorization_token": "request-secret"
+        }],
+        "tools": [{
+            "type": "mcp_toolset",
+            "mcp_server_name": "project-tools",
+            "default_config": {"enabled": false, "defer_loading": true},
+            "configs": {
+                "read_issue": {"enabled": true, "defer_loading": false},
+                "delete_issue": {"enabled": false}
+            }
+        }]
+    });
+    let capabilities = OpenAiCapabilities::gemini_interactions();
+
+    let tools = translated_interaction_tools(&request, &capabilities).unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["type"], "mcp_server");
+    assert_eq!(tools[0]["name"], "project_tools");
+    assert_eq!(tools[0]["url"], "https://mcp.example.com/mcp");
+    assert_eq!(
+        tools[0]["headers"]["Authorization"],
+        "Bearer request-secret"
+    );
+    assert_eq!(tools[0]["allowed_tools"], json!(["read_issue"]));
+
+    let diagnostics = gemini_interaction_request_diagnostics(&request).join("\n");
+    assert!(diagnostics.contains("Remote MCP"));
+    assert!(diagnostics.contains("project_tools"));
+    assert!(diagnostics.contains("defer_loading"));
+    assert!(!diagnostics.contains("request-secret"));
+}
+
+#[test]
+fn translates_gemini_remote_mcp_steps_to_anthropic_content_blocks() {
+    let upstream = json!({
+        "id": "interaction-mcp-1",
+        "status": "completed",
+        "steps": [
+            {
+                "type": "mcp_server_tool_call",
+                "id": "mcp_call_1",
+                "name": "read_issue",
+                "server_name": "project_tools",
+                "arguments": {"id": 42}
+            },
+            {
+                "type": "mcp_server_tool_result",
+                "call_id": "mcp_call_1",
+                "name": "read_issue",
+                "server_name": "project_tools",
+                "result": {"title": "Fix bridge"}
+            },
+            {"type": "model_output", "content": [{"type": "text", "text": "Done."}]}
+        ],
+        "usage": {"total_input_tokens": 4, "total_output_tokens": 2}
+    });
+
+    let translated = translate_gemini_interactions_response(&upstream, "gemini-3.8-flash").unwrap();
+    assert_eq!(translated.message["content"][0]["type"], "mcp_tool_use");
+    assert_eq!(translated.message["content"][0]["id"], "mcp_call_1");
+    assert_eq!(
+        translated.message["content"][0]["server_name"],
+        "project_tools"
+    );
+    assert_eq!(translated.message["content"][0]["input"]["id"], 42);
+    assert_eq!(translated.message["content"][1]["type"], "mcp_tool_result");
+    assert_eq!(
+        translated.message["content"][1]["tool_use_id"],
+        "mcp_call_1"
+    );
+    assert!(translated.message["content"][1]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("Fix bridge"));
+    assert_eq!(translated.message["content"][2]["text"], "Done.");
+}
+
+#[test]
+fn streams_gemini_remote_mcp_steps_as_anthropic_content_blocks() {
+    let continuations = Arc::new(RwLock::new(InteractionContinuationCache::default()));
+    let mut translator = GeminiInteractionsStreamTranslator::new(
+        "gemini-3.8-flash".to_string(),
+        "gemini-mcp.json".to_string(),
+        json!({"messages": [{"role": "user", "content": "Read issue 42"}]}),
+        continuations,
+        2,
+        false,
+    );
+    let mut events = translator
+        .process_payload(
+            r#"{"type":"interaction.created","interaction":{"id":"interaction-mcp-stream","status":"in_progress"}}"#,
+        )
+        .unwrap();
+    for payload in [
+        r#"{"type":"step.start","index":0,"step":{"type":"mcp_server_tool_call","id":"mcp_call_1","name":"read_issue","server_name":"project_tools","arguments":{"id":42}}}"#,
+        r#"{"type":"step.stop","index":0,"status":"done"}"#,
+        r#"{"type":"step.start","index":1,"step":{"type":"mcp_server_tool_result","call_id":"mcp_call_1","result":{"title":"Fix bridge"}}}"#,
+        r#"{"type":"step.stop","index":1,"status":"done"}"#,
+        r#"{"type":"interaction.completed","interaction":{"id":"interaction-mcp-stream","status":"completed","usage":{"total_input_tokens":2,"total_output_tokens":1}}}"#,
+    ] {
+        events.extend(translator.process_payload(payload).unwrap());
+    }
+    events.extend(translator.finish().unwrap());
+    let events = format!("{events:?}");
+    assert!(events.contains("mcp_tool_use"));
+    assert!(events.contains("mcp_tool_result"));
+    assert!(events.contains("project_tools"));
+    assert!(events.contains("Fix bridge"));
+}
+
+#[test]
+fn rejects_anthropic_mcp_denylist_and_dangling_toolsets() {
+    let capabilities = OpenAiCapabilities::gemini_interactions();
+    let denylist = json!({
+        "mcp_servers": [{
+            "type": "url",
+            "name": "project",
+            "url": "https://mcp.example.com/mcp"
+        }],
+        "tools": [{
+            "type": "mcp_toolset",
+            "mcp_server_name": "project",
+            "configs": {"delete_all": {"enabled": false}}
+        }]
+    });
+    let error = translated_interaction_tools(&denylist, &capabilities).unwrap_err();
+    assert!(error.contains("denylist"));
+    assert!(error.contains("allowlist"));
+
+    let dangling = json!({
+        "mcp_servers": [],
+        "tools": [{"type": "mcp_toolset", "mcp_server_name": "missing"}]
+    });
+    let error = translated_interaction_tools(&dangling, &capabilities).unwrap_err();
+    assert!(error.contains("exactly one mcp_servers entry"));
 }
 
 #[test]
@@ -5434,12 +5758,12 @@ fn rejects_unsafe_remote_mcp_and_unsupported_interactions_tiers() {
         OpenAiCapabilities::gemini_interactions(),
     )
     .unwrap_err();
-    assert!(error.contains("standard, priority, or flex"));
+    assert!(error.contains("auto, standard, priority, or flex"));
 }
 
 #[test]
 fn accepts_all_supported_interactions_service_tiers() {
-    for tier in ["standard", "flex", "priority"] {
+    for tier in ["auto", "standard", "flex", "priority"] {
         let raw = json!({"capabilities": {"gemini_service_tier": tier}});
         let capabilities = parse_openai_capabilities_with_defaults(
             raw.as_object().unwrap(),
@@ -5449,6 +5773,31 @@ fn accepts_all_supported_interactions_service_tiers() {
         .unwrap();
         assert_eq!(capabilities.gemini_service_tier.as_deref(), Some(tier));
     }
+}
+
+#[test]
+fn maps_anthropic_fast_mode_to_priority_unless_profile_forces_a_tier() {
+    let request = json!({"speed": "fast", "service_tier": "auto"});
+    let mut capabilities = OpenAiCapabilities::gemini_interactions();
+    assert_eq!(
+        interaction_service_tier(&request, &capabilities).as_deref(),
+        Some("priority")
+    );
+
+    capabilities.gemini_service_tier = Some("auto".to_string());
+    assert_eq!(
+        interaction_service_tier(&request, &capabilities).as_deref(),
+        Some("priority")
+    );
+
+    capabilities.gemini_service_tier = Some("standard".to_string());
+    assert_eq!(
+        interaction_service_tier(&request, &capabilities).as_deref(),
+        Some("standard")
+    );
+    assert!(gemini_interaction_request_diagnostics(&request)
+        .join("\n")
+        .contains("Priority inference"));
 }
 
 #[test]
@@ -5511,12 +5860,47 @@ fn maps_structured_output_effort_service_tier_and_document_sources() {
 }
 
 #[test]
+fn preserves_anthropic_search_result_blocks_as_gemini_context() {
+    let profile = interactions_test_profile("gemini-interactions.json");
+    let request = json!({
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "search_result",
+                "source": "https://example.com/reference",
+                "title": "Reference title",
+                "content": [
+                    {"type": "text", "text": "First paragraph."},
+                    {"type": "text", "text": "Second paragraph."}
+                ],
+                "citations": {"enabled": true}
+            }]
+        }]
+    });
+    let translated = translate_gemini_interactions_request(
+        &request,
+        &profile,
+        &RwLock::new(InteractionContinuationCache::default()),
+    )
+    .unwrap();
+    let text = translated["input"][0]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(text.contains("Reference title"));
+    assert!(text.contains("https://example.com/reference"));
+    assert!(text.contains("First paragraph."));
+    assert!(text.contains("Second paragraph."));
+}
+
+#[test]
 fn exposes_explicit_diagnostics_for_unmapped_anthropic_fields() {
     let request = json!({
         "metadata": {"user_id": "test"},
         "container": "container-1",
         "temperature": 0.7,
         "candidate_count": 2,
+        "frequency_penalty": 0.5,
+        "presence_penalty": 0.5,
         "service_tier": "auto",
         "tool_choice": {"type": "auto", "disable_parallel_tool_use": true},
         "messages": [{
@@ -5529,6 +5913,8 @@ fn exposes_explicit_diagnostics_for_unmapped_anthropic_fields() {
     assert!(diagnostics.contains("container"));
     assert!(diagnostics.contains("temperature"));
     assert!(diagnostics.contains("candidate_count"));
+    assert!(diagnostics.contains("frequency_penalty"));
+    assert!(diagnostics.contains("presence_penalty"));
     assert!(diagnostics.contains("default standard tier"));
     assert!(diagnostics.contains("disable_parallel_tool_use"));
     assert!(diagnostics.contains("cache_control"));
@@ -5567,7 +5953,7 @@ fn builds_google_native_count_tokens_request_with_prompt_and_tools() {
     });
     let translated = gemini_count_tokens_request(&request, &profile).unwrap();
     let generate = &translated["generateContentRequest"];
-    assert_eq!(generate["model"], "models/gemini-3.7-flash");
+    assert_eq!(generate["model"], "models/gemini-3.8-flash");
     assert_eq!(
         generate["systemInstruction"]["parts"][0]["text"],
         "You are a coding agent."
@@ -5644,6 +6030,7 @@ async fn anthropic_count_tokens_uses_kimi_native_estimator() {
         model: "bridge-router".to_string(),
         thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
         interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
+        computer: Arc::new(ComputerBroker),
         vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
         routing: Arc::new(RwLock::new(ProviderRoutingState {
             profiles: vec![profile],
@@ -5707,7 +6094,7 @@ async fn anthropic_messages_uses_bridge_managed_gemini_credential() {
                     .and_then(|value| value.to_str().ok()),
                 Some("managed-google-key")
             );
-            assert_eq!(body["model"], "gemini-3.7-flash");
+            assert_eq!(body["model"], "gemini-3.8-flash");
             Json(json!({
                 "id": "interaction-managed-credential",
                 "status": "completed",
@@ -5733,9 +6120,10 @@ async fn anthropic_messages_uses_bridge_managed_gemini_credential() {
         fallback_api_key: Some("managed-google-key".to_string()),
         local_auth_token: "test-local-token-that-is-long-enough-1234567890".to_string(),
         upstream_url: "https://example.invalid".to_string(),
-        model: "gemini-3.7-flash".to_string(),
+        model: DEFAULT_GEMINI_MODEL.to_string(),
         thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
         interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
+        computer: Arc::new(ComputerBroker),
         vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
         routing: Arc::new(RwLock::new(ProviderRoutingState {
             profiles: vec![profile],
@@ -5776,7 +6164,7 @@ async fn anthropic_count_tokens_uses_google_native_endpoint() {
     let captured = Arc::new(tokio::sync::Mutex::new(None::<Value>));
     let captured_for_handler = captured.clone();
     let mock = Router::new().route(
-        "/v1beta/models/gemini-3.7-flash:countTokens",
+        "/v1beta/models/gemini-3.8-flash:countTokens",
         post(move |headers: HeaderMap, Json(body): Json<Value>| {
             let captured = captured_for_handler.clone();
             async move {
@@ -5807,9 +6195,10 @@ async fn anthropic_count_tokens_uses_google_native_endpoint() {
         fallback_api_key: Some("test-key".to_string()),
         local_auth_token: "test-local-token-that-is-long-enough-1234567890".to_string(),
         upstream_url: "https://example.invalid".to_string(),
-        model: "gemini-3.7-flash".to_string(),
+        model: DEFAULT_GEMINI_MODEL.to_string(),
         thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
         interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
+        computer: Arc::new(ComputerBroker),
         vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
         routing: Arc::new(RwLock::new(ProviderRoutingState {
             profiles: vec![profile],
@@ -5875,7 +6264,16 @@ fn returns_bounded_gemini_server_tool_metadata_and_standard_usage_counts() {
         "usage": {"total_input_tokens": 12, "total_output_tokens": 4}
     });
     let translated = translate_gemini_interactions_response(&upstream, "gemini-3.6-flash").unwrap();
-    assert_eq!(translated.message["content"][0]["text"], "Done.");
+    let content = translated.message["content"].as_array().unwrap();
+    assert!(content
+        .iter()
+        .any(|block| block.get("text").and_then(Value::as_str) == Some("Done.")));
+    assert!(content
+        .iter()
+        .any(|block| block.get("type").and_then(Value::as_str) == Some("mcp_tool_use")));
+    assert!(content
+        .iter()
+        .any(|block| block.get("type").and_then(Value::as_str) == Some("mcp_tool_result")));
     assert_eq!(
         translated.message["usage"]["server_tool_use"]["web_search_requests"],
         1
@@ -6070,6 +6468,8 @@ fn preserves_signature_only_thought_annotations_and_actual_service_tier() {
         translated.message["provider_metadata"]["google"]["service_tier"],
         "priority"
     );
+    assert_eq!(translated.message["usage"]["service_tier"], "priority");
+    assert_eq!(translated.message["usage"]["speed"], "fast");
     let header_tier = translate_gemini_interactions_response_with_service_tier(
         &upstream,
         "gemini-3.7-flash",
@@ -6080,6 +6480,8 @@ fn preserves_signature_only_thought_annotations_and_actual_service_tier() {
         header_tier.message["provider_metadata"]["google"]["service_tier"],
         "flex"
     );
+    assert!(header_tier.message["usage"].get("service_tier").is_none());
+    assert_eq!(header_tier.message["usage"]["speed"], "standard");
 }
 
 #[tokio::test]
@@ -7205,6 +7607,7 @@ fn preserves_streamed_server_tool_deltas_annotations_and_service_tier() {
     assert!(finish_events.contains("interaction_annotations"));
     assert!(finish_events.contains("https://example.com"));
     assert!(finish_events.contains("priority"));
+    assert!(finish_events.contains("speed\\\":\\\"fast"));
 }
 
 #[test]
@@ -7280,7 +7683,7 @@ fn maps_latest_interactions_usage_details_to_anthropic_usage() {
 }
 
 #[test]
-fn normalizes_gemini_37_thinking_levels_and_rejects_assistant_prefill() {
+fn normalizes_gemini_38_thinking_levels_and_rejects_assistant_prefill() {
     let mut profile = interactions_test_profile("gemini-interactions.json");
     let continuations = RwLock::new(InteractionContinuationCache::default());
     let request = json!({"messages": [{"role": "user", "content": "Hello"}]});
@@ -7323,6 +7726,11 @@ fn normalizes_gemini_37_thinking_levels_and_rejects_assistant_prefill() {
     assert!(error.contains("assistant prefill"));
 
     profile.openai_capabilities.gemini_thinking_level_override = None;
+    profile.model = "gemini-4.0-flash".to_string();
+    let translated =
+        translate_gemini_interactions_request(&disabled, &profile, &continuations).unwrap();
+    assert_eq!(translated["generation_config"]["thinking_level"], "low");
+
     profile.model = "gemini-2.5-flash".to_string();
     profile.openai_capabilities.default_reasoning_effort = Some("minimal".to_string());
     let translated =
@@ -7971,4 +8379,437 @@ async fn qwen_responses_forward_enables_official_session_cache_header() {
     assert_eq!(headers["x-dashscope-session-cache"], "enable");
     assert_eq!(headers["authorization"], "Bearer secret");
     server.abort();
+}
+
+fn computer_request_fixture() -> Value {
+    let envelope = json!({
+        "kind": "computer_start_result",
+        "protocol_version": COMPUTER_PROTOCOL_VERSION,
+        "session_id": "cus_test",
+        "sequence": 0,
+        "environment": "browser",
+        "viewport": {"width": 1440, "height": 900, "device_scale_factor": 1},
+        "environment_state": {"current_url": "http://127.0.0.1:3000/"}
+    });
+    json!({
+        "messages": [
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_start", "name": "mcp__bridge__computer_start", "input": {"local_url": "http://127.0.0.1:3000"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_start", "content": [
+                {"type": "text", "text": envelope.to_string()},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}
+            ]}]}
+        ],
+        "tools": [
+            {"name": "mcp__bridge__computer_start", "description": "start", "input_schema": {"type": "object"}},
+            {"name": "mcp__bridge__computer_action_batch", "description": "batch", "input_schema": {"type": "object"}},
+            {"name": "mcp__bridge__computer_cancel", "description": "cancel", "input_schema": {"type": "object"}}
+        ]
+    })
+}
+
+#[test]
+fn provider_accepts_safe_computer_use_and_rejects_unsafe_overrides() {
+    let safe = capability_gemini_builtin_tools(
+        &json!({"tools": ["computer_use"]})
+            .as_object()
+            .unwrap()
+            .clone(),
+        &["tools"],
+        Vec::new(),
+        "test.json",
+    )
+    .unwrap();
+    assert_eq!(safe[0]["type"], "computer_use");
+    assert_eq!(safe[0]["environment"], "browser");
+    assert_eq!(safe[0]["enable_prompt_injection_detection"], true);
+
+    let unsafe_config = json!({"tools": [{"type": "computer_use", "environment": "browser", "enable_prompt_injection_detection": false}]});
+    assert!(capability_gemini_builtin_tools(
+        unsafe_config.as_object().unwrap(),
+        &["tools"],
+        Vec::new(),
+        "test.json"
+    )
+    .is_err());
+    let disabled = json!({"tools": [{"type": "computer_use", "environment": "browser", "enable_prompt_injection_detection": true, "disabled_safety_policies": ["anything"]}]});
+    assert!(capability_gemini_builtin_tools(
+        disabled.as_object().unwrap(),
+        &["tools"],
+        Vec::new(),
+        "test.json"
+    )
+    .is_err());
+}
+
+#[test]
+#[cfg(any())]
+fn validates_all_gemini_browser_and_desktop_actions() {
+    assert!(
+        computer_start_tool()["inputSchema"]["properties"]["environment"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "desktop")
+    );
+    let coordinate = |name: &str| json!({"call_id": format!("call_{name}"), "name": name, "arguments": {"x": 500, "y": 500, "intent": "test"}});
+    for name in [
+        "click",
+        "double_click",
+        "triple_click",
+        "middle_click",
+        "right_click",
+        "mouse_down",
+        "mouse_up",
+        "move",
+    ] {
+        validate_computer_action(&coordinate(name), "browser").unwrap();
+        validate_computer_action(&coordinate(name), "desktop").unwrap();
+    }
+    let calls = vec![
+        json!({"call_id":"type","name":"type","arguments":{"text":"hello","press_enter":true,"intent":"test"}}),
+        json!({"call_id":"drag","name":"drag_and_drop","arguments":{"start_x":0,"start_y":1,"end_x":998,"end_y":999,"intent":"test"}}),
+        json!({"call_id":"wait","name":"wait","arguments":{"seconds":1,"intent":"test"}}),
+        json!({"call_id":"press","name":"press_key","arguments":{"key":"Enter","intent":"test"}}),
+        json!({"call_id":"down","name":"key_down","arguments":{"key":"Control","intent":"test"}}),
+        json!({"call_id":"up","name":"key_up","arguments":{"key":"Control","intent":"test"}}),
+        json!({"call_id":"hotkey","name":"hotkey","arguments":{"keys":["Control","A"],"intent":"test"}}),
+        json!({"call_id":"shot","name":"take_screenshot","arguments":{"intent":"test"}}),
+        json!({"call_id":"scroll","name":"scroll","arguments":{"x":999,"y":999,"direction":"down","magnitude_in_pixels":300,"intent":"test"}}),
+    ];
+    for call in &calls {
+        validate_computer_action(call, "browser").unwrap();
+        validate_computer_action(call, "desktop").unwrap();
+    }
+    for call in [
+        json!({"call_id":"back","name":"go_back","arguments":{"intent":"test"}}),
+        json!({"call_id":"navigate","name":"navigate","arguments":{"url":"http://localhost:3000/next","intent":"test"}}),
+        json!({"call_id":"forward","name":"go_forward","arguments":{"intent":"test"}}),
+    ] {
+        validate_computer_action(&call, "browser").unwrap();
+        assert!(validate_computer_action(&call, "desktop").is_err());
+    }
+    assert!(validate_computer_action(
+        &json!({"call_id":"bad","name":"click","arguments":{"x":1000,"y":0,"intent":"test"}}),
+        "browser"
+    )
+    .is_err());
+    assert!(validate_computer_action(&json!({"call_id":"bad-nav","name":"navigate","arguments":{"url":"https://example.com","intent":"test"}}), "browser").is_err());
+    assert!(validate_computer_action(
+        &json!({"call_id":"too-long","name":"type","arguments":{
+        "text":"x".repeat(4_001),"intent":"test"}}),
+        "desktop"
+    )
+    .is_err());
+}
+
+#[test]
+fn injects_native_computer_use_after_initial_screenshot() {
+    let request = computer_request_fixture();
+    let mut profile = interactions_test_profile("gemini-computer.json");
+    profile
+        .openai_capabilities
+        .gemini_builtin_tools
+        .push(json!({"type":"code_execution"}));
+    let translated = translate_gemini_interactions_request(
+        &request,
+        &profile,
+        &RwLock::new(InteractionContinuationCache::default()),
+    )
+    .unwrap();
+    let tools = translated["tools"].as_array().unwrap();
+    let computer = tools
+        .iter()
+        .find(|tool| tool["type"] == "computer_use")
+        .unwrap();
+    assert_eq!(computer["environment"], "browser");
+    assert_eq!(computer["enable_prompt_injection_detection"], true);
+    assert!(!tools.iter().any(|tool| tool["type"] == "code_execution"));
+    assert!(!tools.iter().any(|tool| tool
+        .get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| name.contains("computer_action_batch"))));
+}
+
+#[test]
+fn exposes_only_computer_cancel_for_an_explicit_lifecycle_exit_turn() {
+    let mut request = computer_request_fixture();
+    request["messages"]
+        .as_array_mut()
+        .unwrap()
+        .insert(
+            0,
+            json!({"role": "user", "content": [{"type": "text", "text": "Start the browser, then call gemini-computer computer_cancel."}]}),
+        );
+    let mut profile = interactions_test_profile("gemini-computer.json");
+    profile.openai_capabilities.gemini_builtin_tools.extend([
+        json!({"type":"google_search"}),
+        json!({"type":"code_execution"}),
+    ]);
+    profile.openai_capabilities.gemini_tool_choice_override = Some("validated".to_string());
+
+    let translated = translate_gemini_interactions_request(
+        &request,
+        &profile,
+        &RwLock::new(InteractionContinuationCache::default()),
+    )
+    .unwrap();
+    let tools = translated["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["type"], "function");
+    assert_eq!(tools[0]["name"], "mcp__bridge__computer_cancel");
+    assert_eq!(
+        translated["generation_config"]["tool_choice"],
+        json!({"allowed_tools": {"mode": "any", "tools": ["mcp__bridge__computer_cancel"]}})
+    );
+}
+
+#[test]
+fn completed_computer_cancel_ends_the_context_without_forcing_a_repeat() {
+    let mut request = computer_request_fixture();
+    let messages = request["messages"].as_array_mut().unwrap();
+    messages.insert(
+        0,
+        json!({"role": "user", "content": [{"type": "text", "text": "Start the browser, then call gemini-computer computer_cancel."}]}),
+    );
+    messages.push(json!({
+        "role": "assistant",
+        "content": [{
+            "type": "tool_use",
+            "id": "toolu_cancel",
+            "name": "mcp__bridge__computer_cancel",
+            "input": {}
+        }]
+    }));
+    messages.push(json!({
+        "role": "user",
+        "content": [{
+            "type": "tool_result",
+            "tool_use_id": "toolu_cancel",
+            "content": [{"type": "text", "text": "{\"kind\":\"computer_cancel_result\",\"status\":\"success\"}"}]
+        }]
+    }));
+    let mut profile = interactions_test_profile("gemini-computer.json");
+    profile
+        .openai_capabilities
+        .gemini_builtin_tools
+        .push(json!({"type":"google_search"}));
+
+    assert!(computer_conversation_context(&request).is_none());
+    assert!(requested_computer_cancel_tool_name(&request).is_none());
+    let translated = translate_gemini_interactions_request(
+        &request,
+        &profile,
+        &RwLock::new(InteractionContinuationCache::default()),
+    )
+    .unwrap();
+    let tools = translated["tools"].as_array().unwrap();
+    assert!(tools.iter().any(|tool| tool["type"] == "google_search"));
+    assert!(!tools.iter().any(|tool| tool["type"] == "computer_use"));
+    assert_ne!(
+        translated["generation_config"]["tool_choice"],
+        json!({"allowed_tools": {"mode": "any", "tools": ["mcp__bridge__computer_cancel"]}})
+    );
+}
+
+#[test]
+fn a_new_completed_start_reopens_context_after_an_earlier_cancel() {
+    let mut request = computer_request_fixture();
+    let messages = request["messages"].as_array_mut().unwrap();
+    messages.push(json!({
+        "role": "assistant",
+        "content": [{
+            "type": "tool_use",
+            "id": "toolu_cancel",
+            "name": "mcp__bridge__computer_cancel",
+            "input": {}
+        }]
+    }));
+    messages.push(json!({
+        "role": "user",
+        "content": [{
+            "type": "tool_result",
+            "tool_use_id": "toolu_cancel",
+            "content": [{"type": "text", "text": "{\"kind\":\"computer_cancel_result\",\"status\":\"success\"}"}]
+        }]
+    }));
+    messages.push(json!({
+        "role": "assistant",
+        "content": [{
+            "type": "tool_use",
+            "id": "toolu_restart",
+            "name": "mcp__bridge__computer_start",
+            "input": {"local_url": "http://127.0.0.1:3000"}
+        }]
+    }));
+    let restart_envelope = json!({
+        "kind": "computer_start_result",
+        "protocol_version": COMPUTER_PROTOCOL_VERSION,
+        "session_id": "cus_restart",
+        "sequence": 0,
+        "environment": "browser",
+        "viewport": {"width": 1440, "height": 900, "device_scale_factor": 1}
+    });
+    messages.push(json!({
+        "role": "user",
+        "content": [{
+            "type": "tool_result",
+            "tool_use_id": "toolu_restart",
+            "content": [{"type": "text", "text": restart_envelope.to_string()}]
+        }]
+    }));
+
+    let context = computer_conversation_context(&request).unwrap();
+    assert_eq!(context.session_id, "cus_restart");
+}
+
+#[test]
+fn wraps_parallel_native_actions_in_one_idempotent_batch() {
+    let request = computer_request_fixture();
+    let upstream = json!({
+        "id": "interaction_computer_1", "status": "requires_action",
+        "steps": [
+            {"type":"function_call","id":"call_click","name":"click","arguments":{"x":10,"y":20,"intent":"focus"}},
+            {"type":"function_call","id":"call_type","name":"type","arguments":{"text":"hello","intent":"enter text","safety_decision":{"decision":"require_confirmation","explanation":"typing"}}}
+        ], "usage": {}
+    });
+    let translated = translate_gemini_interactions_response_for_request(
+        &upstream,
+        "gemini-3.8-flash",
+        None,
+        Some(&request),
+    )
+    .unwrap();
+    assert_eq!(translated.message["content"].as_array().unwrap().len(), 1);
+    let batch = &translated.message["content"][0];
+    assert_eq!(batch["name"], "mcp__bridge__computer_action_batch");
+    assert_eq!(batch["input"]["calls"].as_array().unwrap().len(), 2);
+    assert_eq!(batch["input"]["calls"][0]["call_id"], "call_click");
+    assert_eq!(
+        batch["input"]["calls"][1]["safety_decision"]["decision"],
+        "require_confirmation"
+    );
+    assert_eq!(translated.calls.len(), 1);
+}
+
+#[test]
+fn expands_batch_result_to_original_function_results_with_screenshots() {
+    let envelope = json!({
+        "kind":"computer_action_batch_result", "protocol_version":COMPUTER_PROTOCOL_VERSION,
+        "session_id":"cus_test", "batch_id":"cub_test", "sequence":1,
+        "results":[
+            {"call_id":"call_click","name":"click","status":"success","screenshot":{"content_index":1,"sha256":"a"}},
+            {"call_id":"call_type","name":"type","status":"success","safety_acknowledgement":true,"screenshot":{"content_index":2,"sha256":"b"}}
+        ]
+    });
+    let content = json!([
+        {"type":"text","text":envelope.to_string()},
+        {"type":"image","source":{"type":"base64","media_type":"image/png","data":"shot1"}},
+        {"type":"image","source":{"type":"base64","media_type":"image/png","data":"shot2"}}
+    ]);
+    let expanded = expand_computer_batch_tool_result(&content).unwrap();
+    assert_eq!(expanded.len(), 2);
+    assert_eq!(expanded[0]["call_id"], "call_click");
+    assert_eq!(expanded[0]["result"][1]["data"], "shot1");
+    assert_eq!(expanded[1]["call_id"], "call_type");
+    assert_eq!(expanded[1]["result"][1]["data"], "shot2");
+    assert!(expanded[1]["result"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("safety_acknowledgement"));
+}
+
+#[test]
+fn stateless_history_reconstructs_native_computer_calls_and_results() {
+    let envelope = json!({
+        "kind":"computer_action_batch_result", "protocol_version":COMPUTER_PROTOCOL_VERSION,
+        "session_id":"cus_test", "batch_id":"cub_restart", "sequence":1,
+        "results":[
+            {"call_id":"call_restart_click","name":"click","status":"success","screenshot":{"content_index":1,"sha256":"a"}},
+            {"call_id":"call_restart_shot","name":"take_screenshot","status":"success","screenshot":{"content_index":2,"sha256":"b"}}
+        ]
+    });
+    let messages = vec![
+        json!({"role":"assistant","content":[{"type":"tool_use","id":"toolu_computer_restart","name":"mcp__bridge__computer_action_batch","input":{
+            "protocol_version":COMPUTER_PROTOCOL_VERSION,"session_id":"cus_test","batch_id":"cub_restart","sequence":1,"environment":"browser","viewport":{"width":1440,"height":900,"device_scale_factor":1},
+            "calls":[
+                {"call_id":"call_restart_click","name":"click","arguments":{"x":10,"y":20,"intent":"click"}},
+                {"call_id":"call_restart_shot","name":"take_screenshot","arguments":{"intent":"observe"}}
+            ]
+        }}]}),
+        json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_computer_restart","content":[
+            {"type":"text","text":envelope.to_string()},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":"shot1"}},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":"shot2"}}
+        ]}]}),
+    ];
+    let steps = interaction_steps_from_messages(&messages, true, None);
+    assert_eq!(steps.len(), 4);
+    assert_eq!(steps[0]["type"], "function_call");
+    assert_eq!(steps[0]["id"], "call_restart_click");
+    assert_eq!(steps[1]["id"], "call_restart_shot");
+    assert_eq!(steps[2]["type"], "function_result");
+    assert_eq!(steps[2]["call_id"], "call_restart_click");
+    assert_eq!(steps[3]["call_id"], "call_restart_shot");
+    assert_eq!(steps[3]["result"][1]["data"], "shot2");
+}
+
+#[test]
+#[cfg(any())]
+fn computer_safety_requires_real_confirmation_and_blocks_blocked_calls() {
+    let type_call =
+        json!({"call_id":"type","name":"type","arguments":{"text":"hello","intent":"test"}});
+    assert!(
+        computer_batch_requires_confirmation(&[type_call], Some("http://localhost:3000/"))
+            .unwrap()
+            .is_some()
+    );
+    let click = json!({"call_id":"click","name":"click","arguments":{"x":1,"y":2,"intent":"test"}});
+    assert!(
+        computer_batch_requires_confirmation(&[click], Some("http://localhost:3000/"))
+            .unwrap()
+            .is_none()
+    );
+    let blocked = json!({"call_id":"blocked","name":"click","arguments":{"x":1,"y":2,"intent":"test"},"safety_decision":{"decision":"blocked"}});
+    assert!(
+        computer_batch_requires_confirmation(&[blocked], Some("http://localhost:3000/")).is_err()
+    );
+}
+
+#[test]
+fn streaming_wraps_native_computer_calls_as_one_batch() {
+    let request = computer_request_fixture();
+    let continuations = Arc::new(RwLock::new(InteractionContinuationCache::default()));
+    let mut translator = GeminiInteractionsStreamTranslator::new(
+        "gemini-3.8-flash".into(),
+        "computer.json".into(),
+        request,
+        continuations,
+        1,
+        false,
+    );
+    translator.process_payload(r#"{"type":"interaction.created","interaction":{"id":"interaction_stream_computer","status":"in_progress"}}"#).unwrap();
+    for payload in [
+        r#"{"type":"step.start","index":0,"step":{"type":"function_call","id":"call_1","name":"click","arguments":{"x":10,"y":20,"intent":"click"}}}"#,
+        r#"{"type":"step.stop","index":0,"step":{"type":"function_call","id":"call_1","name":"click","arguments":{"x":10,"y":20,"intent":"click"}}}"#,
+        r#"{"type":"step.start","index":1,"step":{"type":"function_call","id":"call_2","name":"take_screenshot","arguments":{"intent":"observe"}}}"#,
+        r#"{"type":"step.stop","index":1,"step":{"type":"function_call","id":"call_2","name":"take_screenshot","arguments":{"intent":"observe"}}}"#,
+        r#"{"type":"interaction.completed","interaction":{"id":"interaction_stream_computer","status":"requires_action","usage":{}}}"#,
+    ] {
+        translator.process_payload(payload).unwrap();
+    }
+    let events = format!("{:?}", translator.finish().unwrap());
+    assert_eq!(translator.assistant_content.len(), 1);
+    assert_eq!(
+        translator.assistant_content[0]["name"],
+        "mcp__bridge__computer_action_batch"
+    );
+    assert_eq!(
+        translator.assistant_content[0]["input"]["calls"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(events.contains("computer_action_batch"));
+    assert!(!events.contains("\"name\":\"click\""));
 }

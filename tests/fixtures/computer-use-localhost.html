@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Computer Use Localhost Fixture</title>
+  <style>
+    body { margin: 0; min-height: 1800px; font: 20px Segoe UI, sans-serif; background: #f4f7fb; }
+    header { padding: 32px; background: #183153; color: white; }
+    #click-target { position: absolute; left: 640px; top: 300px; width: 160px; height: 60px; font-size: 18px; }
+    #result { position: absolute; left: 620px; top: 380px; width: 220px; text-align: center; }
+    #typing { position: absolute; left: 560px; top: 480px; width: 320px; padding: 10px; }
+    #below-fold { position: absolute; top: 1500px; left: 40px; }
+  </style>
+</head>
+<body>
+  <header>Isolated Computer Use localhost test</header>
+  <button id="click-target" onclick="const result=document.getElementById('result'); const count=Number(result.dataset.count || 0) + 1; result.dataset.count=String(count); result.textContent='clicked ' + count">Click target</button>
+  <div id="result">not clicked</div>
+  <input id="typing" aria-label="Typing target" placeholder="Typing requires confirmation">
+  <div id="below-fold">scroll target</div>
+</body>
+</html>

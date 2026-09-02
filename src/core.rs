@@ -389,6 +389,8 @@ struct AppState {
     model: String,
     thought_signatures: Arc<ThoughtSignatureCache>,
     interaction_continuations: Arc<InteractionContinuationState>,
+    #[allow(dead_code)]
+    computer: Arc<ComputerBroker>,
     vision_cache: Arc<VisionObservationCache>,
     routing: Arc<RwLock<ProviderRoutingState>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,

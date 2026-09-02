@@ -8,6 +8,8 @@
 
 Use Claude Code as one stable coding-agent entry point while choosing Gemini, DeepSeek, Qwen, Kimi, OpenRouter Claude, or another compatible model behind it. The bridge preserves the reasoning, streaming, tools, state, usage, and error semantics that a real Claude Code task depends on instead of reducing every provider to “HTTP 200 plus text.”
 
+> **v0.8.0 major upgrade:** the runtime now adapts the native Computer Use capability newly provided by **Gemini 3.8 Flash** to Claude Code. Gemini decides the actions; Claude Code owns a local stdio MCP lifecycle; and the signed-in-user Windows Host performs screenshots and input. No Model Center window, second model, or manually started Host is required.
+
 This project is not a thin request-schema converter. It is built around three responsibilities:
 
 - **Semantic adaptation:** translate the Claude Code lifecycle into the richest safe protocol exposed by each provider.
@@ -29,7 +31,7 @@ The labels below deliberately separate live evidence from source-level support.
 | Capability | Status | Current behavior |
 | --- | --- | --- |
 | Text, system instructions, and SSE | **Verified** | Normal and streamed Claude Code turns preserve message lifecycle and terminal errors |
-| Thinking and reasoning controls | **Verified** | Provider-aware effort/budget mapping; Gemini 3.7 exposes Low/Medium/High with signed thought continuity |
+| Thinking and reasoning controls | **Verified** | Provider-aware effort/budget mapping; Gemini Flash 3.7 and newer expose Low/Medium/High with signed thought continuity |
 | Claude Code local tools | **Verified** | Function declarations, streamed arguments, tool results, failures, and continued reasoning survive round trips |
 | Parallel client tools | **Verified** | Gemini calls are held until terminal `requires_action`; live Claude Code validation showed overlapping independent read-only `Grep` calls |
 | Structured output | **Verified** | JSON Schema is translated, sanitized only when required, and rejected explicitly when the contract cannot be represented |
@@ -37,9 +39,11 @@ The labels below deliberately separate live evidence from source-level support.
 | Token count, usage, and caching | **Verified** | Native count endpoints when available; input/output/reasoning/cache/server-tool usage is mapped without inventing hits |
 | Gemini server tools | **Verified / Opt-in** | Google Search, URL Context, and Code Execution are live-tested; Maps and configured File Search queries are opt-in |
 | Image generation | **Verified** | `generate_image` MCP delegates to `gemini-3.1-flash-image` by default and returns a preview plus a saved path |
-| Remote MCP, Kimi Formula, Flex/Priority | **Opt-in** | Implemented with validation and redaction; disabled unless explicitly configured |
+| Remote MCP, Kimi Formula, Flex/Priority | **Opt-in** | Profile and request-level Claude MCP connectors map to Gemini Remote MCP with validation, redaction, allowlists, and response-block translation |
+| Claude Bash/Text Editor/Memory declarations | **Verified** | Schema-less client declarations expand to schema-defined Gemini functions and remain executed by Claude Code; tool-search declarations use eager function exposure |
+| Gemini 3.8 Flash Computer Use on Windows | **Verified** | Native Gemini Computer Use actions are translated to a Claude Code-managed `gemini-computer` stdio MCP Host; Browser and Desktop execution are live-tested |
 | Gemini audio/video input from Claude Code | **Out of scope** | Gemini supports the modalities, but the current Anthropic Messages entry has no audio/video block mapping |
-| Computer Use, Files/Batch/store management, Live/background APIs | **Out of scope** | Require client executors or platform-management surfaces that this local coding bridge does not expose |
+| Files/Batch/store management and Live/background APIs | **Out of scope** | These platform-management surfaces remain outside the local coding bridge |
 
 “Callable” is not the same as “deeply adapted.” A generic compatible provider receives only the semantics its real API and explicit profile can support.
 
@@ -60,11 +64,12 @@ The labels below deliberately separate live evidence from source-level support.
        Anthropic Messages                    ├─ Claude Code local tools
        Gemini Interactions                   ├─ Google server tools
        OpenAI Responses                      ├─ Gemini Remote MCP
-       OpenAI Chat fallback                  └─ bridge MCP extensions
+       OpenAI Chat fallback                  ├─ bridge MCP extensions
+                                             └─ Gemini Computer Host
                      │                               │
                      ▼                               ▼
        Gemini · DeepSeek · Qwen · Kimi      specialized executors
-          OpenRouter Claude · others        Gemini Image · Kimi Formula
+          OpenRouter Claude · others     Gemini Image · Kimi Formula · Windows Host
 ```
 
 The bridge chooses the least-lossy configured transport, not a universal lowest common denominator:
@@ -82,7 +87,7 @@ The bridge chooses the least-lossy configured transport, not a universal lowest 
 
 Download from [GitHub Releases](https://github.com/duojiwu58-boop/claude-code-multi-model-agent-runtime/releases/latest):
 
-- `ClaudeCodeBridge-<version>-Setup.exe`: recommended; installs the service, Model Center, Start Menu entries, `gemini-image` MCP registration, and uninstaller.
+- `ClaudeCodeBridge-<version>-Setup.exe`: recommended; installs the service, Model Center, Start Menu entries, `gemini-image` HTTP MCP and `gemini-computer` stdio MCP registrations, and uninstaller.
 - `ClaudeCodeBridge-<version>-windows-x64.zip`: extract the complete archive, then run `Install.cmd`.
 
 The installer creates the automatic Windows service `ClaudeCodeBridge` and configures Claude Code to use:
@@ -121,7 +126,7 @@ For deeply adapted models, start from a verified template:
 - [Generic OpenAI-compatible provider](examples/providers/custom-openai.example.json)
 - [Capability overrides](examples/providers/capability-overrides.example.json)
 
-Open **Claude Code Model Center**, select **Reload profiles**, and choose a model. The next request uses it without restarting VS Code, Claude Code, or the service. Active Gemini 3.7 Interactions profiles also expose hot **Low / Medium / High** Thinking controls.
+Open **Claude Code Model Center**, select **Reload profiles**, and choose a model. The next request uses it without restarting VS Code, Claude Code, or the service. Active Gemini 3.7-or-newer Flash Interactions profiles also expose hot **Low / Medium / High** Thinking controls.
 
 ### 3. Verify
 
@@ -135,7 +140,7 @@ The response reports the active profile, actual model, transport, and upstream U
 
 | Model | Recommended path | Adapted surface |
 | --- | --- | --- |
-| **Gemini 3.7 Flash** | `gemini-interactions` | Current step-based SSE, Low/Medium/High Thinking, terminal-batched parallel client calls, exact stored continuation, 1M context, images/PDF, structured output, native token count, detailed usage/cache/tier, Google tools, optional native Remote MCP |
+| **Gemini 3.8 Flash** | `gemini-interactions` | Current step-based SSE, Low/Medium/High Thinking, terminal-batched parallel client calls, exact stored continuation, 1M context, images/PDF, structured output, native token count, detailed usage/cache/tier, Google tools, optional native Remote MCP |
 | **DeepSeek V4 Flash / Pro** | `anthropic` when available | Minimal Claude contract translation, provider-aware disabled/high/max reasoning, tool-turn reasoning replay, output-headroom protection; Responses/Chat fallbacks remain available |
 | **Qwen3.8 Max** | `anthropic` or validated `openai-responses` | Meaningful effort tiers, bounded normal reasoning, exact Responses continuation, DashScope session cache, structured output, usage and latency diagnostics |
 | **Kimi K3** | `anthropic` | Bearer auth, verified model ID, 1M context metadata, native token estimate and cache usage; Chat reasoning replay and opt-in Kimi Formula tools |
@@ -144,11 +149,11 @@ The response reports the active profile, actual model, transport, and upstream U
 
 Model IDs, regional endpoints, quotas, pricing, and provider behavior can change. Use the [Provider configuration guide](PROVIDER_CONFIG.md) and [changelog](CHANGELOG.md) before changing a verified template.
 
-## Gemini 3.7 Flash as a local coding baseline
+## Gemini 3.8 Flash as a local coding baseline
 
 The native `gemini-interactions` path on the `standard` tier is sufficient for ordinary repository work: read, search, edit, build, test, debug, and review. The verified path includes text/SSE, system instructions, signed Thinking, local tools and exact tool-result continuation, structured JSON, images/PDF, native token counting, stateful conversations, implicit cache reporting, and server-tool usage.
 
-Gemini 3.7 Flash supports a 1,048,576-token input window and up to 65,536 output tokens. Set both the profile's `max_output_tokens` and Claude Code's `CLAUDE_CODE_MAX_OUTPUT_TOKENS` to `65536` to expose the full output ceiling. Implicit cache hits are controlled by Google and are not guaranteed; the bridge reports a hit only when the upstream reports one.
+Gemini 3.8 Flash supports a 1,048,576-token input window and up to 65,536 output tokens. Its only valid Thinking levels are `low`, `medium`, and `high`, with `medium` as Google's default. Set both the profile's `max_output_tokens` and Claude Code's `CLAUDE_CODE_MAX_OUTPUT_TOKENS` to `65536` to expose the full output ceiling. Implicit cache hits are controlled by Google and are not guaranteed; the bridge reports a hit only when the upstream reports one.
 
 ### Parallel tool calls
 
@@ -158,10 +163,10 @@ The batch makes concurrency possible; Claude Code still decides what is safe to 
 
 ### Image generation is explicit multi-model execution
 
-Gemini 3.7 Flash does not natively emit images on this route. The installed path is:
+Gemini 3.8 Flash does not natively emit images on this route. The installed path is:
 
 ```text
-Gemini 3.7 Flash (reason and choose tool)
+Gemini 3.8 Flash (reason and choose tool)
         │
         ▼
 Claude Code calls generate_image over authenticated loopback MCP
@@ -179,7 +184,11 @@ The tool supports the documented aspect ratios and 1K/2K/4K output, uses high Th
 
 Normal local coding does **not** require Google Maps, File Search stores, Remote MCP, Flex, or Priority. Enable them only when the task needs hosted RAG, external systems, geospatial context, or a different service tier. Google Search, URL Context, Code Execution, Maps, configured File Search queries, and Remote MCP can add data flows, resource requirements, or charges.
 
-The current local-development scope intentionally excludes the legacy `generateContent` transport, explicit `cachedContents`, File Search store provisioning/local-directory sync, standalone Files/Batch management, Live API sessions, background Interaction management, and a Computer Use executor. Audio/video inputs are supported by the Gemini model but not mapped by the current Claude Code Messages entry.
+Current Claude server-tool declarations are adapted request by request: `web_search_*` becomes Gemini `google_search`, `web_fetch_*` becomes `url_context`, and `code_execution_*` becomes `code_execution`, with native-type deduplication against profile tools. Anthropic-only domain, cache, and usage-limit controls have no Gemini Interactions equivalent and are reported as explicit diagnostics. With profile tier `auto`, Claude fast mode maps to Gemini Priority; actual tier/speed is returned in usage, and Flex receives a 20-minute request/stream-idle window.
+
+Claude request-level `mcp_servers` and their matching `mcp_toolset` declarations are translated to Gemini Remote MCP. Bearer tokens become redacted Authorization headers, hyphenated server names are normalized to Gemini-safe underscores, allowlists are retained, and denylist configurations fail explicitly because Gemini cannot enforce them. Returned MCP calls/results are reconstructed as Claude `mcp_tool_use`/`mcp_tool_result` blocks in unary and streaming responses. Gemini supports Streamable HTTP only on this path, not Anthropic's SSE MCP transport.
+
+The current local-development scope intentionally excludes the legacy `generateContent` transport, explicit `cachedContents`, File Search store provisioning/local-directory sync, standalone Files/Batch management, Live API sessions, and background Interaction management. On Windows x64, Claude Code automatically owns a signed-in-user `gemini-computer` stdio MCP Host; the bridge service only aligns model and tool protocols. Browser mode provides an isolated 1440×900 localhost-only browser and all 20 Gemini browser actions. Desktop mode adds on-demand real-user window selection, Windows Graphics Capture, 17 desktop actions through SendInput, PerMonitorV2/multi-display coordinates, HWND/PID scoping, sensitive/elevated-window blocking, per-action PNGs, idempotent batches, and one-shot Host safety confirmations. Model Center is not part of the execution path. See [Gemini Computer Use](COMPUTER_USE.md). Audio/video inputs are supported by the Gemini model but not mapped by the current Claude Code Messages entry.
 
 ## Cross-model extensions
 
@@ -200,9 +209,11 @@ The original media goes to the vision provider and the extracted observation goe
 ### MCP and server tools
 
 - `gemini-image`: installer-managed local MCP image generation with preview and safe file persistence.
+- `gemini-computer`: installer-managed local stdio MCP Computer Use executor, automatically started and stopped by Claude Code.
 - Kimi Formula: only explicitly allowlisted official Formula URIs are exposed; default is empty.
 - Gemini server tools: `google_search`, `url_context`, `code_execution`, `google_maps`, and configured File Search queries.
 - Gemini native Remote MCP: validated HTTPS Streamable HTTP servers with redacted authorization values and optional tool allowlists.
+- Claude request-level MCP connectors: converted to native Gemini Remote MCP; unary and streaming MCP result blocks are converted back to the Claude contract.
 
 ### Per-model reasoning policy
 
@@ -250,7 +261,7 @@ Returning text is not sufficient. A model enters the priority support tier only 
 7. Authentication, rate limits, overload, context limits, refusal, cancellation, and abnormal stream termination.
 8. Official-contract request/response/stream fixtures, regressions, and real-client acceptance where the client boundary matters.
 
-The current locked Rust suite contains 204 passing tests. Critical paths are also validated through the actual Windows service and VS Code Claude Code client; mock success alone is not treated as end-to-end compatibility.
+The current locked Rust suite contains 225 bridge tests plus 3 Computer Host tests, all passing. Critical paths are also validated through the actual Windows service and VS Code Claude Code client; mock success alone is not treated as end-to-end compatibility.
 
 ## Build from source
 

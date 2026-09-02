@@ -270,12 +270,12 @@ Kimi Formula 官方工具通过本地 MCP 显式启用；空数组表示完全�
 
 ## Gemini 原生 Interactions（推荐）
 
-Gemini 3.7 Flash 建议使用已 GA 的 Google 原生 Interactions API，而不是 OpenAI 兼容层：
+Gemini 3.8 Flash 建议使用已 GA 的 Google 原生 Interactions API，而不是 OpenAI 兼容层：
 
 ```json
 {
-  "name": "Google Gemini 3.7 Flash",
-  "model": "gemini-3.7-flash",
+  "name": "Google Gemini 3.8 Flash",
+  "model": "gemini-3.8-flash",
   "context_window": 1048576,
   "base_url": "https://generativelanguage.googleapis.com/v1beta",
   "api_key": "<GEMINI_API_KEY>",
@@ -287,7 +287,7 @@ Gemini 3.7 Flash 建议使用已 GA 的 Google 原生 Interactions API，而不�
     "sampling_parameters": false,
     "max_output_tokens": 65536,
     "gemini_store": true,
-    "gemini_service_tier": "standard",
+    "gemini_service_tier": "auto",
     "gemini_tool_choice_override": "validated",
     "gemini_builtin_tools": [],
     "gemini_file_search_store_names": [],
@@ -297,7 +297,7 @@ Gemini 3.7 Flash 建议使用已 GA 的 Google 原生 Interactions API，而不�
 ```
 
 对于本地项目开发，建议保持原生 `gemini-interactions`、`gemini_store: true` 和
-`gemini_service_tier: "standard"`。文本/流式输出、Thinking、Claude Code 的本地
+`gemini_service_tier: "auto"`（没有快速模式请求时仍走 Google 默认 standard）。文本/流式输出、Thinking、Claude Code 的本地
 Read/Grep/Edit/构建测试工具及工具结果续接、图片/PDF、结构化输出、原生 Token Count 和
 Usage 观测都不依赖 File Search、Remote MCP、Maps、Flex 或 Priority。Google Search、URL Context
 和 Code Execution 可按任务需要启用；其余能力主要面向云端知识库、外部业务系统、地理信息或
@@ -306,7 +306,10 @@ Usage 观测都不依赖 File Search、Remote MCP、Maps、Flex 或 Priority。G
 项目范围以 Gemini Interactions 和 Claude Code 本地开发为核心。传统 `generateContent` transport
 及其显式 `cachedContents` 生命周期暂不支持；Interactions 自身的有状态续接和隐式缓存已经覆盖
 当前工作流。桥接器也不负责创建 File Search store、把本地目录同步到云端、调用独立 Files/Batch
-管理 API、管理 Live API/后台 Interaction，或执行 Computer Use 动作。已经实现的 Maps、指定 store
+管理 API、管理 Live API/后台 Interaction，或执行 Computer Use 动作。Gemini Files 上传只有 48 小时生命周期且
+不能下载，无法无损模拟 Claude Files；Gemini Batch 当前只接受 `generateContent`，无法直接批处理本项目使用的
+Interactions 请求。若以后增加这两个 facade，需要独立的 ID/元数据映射和 Interactions→`generateContent` job
+转换，而不是简单转发。交互式 Claude Code 本地编码循环本身也不调用它们。已经实现的 Maps、指定 store
 的 File Search 查询、Remote MCP、Flex 和 Priority 只作为默认关闭的 Interactions 可选配置保留，
 不属于本地开发核心链路的默认启用项或验收前置条件。
 
@@ -318,16 +321,17 @@ Interactions 的隐式缓存由 Google 自动管理，不提供可强制插入�
 丢失缓存字段。有状态续接会使用 `previous_interaction_id`，但仍按 Google 契约重新发送工具、system
 instruction 和生成配置。需要确定性折扣的显式 `cachedContents` 不属于此 transport。
 
-Gemini 3.7 Flash 的输入窗口为 1,048,576 tokens、最大输出为 65,536 tokens，默认 Thinking
+Gemini 3.8 Flash 的输入窗口为 1,048,576 tokens、最大输出为 65,536 tokens，默认 Thinking
 档位为 `medium`。模型只接受 `low`、`medium`、`high`；桥接器会把 Claude 的
 `none`/`minimal` 映射到 `low`，把 `xhigh`/`max` 映射到 `high`，并继续丢弃 3.x
-不支持的 `temperature`、`top_p`、`top_k` 和 `candidate_count`。Interactions 流同时兼容
-官方资源 schema 的 `event_type`/`thought_summary`/`arguments_delta`，以及 3.7 迁移示例中的
+不支持的 `temperature`、`top_p`、`top_k`、`candidate_count`、`frequency_penalty` 和
+`presence_penalty`。Interactions 流同时兼容官方资源 schema 的
+`event_type`/`thought_summary`/`arguments_delta`，以及当前迁移示例中的
 `type`/`thought`/`arguments`；对象型 thought summary 会提取其中的文本，不会泄漏 JSON 包装串。
 若完整工具参数只出现在 `step.stop`，桥接器会在 `content_block_stop` 前补发一个完整
 `input_json_delta`，使 Claude Code 能重建真实输入。cached、thought 和新旧 token usage 字段都会映射。
 
-模型中心为活动的 Gemini 3.7 Flash Interactions profile 提供“低 / 中 / 高”即时选择。该值写入
+模型中心为活动的 Gemini 3.7 及更高版本 Flash Interactions profile 提供“低 / 中 / 高”即时选择。该值写入
 `bridge-state.json`，切换后从下一次请求生效，无需重启；它的优先级高于 Claude 请求携带的
 `output_config.effort`、`thinking.budget_tokens` 以及 profile 的 `default_reasoning_effort`。
 若 profile 顶层设置了 `reasoning_effort`，该模型级强制值再覆盖 GUI 档位；未设置时保持现有 GUI
@@ -356,6 +360,13 @@ Gemini 3.7 Flash 的输入窗口为 1,048,576 tokens、最大输出为 65,536 to
 Google Search、URL Context、自定义函数及其他兼容工具继续保留，非 PDF 请求不受影响。
 若不希望服务端自行搜索或执行代码，将此数组设为空即可。
 
+Claude 最新 Messages API 的版本化服务端工具会按请求自动适配：`web_search_*` 映射为
+`google_search`，`web_fetch_*` 映射为 `url_context`，`code_execution_*` 映射为
+`code_execution`。它们会与 profile 的 `gemini_builtin_tools` 按原生类型去重；若 profile
+对象包含 `search_types` 等更丰富的 Google 选项，则保留该对象。Anthropic 特有的
+`allowed_domains`、`blocked_domains`、`max_uses`、`max_content_tokens`、`use_cache` 等控制
+在 Gemini Interactions 没有等价字段，桥接器不会伪造支持，而会通过诊断响应头明确报告未转发。
+
 `gemini_remote_mcp_servers` 可向 Interactions 请求加入 Google 原生 Remote MCP 工具。例如：
 
 ```json
@@ -371,6 +382,19 @@ Google Search、URL Context、自定义函数及其他兼容工具继续保留�
 `headers` 的名称和值必须是合法 HTTP header，`allowed_tools` 必须是由非空字符串组成的数组。管理/状态输出会把
 所有 header 值替换为 `<redacted>`，但 profile 文件本身仍含凭据，应按密钥文件保护。Google 原生 Remote MCP
 由 Google 连接远端 server，不会注册成本地 Claude Code MCP；SSE transport 不受支持。
+
+Claude Messages 请求本身携带的 `mcp_servers` 和匹配的 `mcp_toolset` 也会逐请求转换，无需写入 profile。
+Anthropic `authorization_token` 会转换为 `Authorization: Bearer ...`，管理诊断不回显 token；带连字符的
+server name 会规范化为 Gemini 接受的下划线，并检查规范化后的名称冲突。`default_config.enabled: false`
+配合逐工具 `configs.<name>.enabled: true` 会转换为 `allowed_tools`。由于 Gemini 没有 denylist 等价语义，
+任何显式禁用单个工具的配置都会 fail closed 返回 400，避免让上游获得超出 Claude 请求授权的工具。
+普通与 SSE 响应中的 `mcp_server_tool_call`/`mcp_server_tool_result` 会分别还原为 Claude
+`mcp_tool_use`/`mcp_tool_result` 内容块。
+
+Claude 的 schema-less 客户端 `bash_20250124`、`text_editor_*` 和 `memory_20250818` 声明会展开为
+带 JSON Schema 的普通 Gemini function，返回后仍由 Claude Code 客户端执行，不会让 Google 服务端直接访问
+本机 shell、文件或 memory。`tool_search_tool_*` 在 Gemini 没有按需发现协议，因此桥接器保留请求中的函数并
+立即暴露给 Gemini，同时给出 eager-exposure 诊断；Computer/Browser toolset 仍因动作协议与安全确认不同而不展开。
 
 Google 当前对“服务端内置工具 + 自定义函数”的部分模型组合仍可能返回要求
 `include_server_side_tool_invocations` 的 400，但 Interactions 请求结构尚无对应可移植字段。
@@ -388,16 +412,23 @@ Google 当前对“服务端内置工具 + 自定义函数”的部分模型组�
 一旦定位文件或符号就立即按完整逻辑单元读取；需要连续大范围上下文时，优先一次读取约 800–1,200 行而不是机械分页；每次结果后维护
 “已证实 / 仍缺失”的证据清单，避免重复区间和重叠搜索，并在所有重要结论有源码依据前继续调查。
 该规则不限制调用次数，也不会仅因读取较多而强制最终答案；无法覆盖的区域必须明确说明而不能猜测。
-`gemini_service_tier` 可固定为 Gemini 3.7 Flash 支持的 `standard`、`priority` 或 `flex`，优先级高于 Claude
-请求的 service tier。`max_output_tokens` 会作为 Interactions 的 profile 上限，对 Claude 请求值
-取较小者；Gemini 3.7 Flash 要开放完整输出能力时设为 `65536`，并在启动 Claude Code 前同步
+`gemini_service_tier` 可设为 `auto`，或固定为 Gemini 3.8 Flash 支持的 `standard`、`priority`、`flex`。
+固定档位优先于 Claude 请求；`auto` 时，Claude `speed: "fast"` 会映射为 Gemini
+`service_tier: "priority"`，`service_tier: "standard_only"` 仍映射为 `standard`，其余请求省略字段并使用
+Google 默认 standard。实际 `priority`/`standard` 还会分别写入 Claude `usage.service_tier` 和
+`usage.speed`；Gemini 特有的 `flex` 保存在 `provider_metadata.google.service_tier`，并将非流式总等待和
+流式空闲等待扩展到 20 分钟，以容纳官方说明的排队延迟。`max_output_tokens` 会作为 Interactions 的 profile 上限，对 Claude 请求值
+取较小者；Gemini 3.8 Flash 要开放完整输出能力时设为 `65536`，并在启动 Claude Code 前同步
 设置 `CLAUDE_CODE_MAX_OUTPUT_TOKENS=65536`。响应体或 `x-gemini-service-tier` 响应头给出的
 实际档位会写入 `provider_metadata.google.service_tier`，因此可以观察 Google 是否发生降级。
 默认不设置 `max_tool_result_chars`，工具结果不会被桥接器裁剪；只有为受限路由显式配置该字段时才会裁剪。
 
-Gemini Computer Use 不是纯服务端工具：Google API 返回动作后，调用方必须在受控浏览器中执行、
-回传截图并处理安全确认。本桥接器没有这个客户端执行器，因此不会把 Computer Use 伪装成已支持；
-Google Search、URL Context、Code Execution、Maps 和 File Search 仍按上面的原生接口使用。
+Gemini Computer Use 路径针对 Gemini 3.8 Flash 新提供的原生能力实现，并由专用 Browser/Desktop Host 执行：Gemini 3.8 Flash 负责动作决策，安装器将 Host 注册为 Claude Code 自动托管的本地 stdio MCP。Claude Code 调用 `computer_start`，首张截图成功后，
+桥接器才在 Gemini Interactions 请求中加入原生 `computer_use`；Gemini 的多个动作会合并成一个有序、幂等的
+`computer_action_batch`，由登录用户会话中的 `claude-computer-host.exe` 执行并逐动作回传 PNG。服务进程本身不接触
+Session 0 桌面，也不参与 Host 生命周期。Claude 的 `computer_toolset_20260801`/`browser_toolset_20260801` 不会被伪造；入口始终是
+schema 明确的 MCP 工具。Browser 只允许 loopback 网页；Desktop 在 `computer_start` 时由 Host 按需弹窗，让真实用户明确选择 HWND，并使用 Windows Graphics Capture 与 SendInput，阻止提权/敏感窗口。完整协议和安全确认见
+[COMPUTER_USE.md](COMPUTER_USE.md)。
 
 Claude Code 请求在此 transport 上按下表映射：
 
@@ -411,6 +442,12 @@ Claude Code 请求在此 transport 上按下表映射：
 | 含 PDF 且 profile 启用 `code_execution`    | 仅对本次请求省略原生 Code Execution 并报告兼容性降级；其他兼容工具保留                                            |
 | `service_tier: standard_only`              | `service_tier: standard`                                                                                           |
 | `service_tier: auto`                       | 不发送该字段，使用 Google 默认 `standard`，不会自动升级为付费 `priority`                                           |
+| `speed: fast`（profile tier 为 `auto`/未设） | `service_tier: priority`；实际结果写回 `usage.speed` 与 `usage.service_tier`                                      |
+| `web_search_*` / `web_fetch_*` / `code_execution_*` | 分别映射为 `google_search` / `url_context` / `code_execution`，并与 profile 配置去重                    |
+| `mcp_servers` + `mcp_toolset`              | 原生 Remote MCP；转换 Bearer 鉴权、名称与 allowlist，denylist 因无法强制执行而拒绝                        |
+| `bash_*` / `text_editor_*` / `memory_*`    | 展开为带 schema 的 client function，工具动作仍由 Claude Code 在本机执行                                  |
+| `tool_search_tool_*`                       | Gemini 无按需 tool search；改为立即暴露请求中的函数并报告诊断                                            |
+| `search_result` 输入块                     | 保留 title、source 与正文，转换成有来源标记的 Gemini 文本上下文；不伪造 Anthropic 加密引用索引           |
 
 无法安全映射的 Anthropic 字段会写入服务日志，并以可重复的
 `x-claude-bridge-warning` 响应头返回；因此可在调用端明确看到降级，而不是被静默忽略。
@@ -428,8 +465,8 @@ Google 文本 annotations 则原样保存在
 
 当前可从 Claude Code 输入到达的原生模态为文本、图片和 PDF 文档；Claude Code `Read` 返回的 PDF
 不会放入只允许文本/图片的 `function_result.result`，而是作为后一条 `user_input` 发送。Google API 虽定义音频、
-视频和 Computer Use，但 Claude Code 当前输入没有音频/视频内容块，Computer Use 又需要动作执行与安全确认，
-因此这些能力仍未提供。Remote MCP 则可通过上面的显式、受校验配置使用。
+视频和 Computer Use；Claude Code 当前输入没有音频/视频内容块。Computer Use 已通过独立用户态 Host 和本地 MCP
+执行器同时提供 Browser 与 Windows Desktop 模式。Remote MCP 则可通过上面的显式、受校验配置使用。
 
 ## 完整字段
 
@@ -583,7 +620,7 @@ profile 时检查引用是否存在。
 | `reasoning_fields`               | `["reasoning_content", "thinking"]`                              | 响应中按顺序识别的推理文本字段；可以填写一个字符串或字符串数组，空数组表示不提取推理文本                                                     |
 | `thinking_tags`                  | `true`                                                           | 将正文开头的 `<think>...</think>` 提取为 Thinking 块，并支持标签跨流式 Chunk；若模型需要原样输出该标签则设为 `false`                         |
 | `include_thoughts`               | `false`                                                          | 为 Google OpenAI 兼容端点请求思考摘要；启用时桥接器会把推理等级写入同一个 `thinking_config`，避免与 `reasoning_effort` 同时发送导致 HTTP 400 |
-| `sampling_parameters`            | `true`                                                           | 转发 Claude 的 `temperature` 和 `top_p`；Gemini 3.7 Flash 不支持这些参数，应设为 `false`                                                     |
+| `sampling_parameters`            | `true`                                                           | 转发 Claude 的 `temperature` 和 `top_p`；Gemini 3.8 Flash 不支持这些参数，应设为 `false`                                                     |
 | `tool_result_media`              | `separate_user`                                                  | 保持 `role: tool` 的 `content` 为字符串，并将图片/PDF 移至后一条 `user` 消息；仅对明确支持工具消息内联媒体的端点使用 `inline`                |
 | `tool_schema`                    | `sanitize`                                                       | `sanitize` 清理常见不兼容元数据；确认端点支持完整 JSON Schema 时使用 `preserve`                                                              |
 | `max_tokens_field`               | `max_tokens`                                                     | 可选值为 `max_tokens`、`max_completion_tokens` 或 `omit`                                                                                     |
@@ -600,7 +637,7 @@ profile 时检查引用是否存在。
 | `gemini_file_search_store_names` | `[]`                                                             | 仅 `gemini-interactions` 使用；非空时启用 Google 原生 File Search，并传入指定 `fileSearchStores/...` 资源名                                  |
 | `gemini_remote_mcp_servers`      | `[]`                                                             | 仅 `gemini-interactions` 使用；显式配置 HTTPS Streamable HTTP MCP server、可选 headers 与 `allowed_tools`；管理输出会脱敏 header 值          |
 | `gemini_store`                   | `true`                                                           | 仅 `gemini-interactions` 使用；关闭时不在 Google 端存储交互，也不使用 `previous_interaction_id`                                             |
-| `gemini_service_tier`            | 未设置                                                           | 可选 `standard`、`priority`、`flex`；设置后覆盖 Claude 请求映射                                                                             |
+| `gemini_service_tier`            | 未设置                                                           | 可选 `auto`、`standard`、`priority`、`flex`；`auto` 允许 Claude fast mode 映射 Priority，固定档位覆盖请求映射                              |
 | `gemini_tool_choice_override`    | 未设置                                                           | 可选 `auto`、`any`、`none`、`validated`；设置后覆盖 Claude 的 tool choice，`validated` 保留 Gemini 原生 schema 约束                          |
 
 本地 vLLM 提供的 Qwen OpenAI Chat 端点应继续使用 `chat_dialect: "generic"`，避免发送仅

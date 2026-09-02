@@ -23,9 +23,32 @@ fn provider_profile_json(profile: &ProviderProfile, active_file: &str) -> Value 
     })
 }
 
-fn is_gemini_37_flash_profile(profile: &ProviderProfile) -> bool {
+fn is_gemini_37_or_newer_flash_model(model: &str) -> bool {
+    let model = display_model_name(model).to_ascii_lowercase();
+    let Some(rest) = model.strip_prefix("gemini-") else {
+        return false;
+    };
+    let Some((version, variant)) = rest.split_once('-') else {
+        return false;
+    };
+    if variant != "flash" && !variant.starts_with("flash-") {
+        return false;
+    }
+
+    let mut version_parts = version.split('.');
+    let (Some(major), Some(minor), None) = (
+        version_parts.next().and_then(|part| part.parse::<u64>().ok()),
+        version_parts.next().and_then(|part| part.parse::<u64>().ok()),
+        version_parts.next(),
+    ) else {
+        return false;
+    };
+    major > 3 || (major == 3 && minor >= 7)
+}
+
+fn supports_gemini_flash_thinking_levels(profile: &ProviderProfile) -> bool {
     profile.transport == ProviderTransport::GeminiInteractions
-        && display_model_name(&profile.model).eq_ignore_ascii_case("gemini-3.7-flash")
+        && is_gemini_37_or_newer_flash_model(&profile.model)
 }
 
 fn effective_gemini_thinking_level(state: &AppState) -> Result<Option<String>, String> {
@@ -37,7 +60,7 @@ fn effective_gemini_thinking_level(state: &AppState) -> Result<Option<String>, S
         .profiles
         .iter()
         .find(|profile| profile.file_name == routing.active_file)
-        .filter(|profile| is_gemini_37_flash_profile(profile))
+        .filter(|profile| supports_gemini_flash_thinking_levels(profile))
     else {
         return Ok(None);
     };
@@ -46,8 +69,7 @@ fn effective_gemini_thinking_level(state: &AppState) -> Result<Option<String>, S
         .reasoning_effort_override
         .as_deref()
     {
-        return Ok(normalize_gemini_thinking_level(level, "gemini-3.7-flash")
-            .map(str::to_owned));
+        return Ok(normalize_gemini_thinking_level(level, &profile.model).map(str::to_owned));
     }
     if let Some(level) = current_gemini_thinking_level(state)? {
         return Ok(Some(level));
@@ -56,7 +78,7 @@ fn effective_gemini_thinking_level(state: &AppState) -> Result<Option<String>, S
         .openai_capabilities
         .default_reasoning_effort
         .as_deref()
-        .and_then(|level| normalize_gemini_thinking_level(level, "gemini-3.7-flash"))
+        .and_then(|level| normalize_gemini_thinking_level(level, &profile.model))
         .or(Some("medium"))
         .map(str::to_owned))
 }
@@ -367,7 +389,7 @@ async fn admin_set_gemini_thinking_level(
             .profiles
             .iter()
             .find(|profile| profile.file_name == routing.active_file)
-            .is_some_and(is_gemini_37_flash_profile),
+            .is_some_and(supports_gemini_flash_thinking_levels),
         Err(_) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -379,7 +401,7 @@ async fn admin_set_gemini_thinking_level(
     if !supported {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "Thinking level control requires an active gemini-3.7-flash Interactions profile"})),
+            Json(json!({"error": "Thinking level control requires an active Gemini 3.7-or-newer Flash Interactions profile"})),
         )
             .into_response();
     }

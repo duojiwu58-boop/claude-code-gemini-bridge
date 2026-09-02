@@ -12,7 +12,7 @@ $localAuthToken = Get-BridgeLocalAuthToken `
     -TokenFile $LocalTokenFile
 
 $body = @{
-    model = 'gemini-3.7-flash'
+    model = 'gemini-3.8-flash'
     max_tokens = 2048
     stream = $true
     messages = @(

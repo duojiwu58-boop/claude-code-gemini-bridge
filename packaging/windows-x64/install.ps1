@@ -18,13 +18,151 @@
 $ErrorActionPreference = 'Stop'
 $proxyUrlSpecified = $PSBoundParameters.ContainsKey('ProxyUrl')
 
+# ---------------------------------------------------------------------------
+# PowerShell 2.0 compatibility helpers.
+#
+# Windows 7 SP1 ships Windows PowerShell 2.0 only. The helpers below provide
+# JSON conversion, HTTP requests, string checks, and a TCP listener probe in
+# a PS 2.0-compatible way (System.Web.Extensions JavaScriptSerializer, raw
+# HttpWebRequest, and netstat.exe). Keep this script PS 2.0-safe: no ::new(),
+# no [pscustomobject], no ConvertTo/From-Json, no -in/-notin, no hashtable
+# dot access ($h.key), no -LiteralPath/-PathType/-File.
+# ---------------------------------------------------------------------------
+
+function Test-StringNullOrWhitespace {
+    param([string]$Value)
+    if ([string]::IsNullOrEmpty($Value)) {
+        return $true
+    }
+    return $Value.Trim().Length -eq 0
+}
+
+function ConvertFrom-JsonCompat {
+    param([Parameter(Mandatory)][string]$InputObject)
+    if ($PSVersionTable.ContainsKey('PSEdition') -and
+        $PSVersionTable['PSEdition'] -eq 'Core') {
+        return Microsoft.PowerShell.Utility\ConvertFrom-Json `
+            -InputObject $InputObject `
+            -AsHashtable
+    }
+    Add-Type -AssemblyName System.Web.Extensions -ErrorAction SilentlyContinue
+    $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+    $serializer.MaxJsonLength = [int]::MaxValue
+    return $serializer.DeserializeObject($InputObject)
+}
+
+function ConvertTo-JsonSafeValue {
+    param($Value)
+    if ($null -eq $Value) {
+        return $null
+    }
+    $typeName = $Value.GetType().FullName
+    if ($typeName -eq 'System.Management.Automation.PSCustomObject' -or
+        $typeName -eq 'System.Management.Automation.PSObject') {
+        $result = @{}
+        foreach ($prop in $Value.PSObject.Properties) {
+            $result[$prop.Name] = ConvertTo-JsonSafeValue ($prop.Value)
+        }
+        return $result
+    }
+    if ($typeName -eq 'System.Collections.Hashtable') {
+        $result = @{}
+        foreach ($key in $Value.Keys) {
+            $result[[string]$key] = ConvertTo-JsonSafeValue ($Value[$key])
+        }
+        return $result
+    }
+    if ($Value -is [System.Collections.IDictionary]) {
+        $result = @{}
+        foreach ($key in $Value.Keys) {
+            $result[[string]$key] = ConvertTo-JsonSafeValue ($Value[$key])
+        }
+        return $result
+    }
+    if ($Value -is [System.Array] -or $Value -is [System.Collections.ArrayList]) {
+        $list = New-Object System.Collections.ArrayList
+        foreach ($item in $Value) {
+            [void]$list.Add((ConvertTo-JsonSafeValue $item))
+        }
+        # JavaScriptSerializer cannot handle an ArrayList nested inside an
+        # IDictionary, so return a plain object[] instead.
+        return ,($list.ToArray())
+    }
+    return $Value
+}
+
+function ConvertTo-JsonCompat {
+    param($InputObject)
+    if ($PSVersionTable.ContainsKey('PSEdition') -and
+        $PSVersionTable['PSEdition'] -eq 'Core') {
+        return Microsoft.PowerShell.Utility\ConvertTo-Json `
+            -InputObject $InputObject `
+            -Depth 100 `
+            -Compress
+    }
+    Add-Type -AssemblyName System.Web.Extensions -ErrorAction SilentlyContinue
+    $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+    $serializer.MaxJsonLength = [int]::MaxValue
+    return $serializer.Serialize((ConvertTo-JsonSafeValue $InputObject))
+}
+
+function Invoke-RestMethodCompat {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Uri,
+        [string]$Method = 'GET',
+        [hashtable]$Headers = @{},
+        [int]$TimeoutSec = 3
+    )
+    $request = [System.Net.HttpWebRequest]::Create($Uri)
+    $request.Method = $Method
+    $request.Timeout = $TimeoutSec * 1000
+    $request.ReadWriteTimeout = $TimeoutSec * 1000
+    if ($null -ne $Headers) {
+        foreach ($key in $Headers.Keys) {
+            if ($key -eq 'Content-Type') {
+                $request.ContentType = [string]$Headers[$key]
+                continue
+            }
+            if ($key -eq 'User-Agent') {
+                $request.UserAgent = [string]$Headers[$key]
+                continue
+            }
+            $request.Headers.Add([string]$key, [string]$Headers[$key])
+        }
+    }
+    $response = $request.GetResponse()
+    try {
+        $reader = New-Object -TypeName System.IO.StreamReader -ArgumentList @(
+            $response.GetResponseStream()
+        )
+        $body = $reader.ReadToEnd()
+    }
+    finally {
+        $reader.Dispose()
+        $response.Close()
+    }
+    return ConvertFrom-JsonCompat $body
+}
+
+function Test-TcpListenerActive {
+    param([int]$Port)
+    $netstatLines = & netstat.exe -ano -p tcp
+    foreach ($line in $netstatLines) {
+        if ($line -match ('^\s*TCP\s+127\.0\.0\.1:' + $Port + '\s+\S+\s+LISTENING\s+\d+\s*$')) {
+            return $true
+        }
+    }
+    return $false
+}
+
 if ($DirectConnection -and $proxyUrlSpecified) {
     throw '-DirectConnection 不能与 -ProxyUrl 同时使用。'
 }
 
 function Test-IsAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+    $principal = New-Object -TypeName Security.Principal.WindowsPrincipal -ArgumentList @($identity)
     return $principal.IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator
     )
@@ -46,7 +184,7 @@ if (-not (Test-IsAdministrator)) {
             '-ElevationUserProfile "{1}" -ElevationUserPictures "{2}" ' +
             '-ElevationUserDesktop "{3}" -ElevationUserSid "{4}"'
         ) -f
-        $PSCommandPath,
+        $MyInvocation.MyCommand.Path,
         $unelevatedProfile,
         $unelevatedPictures,
         $unelevatedDesktop,
@@ -78,16 +216,16 @@ function Copy-FileIfNeeded {
     )) {
         return
     }
-    Copy-Item -LiteralPath $sourcePath -Destination $destinationPath -Force
+    Copy-Item -Path $sourcePath -Destination $destinationPath -Force
 }
 
 function Get-WindowsProxyUrl {
     $internetSettings = Get-ItemProperty `
-        -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' `
+        -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' `
         -ErrorAction SilentlyContinue
     if ($null -eq $internetSettings -or
         $internetSettings.ProxyEnable -ne 1 -or
-        [string]::IsNullOrWhiteSpace([string]$internetSettings.ProxyServer)) {
+        (Test-StringNullOrWhitespace ([string]$internetSettings.ProxyServer))) {
         return $null
     }
 
@@ -99,22 +237,22 @@ function Get-WindowsProxyUrl {
             $candidates[$Matches.scheme.ToLowerInvariant()] = $Matches.address.Trim()
         }
         elseif (-not $candidates.ContainsKey('default')) {
-            $candidates.default = $trimmed
+            $candidates['default'] = $trimmed
         }
     }
     $detected = if ($candidates.ContainsKey('https')) {
-        $candidates.https
+        $candidates['https']
     }
     elseif ($candidates.ContainsKey('http')) {
-        $candidates.http
+        $candidates['http']
     }
     elseif ($candidates.ContainsKey('default')) {
-        $candidates.default
+        $candidates['default']
     }
     else {
         $null
     }
-    if ([string]::IsNullOrWhiteSpace($detected)) {
+    if (Test-StringNullOrWhitespace ($detected)) {
         return $null
     }
     if ($detected -notmatch '^[a-z][a-z0-9+.-]*://') {
@@ -126,13 +264,15 @@ function Get-WindowsProxyUrl {
 $serviceName = 'ClaudeCodeBridge'
 $serviceAccount = "NT SERVICE\$serviceName"
 $displayName = 'Claude Code Multi-Model Bridge'
-$packageDir = Split-Path -Parent $PSCommandPath
+$packageDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $packageExe = Join-Path $packageDir 'claude-bridge.exe'
+$packageComputerHost = Join-Path $packageDir 'claude-computer-host.exe'
 $packageGui = Join-Path $packageDir 'ClaudeBridgeManager.exe'
 $bridgeSettingsTemplate = Join-Path $packageDir 'claude-settings.bridge.json'
 $installDir = Join-Path $env:ProgramFiles 'ClaudeCodeBridge'
 $programDataDir = Join-Path $env:ProgramData 'ClaudeCodeBridge'
 $serviceExe = Join-Path $installDir 'claude-bridge.exe'
+$computerHostExe = Join-Path $installDir 'claude-computer-host.exe'
 $legacyServiceExe = Join-Path $installDir 'codex-gemini-bridge.exe'
 $guiExe = Join-Path $installDir 'ClaudeBridgeManager.exe'
 $scriptsDir = Join-Path $installDir 'scripts'
@@ -141,13 +281,13 @@ $keyFile = Join-Path $programDataDir 'gemini-api-key.toml'
 $localTokenFile = Join-Path $programDataDir 'local-auth-token'
 $installMetadataFile = Join-Path $programDataDir 'install-metadata.json'
 $stateFile = Join-Path $programDataDir 'bridge-state.json'
-$targetUserProfile = if ([string]::IsNullOrWhiteSpace($ElevationUserProfile)) {
+$targetUserProfile = if (Test-StringNullOrWhitespace ($ElevationUserProfile)) {
     [System.IO.Path]::GetFullPath($env:USERPROFILE)
 }
 else {
     [System.IO.Path]::GetFullPath($ElevationUserProfile)
 }
-$claudeDir = if ([string]::IsNullOrWhiteSpace($ClaudeSettingsDir)) {
+$claudeDir = if (Test-StringNullOrWhitespace ($ClaudeSettingsDir)) {
     Join-Path $targetUserProfile '.claude'
 }
 else {
@@ -155,29 +295,29 @@ else {
 }
 $claudeSettings = Join-Path $claudeDir 'settings.json'
 $claudeUserConfig = Join-Path (Split-Path -Parent $claudeDir) '.claude.json'
-$picturesDir = if ([string]::IsNullOrWhiteSpace($ElevationUserPictures)) {
+$picturesDir = if (Test-StringNullOrWhitespace ($ElevationUserPictures)) {
     [Environment]::GetFolderPath([Environment+SpecialFolder]::MyPictures)
 }
 else {
     [System.IO.Path]::GetFullPath($ElevationUserPictures)
 }
-if ([string]::IsNullOrWhiteSpace($picturesDir)) {
+if (Test-StringNullOrWhitespace ($picturesDir)) {
     $picturesDir = Join-Path (Split-Path -Parent $claudeDir) 'Pictures'
 }
 $imageDir = Join-Path $picturesDir 'ClaudeCodeBridge'
-$desktopDir = if ([string]::IsNullOrWhiteSpace($ElevationUserDesktop)) {
+$desktopDir = if (Test-StringNullOrWhitespace ($ElevationUserDesktop)) {
     [Environment]::GetFolderPath('DesktopDirectory')
 }
 else {
     [System.IO.Path]::GetFullPath($ElevationUserDesktop)
 }
-$shortcutPath = if ([string]::IsNullOrWhiteSpace($desktopDir)) {
+$shortcutPath = if (Test-StringNullOrWhitespace ($desktopDir)) {
     $null
 }
 else {
     Join-Path $desktopDir 'Claude Code 模型切换器.lnk'
 }
-$providersDir = if ([string]::IsNullOrWhiteSpace($ProviderConfigDir)) {
+$providersDir = if (Test-StringNullOrWhitespace ($ProviderConfigDir)) {
     Join-Path $claudeDir 'bridge-providers'
 }
 else {
@@ -185,7 +325,7 @@ else {
 }
 $geminiProfile = Join-Path $providersDir 'gemini.json'
 $serviceRegistry = "HKLM:\SYSTEM\CurrentControlSet\Services\$serviceName"
-$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+$utf8NoBom = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList @($false)
 New-Item -ItemType Directory -Path $providersDir -Force | Out-Null
 
 function Grant-ServicePathAccess {
@@ -196,10 +336,10 @@ function Grant-ServicePathAccess {
         [Security.AccessControl.FileSystemRights]$Rights
     )
 
-    if (-not (Test-Path -LiteralPath $Path)) {
+    if (-not (Test-Path -Path $Path)) {
         return
     }
-    $item = Get-Item -LiteralPath $Path
+    $item = Get-Item -Path $Path
     $inheritance = if ($item.PSIsContainer) {
         [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
         [Security.AccessControl.InheritanceFlags]::ObjectInherit
@@ -207,8 +347,8 @@ function Grant-ServicePathAccess {
     else {
         [Security.AccessControl.InheritanceFlags]::None
     }
-    $acl = Get-Acl -LiteralPath $Path
-    $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+    $acl = Get-Acl -Path $Path
+    $rule = New-Object -TypeName Security.AccessControl.FileSystemAccessRule -ArgumentList @(
         $serviceAccount,
         $Rights,
         $inheritance,
@@ -216,7 +356,7 @@ function Grant-ServicePathAccess {
         [Security.AccessControl.AccessControlType]::Allow
     )
     $acl.SetAccessRule($rule)
-    Set-Acl -LiteralPath $Path -AclObject $acl
+    Set-Acl -Path $Path -AclObject $acl
 }
 
 function Grant-ServiceDirectoryBrowseAccess {
@@ -225,11 +365,11 @@ function Grant-ServiceDirectoryBrowseAccess {
         [string]$Path
     )
 
-    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+    if (-not [System.IO.Directory]::Exists($Path)) {
         return
     }
-    $acl = Get-Acl -LiteralPath $Path
-    $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+    $acl = Get-Acl -Path $Path
+    $rule = New-Object -TypeName Security.AccessControl.FileSystemAccessRule -ArgumentList @(
         $serviceAccount,
         [Security.AccessControl.FileSystemRights]::ReadAndExecute,
         [Security.AccessControl.InheritanceFlags]::None,
@@ -237,7 +377,7 @@ function Grant-ServiceDirectoryBrowseAccess {
         [Security.AccessControl.AccessControlType]::Allow
     )
     $acl.SetAccessRule($rule)
-    Set-Acl -LiteralPath $Path -AclObject $acl
+    Set-Acl -Path $Path -AclObject $acl
 }
 
 function Remove-ServicePathAccess {
@@ -246,17 +386,17 @@ function Remove-ServicePathAccess {
         [string]$Path
     )
 
-    if (-not (Test-Path -LiteralPath $Path)) {
+    if (-not (Test-Path -Path $Path)) {
         return
     }
-    $acl = Get-Acl -LiteralPath $Path
-    $serviceIdentity = [Security.Principal.NTAccount]::new($serviceAccount)
+    $acl = Get-Acl -Path $Path
+    $serviceIdentity = New-Object -TypeName Security.Principal.NTAccount -ArgumentList @($serviceAccount)
     $acl.PurgeAccessRules($serviceIdentity)
-    Set-Acl -LiteralPath $Path -AclObject $acl
+    Set-Acl -Path $Path -AclObject $acl
 }
 
 function New-LocalAuthToken {
-    $bytes = [byte[]]::new(32)
+    $bytes = New-Object byte[] 32
     $random = [Security.Cryptography.RandomNumberGenerator]::Create()
     try {
         $random.GetBytes($bytes)
@@ -277,10 +417,10 @@ function Write-Utf8TextAtomically {
     $temporaryPath = "$Path.tmp-$PID-$([Guid]::NewGuid().ToString('N'))"
     try {
         [System.IO.File]::WriteAllText($temporaryPath, $Contents, $utf8NoBom)
-        Move-Item -LiteralPath $temporaryPath -Destination $Path -Force
+        Move-Item -Path $temporaryPath -Destination $Path -Force
     }
     finally {
-        Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $temporaryPath -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -296,19 +436,19 @@ function Write-ProtectedUtf8TextAtomically {
     $temporaryPath = "$Path.tmp-$PID-$([Guid]::NewGuid().ToString('N'))"
     $stream = $null
     try {
-        $stream = [System.IO.FileStream]::new(
+        $stream = New-Object -TypeName System.IO.FileStream -ArgumentList @(
             $temporaryPath,
             [System.IO.FileMode]::CreateNew,
             [System.IO.FileAccess]::Write,
             [System.IO.FileShare]::None
         )
-        Set-Acl -LiteralPath $temporaryPath -AclObject $Acl
+        Set-Acl -Path $temporaryPath -AclObject $Acl
         $bytes = $utf8NoBom.GetBytes($Contents)
         $stream.Write($bytes, 0, $bytes.Length)
         $stream.Flush($true)
         $stream.Dispose()
         $stream = $null
-        Move-Item -LiteralPath $temporaryPath -Destination $Path -Force
+        Move-Item -Path $temporaryPath -Destination $Path -Force
     }
     finally {
         if ($null -ne $stream) {
@@ -322,8 +462,7 @@ function Write-ProtectedUtf8TextAtomically {
 
 function Restore-ManagedServiceConfiguration {
     param(
-        [AllowNull()]
-        [pscustomobject]$Snapshot,
+        $Snapshot,
         [bool]$CreatedByThisRun
     )
 
@@ -343,7 +482,7 @@ function Restore-ManagedServiceConfiguration {
     if ($LASTEXITCODE -ne 0) {
         throw "恢复服务程序路径失败，sc.exe 返回 $LASTEXITCODE。"
     }
-    if (-not [string]::IsNullOrWhiteSpace($Snapshot.ObjectName)) {
+    if (-not (Test-StringNullOrWhitespace ($Snapshot.ObjectName))) {
         & sc.exe config $serviceName obj= $Snapshot.ObjectName | Out-Null
         if ($LASTEXITCODE -ne 0) {
             throw "恢复服务账户失败，sc.exe 返回 $LASTEXITCODE。"
@@ -361,7 +500,7 @@ function Restore-ManagedServiceConfiguration {
     if ($LASTEXITCODE -ne 0) {
         throw "恢复服务启动类型失败，sc.exe 返回 $LASTEXITCODE。"
     }
-    if (-not [string]::IsNullOrWhiteSpace($Snapshot.DisplayName)) {
+    if (-not (Test-StringNullOrWhitespace ($Snapshot.DisplayName))) {
         & sc.exe config $serviceName DisplayName= $Snapshot.DisplayName | Out-Null
         if ($LASTEXITCODE -ne 0) {
             throw "恢复服务显示名称失败，sc.exe 返回 $LASTEXITCODE。"
@@ -371,7 +510,7 @@ function Restore-ManagedServiceConfiguration {
     if ($LASTEXITCODE -ne 0) {
         throw "恢复服务说明失败，sc.exe 返回 $LASTEXITCODE。"
     }
-    if (-not [string]::IsNullOrWhiteSpace($Snapshot.Sddl)) {
+    if (-not (Test-StringNullOrWhitespace ($Snapshot.Sddl))) {
         & sc.exe sdset $serviceName $Snapshot.Sddl | Out-Null
         if ($LASTEXITCODE -ne 0) {
             throw "恢复服务权限失败，sc.exe 返回 $LASTEXITCODE。"
@@ -383,18 +522,18 @@ function Restore-ManagedServiceConfiguration {
         @{ Name = 'FailureActions'; Type = 'Binary' }
         @{ Name = 'FailureActionsOnNonCrashFailures'; Type = 'DWord' }
     )) {
-        $snapshotProperty = $Snapshot.Registry.PSObject.Properties[$property.Name]
+        $snapshotProperty = $Snapshot.Registry.PSObject.Properties[$property['Name']]
         if ($null -eq $snapshotProperty) {
             Remove-ItemProperty `
-                -LiteralPath $serviceRegistry `
-                -Name $property.Name `
+                -Path $serviceRegistry `
+                -Name $property['Name'] `
                 -ErrorAction SilentlyContinue
         }
         else {
             New-ItemProperty `
-                -LiteralPath $serviceRegistry `
-                -Name $property.Name `
-                -PropertyType $property.Type `
+                -Path $serviceRegistry `
+                -Name $property['Name'] `
+                -PropertyType $property['Type'] `
                 -Value $snapshotProperty.Value `
                 -Force | Out-Null
         }
@@ -410,13 +549,14 @@ if ($Port -ne 18787) {
 
 $requiredFiles = @(
     $packageExe
+    $packageComputerHost
     $packageGui
     $bridgeSettingsTemplate
     (Join-Path $packageDir 'scripts\start-bridge.ps1')
     (Join-Path $packageDir 'scripts\stop-bridge.ps1')
 )
 foreach ($requiredFile in $requiredFiles) {
-    if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
+    if (-not [System.IO.File]::Exists($requiredFile)) {
         throw "发布包不完整，缺少文件：$requiredFile"
     }
 }
@@ -442,15 +582,15 @@ $configureGemini = $GeminiMode -eq 'Configure'
 $apiKey = $null
 if ($configureGemini) {
     Write-Host 'API Key 只会保存在本机受限文件中，不会写入服务注册表。'
-    if (-not [string]::IsNullOrWhiteSpace($ApiKeyFile)) {
-        if (-not (Test-Path -LiteralPath $ApiKeyFile -PathType Leaf)) {
+    if (-not (Test-StringNullOrWhitespace ($ApiKeyFile))) {
+        if (-not [System.IO.File]::Exists($ApiKeyFile)) {
             throw "找不到安装器提供的 API Key 临时文件：$ApiKeyFile"
         }
         try {
             $apiKey = [System.IO.File]::ReadAllText($ApiKeyFile).Trim()
         }
         finally {
-            Remove-Item -LiteralPath $ApiKeyFile -Force -ErrorAction SilentlyContinue
+            Remove-Item -Path $ApiKeyFile -Force -ErrorAction SilentlyContinue
         }
     }
     else {
@@ -466,17 +606,17 @@ if ($configureGemini) {
             [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($keyPointer)
         }
     }
-    if ([string]::IsNullOrWhiteSpace($apiKey)) {
+    if (Test-StringNullOrWhitespace ($apiKey)) {
         throw 'API Key 不能为空。'
     }
 }
 
 $previousServiceEnvironment = @()
-if (Test-Path -LiteralPath $serviceRegistry) {
+if (Test-Path -Path $serviceRegistry) {
     $previousServiceEnvironment = @(
         (
             Get-ItemProperty `
-                -LiteralPath $serviceRegistry `
+                -Path $serviceRegistry `
                 -ErrorAction SilentlyContinue
         ).Environment
     )
@@ -484,12 +624,13 @@ if (Test-Path -LiteralPath $serviceRegistry) {
 
 $persistedProxyKnown = $false
 $persistedProxy = $null
-if (Test-Path -LiteralPath $stateFile -PathType Leaf) {
+if ([System.IO.File]::Exists($stateFile)) {
     try {
-        $previousState = Get-Content -LiteralPath $stateFile -Raw | ConvertFrom-Json
-        if ($null -ne $previousState.PSObject.Properties['gemini_proxy']) {
+        $previousState = ConvertFrom-JsonCompat ([System.IO.File]::ReadAllText($stateFile))
+        if ($previousState -is [System.Collections.IDictionary] -and
+            $previousState.ContainsKey('gemini_proxy')) {
             $persistedProxyKnown = $true
-            $persistedProxy = [string]$previousState.gemini_proxy
+            $persistedProxy = [string]$previousState['gemini_proxy']
         }
     }
     catch {
@@ -502,7 +643,7 @@ $previousProxy = $previousServiceEnvironment |
 $suggestedProxy = if ($persistedProxyKnown) {
     $persistedProxy
 }
-elseif (-not [string]::IsNullOrWhiteSpace($previousProxy)) {
+elseif (-not (Test-StringNullOrWhitespace ($previousProxy))) {
     ($previousProxy -split '=', 2)[1]
 }
 else {
@@ -513,7 +654,7 @@ if ($configureGemini -and
     -not $NonInteractive -and
     -not $proxyUrlSpecified -and
     -not $DirectConnection) {
-    $prompt = if ([string]::IsNullOrWhiteSpace($suggestedProxy)) {
+    $prompt = if (Test-StringNullOrWhitespace ($suggestedProxy)) {
         '代理地址（输入 direct 使用直连，或输入代理 URL）'
     }
     else {
@@ -523,7 +664,7 @@ if ($configureGemini -and
     if ($proxyAnswer -eq 'direct') {
         $DirectConnection = $true
     }
-    elseif ([string]::IsNullOrWhiteSpace($proxyAnswer)) {
+    elseif (Test-StringNullOrWhitespace ($proxyAnswer)) {
         $ProxyUrl = $suggestedProxy
     }
     else {
@@ -537,10 +678,10 @@ elseif (-not $proxyUrlSpecified -and -not $DirectConnection) {
 if ($DirectConnection) {
     $ProxyUrl = $null
 }
-if (-not [string]::IsNullOrWhiteSpace($ProxyUrl)) {
+if (-not (Test-StringNullOrWhitespace ($ProxyUrl))) {
     $proxyUri = $null
     if (-not [Uri]::TryCreate($ProxyUrl, [UriKind]::Absolute, [ref]$proxyUri) -or
-        $proxyUri.Scheme -notin @('http', 'https')) {
+        @('http', 'https') -notcontains $proxyUri.Scheme) {
         throw "代理地址无效或协议不受支持：$ProxyUrl"
     }
 }
@@ -549,7 +690,7 @@ $existingService = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
 $serviceRollback = $null
 $serviceCreatedByThisRun = $false
 if ($null -ne $existingService) {
-    $existingServiceRegistry = Get-ItemProperty -LiteralPath $serviceRegistry
+    $existingServiceRegistry = Get-ItemProperty -Path $serviceRegistry
     $existingServiceSddlOutput = & sc.exe sdshow $serviceName
     if ($LASTEXITCODE -ne 0) {
         throw "读取原服务权限失败，sc.exe 返回 $LASTEXITCODE。"
@@ -557,7 +698,7 @@ if ($null -ne $existingService) {
     $existingServiceSddl = $existingServiceSddlOutput |
         Where-Object { $_ -match '^D:' } |
         Select-Object -First 1
-    $serviceRollback = [pscustomobject]@{
+    $serviceRollback = New-Object PSObject -Property @{
         ImagePath = [string]$existingServiceRegistry.ImagePath
         ObjectName = [string]$existingServiceRegistry.ObjectName
         Start = [int]$existingServiceRegistry.Start
@@ -578,14 +719,7 @@ if ($null -ne $existingService -and $existingService.Status -ne 'Stopped') {
     )
 }
 
-$listeners = @(
-    Get-NetTCPConnection `
-        -LocalAddress '127.0.0.1' `
-        -LocalPort $Port `
-        -State Listen `
-        -ErrorAction SilentlyContinue
-)
-if ($listeners.Count -gt 0) {
+if (Test-TcpListenerActive -Port $Port) {
     throw "端口 127.0.0.1:$Port 已被其他程序占用，请先关闭该程序。"
 }
 
@@ -597,21 +731,21 @@ New-Item -ItemType Directory -Path $imageDir -Force | Out-Null
 New-Item -ItemType Directory -Path $claudeDir -Force | Out-Null
 
 $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
-$installUserSid = if ([string]::IsNullOrWhiteSpace($ElevationUserSid)) {
+$installUserSid = if (Test-StringNullOrWhitespace ($ElevationUserSid)) {
     $currentIdentity.User
 }
 else {
-    [Security.Principal.SecurityIdentifier]::new($ElevationUserSid)
+    New-Object -TypeName Security.Principal.SecurityIdentifier -ArgumentList @($ElevationUserSid)
 }
-$installSecretAcl = [Security.AccessControl.FileSecurity]::new()
+$installSecretAcl = New-Object -TypeName Security.AccessControl.FileSecurity
 $installSecretAcl.SetAccessRuleProtection($true, $false)
 foreach ($principalEntry in @(
     @{
-        Sid = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+        Sid = (New-Object -TypeName Security.Principal.SecurityIdentifier -ArgumentList @('S-1-5-18'))
         Rights = [Security.AccessControl.FileSystemRights]::FullControl
     }
     @{
-        Sid = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+        Sid = (New-Object -TypeName Security.Principal.SecurityIdentifier -ArgumentList @('S-1-5-32-544'))
         Rights = [Security.AccessControl.FileSystemRights]::FullControl
     }
     @{
@@ -619,14 +753,14 @@ foreach ($principalEntry in @(
         Rights = [Security.AccessControl.FileSystemRights]::FullControl
     }
 )) {
-    $installSecretAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
-        $principalEntry.Sid,
-        $principalEntry.Rights,
+    $installSecretAcl.AddAccessRule((New-Object -TypeName Security.AccessControl.FileSystemAccessRule -ArgumentList @(
+        $principalEntry['Sid'],
+        $principalEntry['Rights'],
         [Security.AccessControl.AccessControlType]::Allow
-    ))
+    )))
 }
 
-$localAuthToken = if (Test-Path -LiteralPath $localTokenFile -PathType Leaf) {
+$localAuthToken = if ([System.IO.File]::Exists($localTokenFile)) {
     [System.IO.File]::ReadAllText($localTokenFile).Trim()
 }
 else {
@@ -640,10 +774,11 @@ if ($localAuthToken.Length -lt 32) {
         -Acl $installSecretAcl
 }
 else {
-    Set-Acl -LiteralPath $localTokenFile -AclObject $installSecretAcl
+    Set-Acl -Path $localTokenFile -AclObject $installSecretAcl
 }
 
 Copy-FileIfNeeded -Source $packageExe -Destination $serviceExe
+Copy-FileIfNeeded -Source $packageComputerHost -Destination $computerHostExe
 Copy-FileIfNeeded -Source $packageGui -Destination $guiExe
 Copy-FileIfNeeded `
     -Source (Join-Path $packageDir 'scripts\start-bridge.ps1') `
@@ -661,59 +796,60 @@ if ($configureGemini) {
     $apiKey = $null
 }
 
-$template = [System.IO.File]::ReadAllText($bridgeSettingsTemplate) | ConvertFrom-Json
-$template.env.ANTHROPIC_AUTH_TOKEN = $localAuthToken
+$template = ConvertFrom-JsonCompat ([System.IO.File]::ReadAllText($bridgeSettingsTemplate))
+$template['env']['ANTHROPIC_AUTH_TOKEN'] = $localAuthToken
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 if ($configureGemini) {
-    $geminiTemplate = [ordered]@{
-        name = 'Google Gemini'
-        model = 'gemini-3.7-flash'
-        context_window = 1048576
-        base_url = 'https://generativelanguage.googleapis.com/v1beta'
-        protocol = 'gemini-interactions'
-        bridge_managed_credentials = $true
-        identity = 'Google Gemini (gemini-3.7-flash)'
-        capabilities = [ordered]@{
-            max_output_tokens = 65536
-            gemini_store = $true
-            gemini_service_tier = 'standard'
-            gemini_tool_choice_override = 'validated'
-        }
-    }
-    if (Test-Path -LiteralPath $geminiProfile -PathType Leaf) {
+    $geminiCapabilities = New-Object System.Collections.Specialized.OrderedDictionary
+    $geminiCapabilities.Add('max_output_tokens', 65536)
+    $geminiCapabilities.Add('gemini_store', $true)
+    $geminiCapabilities.Add('gemini_service_tier', 'auto')
+    $geminiCapabilities.Add('gemini_tool_choice_override', 'validated')
+    $geminiTemplate = New-Object System.Collections.Specialized.OrderedDictionary
+    $geminiTemplate.Add('name', 'Google Gemini')
+    $geminiTemplate.Add('model', 'gemini-3.8-flash')
+    $geminiTemplate.Add('context_window', 1048576)
+    $geminiTemplate.Add('base_url', 'https://generativelanguage.googleapis.com/v1beta')
+    $geminiTemplate.Add('protocol', 'gemini-interactions')
+    $geminiTemplate.Add('bridge_managed_credentials', $true)
+    $geminiTemplate.Add('identity', 'Google Gemini (gemini-3.8-flash)')
+    $geminiTemplate.Add('capabilities', $geminiCapabilities)
+    if ([System.IO.File]::Exists($geminiProfile)) {
         Copy-Item `
-            -LiteralPath $geminiProfile `
+            -Path $geminiProfile `
             -Destination "$geminiProfile.backup-$timestamp" `
             -Force
     }
     Write-Utf8TextAtomically `
         -Path $geminiProfile `
-        -Contents ($geminiTemplate | ConvertTo-Json -Depth 8)
+        -Contents (ConvertTo-JsonCompat ($geminiTemplate))
 }
 
-if (Test-Path -LiteralPath $claudeSettings -PathType Leaf) {
+if ([System.IO.File]::Exists($claudeSettings)) {
     Copy-Item `
-        -LiteralPath $claudeSettings `
+        -Path $claudeSettings `
         -Destination "$claudeSettings.backup-$timestamp" `
         -Force
-    $settings = [System.IO.File]::ReadAllText($claudeSettings) | ConvertFrom-Json
+    $settings = ConvertFrom-JsonCompat ([System.IO.File]::ReadAllText($claudeSettings))
 }
 else {
-    $settings = [pscustomobject]@{}
+    $settings = @{}
 }
-if ($null -eq $settings.PSObject.Properties['env']) {
-    $settings | Add-Member -MemberType NoteProperty -Name env -Value ([pscustomobject]@{})
+if (-not $settings.ContainsKey('env')) {
+    $settings['env'] = @{}
 }
-elseif ($null -eq $settings.env) {
-    $settings.env = [pscustomobject]@{}
+elseif ($null -eq $settings['env']) {
+    $settings['env'] = @{}
 }
 $previousEnv = $null
-if (Test-Path -LiteralPath $installMetadataFile -PathType Leaf) {
+if ([System.IO.File]::Exists($installMetadataFile)) {
     try {
-        $existingInstallMetadata = [System.IO.File]::ReadAllText($installMetadataFile) |
-            ConvertFrom-Json
-        if ($null -ne $existingInstallMetadata.PSObject.Properties['previous_env']) {
-            $previousEnv = @($existingInstallMetadata.previous_env)
+        $existingInstallMetadata = ConvertFrom-JsonCompat (
+            [System.IO.File]::ReadAllText($installMetadataFile)
+        )
+        if ($existingInstallMetadata -is [System.Collections.IDictionary] -and
+            $existingInstallMetadata.ContainsKey('previous_env')) {
+            $previousEnv = @($existingInstallMetadata['previous_env'])
         }
     }
     catch {
@@ -722,37 +858,34 @@ if (Test-Path -LiteralPath $installMetadataFile -PathType Leaf) {
 }
 if ($null -eq $previousEnv) {
     $previousEnv = @(
-        foreach ($property in $template.env.PSObject.Properties) {
-            $existingProperty = $settings.env.PSObject.Properties[$property.Name]
-            [pscustomobject]@{
-                name = $property.Name
-                existed = $null -ne $existingProperty
-                value = if ($null -ne $existingProperty) { $existingProperty.Value } else { $null }
+        foreach ($propertyName in $template['env'].Keys) {
+            $snapshotValue = $null
+            if ($settings['env'].ContainsKey($propertyName)) {
+                $snapshotValue = $settings['env'][$propertyName]
             }
+            (New-Object PSObject -Property @{
+                name = $propertyName
+                existed = $settings['env'].ContainsKey($propertyName)
+                value = $snapshotValue
+            })
         }
     )
 }
-foreach ($property in $template.env.PSObject.Properties) {
-    $existingProperty = $settings.env.PSObject.Properties[$property.Name]
-    if ($null -eq $existingProperty) {
-        $settings.env | Add-Member `
-            -MemberType NoteProperty `
-            -Name $property.Name `
-            -Value $property.Value
-    }
-    else {
-        $existingProperty.Value = $property.Value
-    }
+foreach ($propertyName in $template['env'].Keys) {
+    $settings['env'][$propertyName] = $template['env'][$propertyName]
 }
 Write-Utf8TextAtomically `
     -Path $claudeSettings `
-    -Contents ($settings | ConvertTo-Json -Depth 100)
+    -Contents (ConvertTo-JsonCompat ($settings))
 $installedEnv = @(
-    foreach ($property in $template.env.PSObject.Properties) {
-        [pscustomobject]@{ name = $property.Name; value = $property.Value }
+    foreach ($propertyName in $template['env'].Keys) {
+        (New-Object PSObject -Property @{
+            name = $propertyName
+            value = $template['env'][$propertyName]
+        })
     }
 )
-$installMetadata = [pscustomobject]@{
+$installMetadata = New-Object PSObject -Property @{
     version = 1
     claude_settings = $claudeSettings
     previous_env = $previousEnv
@@ -760,57 +893,49 @@ $installMetadata = [pscustomobject]@{
 }
 Write-ProtectedUtf8TextAtomically `
     -Path $installMetadataFile `
-    -Contents ($installMetadata | ConvertTo-Json -Depth 20) `
+    -Contents (ConvertTo-JsonCompat ($installMetadata)) `
     -Acl $installSecretAcl
 
 try {
-    if (Test-Path -LiteralPath $claudeUserConfig -PathType Leaf) {
+    if ([System.IO.File]::Exists($claudeUserConfig)) {
         Copy-Item `
-            -LiteralPath $claudeUserConfig `
+            -Path $claudeUserConfig `
             -Destination "$claudeUserConfig.backup-$timestamp" `
             -Force
-        $claudeUser = [System.IO.File]::ReadAllText($claudeUserConfig) |
-            ConvertFrom-Json
+        $claudeUser = ConvertFrom-JsonCompat ([System.IO.File]::ReadAllText($claudeUserConfig))
     }
     else {
-        $claudeUser = [pscustomobject]@{}
+        $claudeUser = @{}
     }
-    if ($null -eq $claudeUser.PSObject.Properties['mcpServers']) {
-        $claudeUser | Add-Member `
-            -MemberType NoteProperty `
-            -Name mcpServers `
-            -Value ([pscustomobject]@{})
+    if (-not $claudeUser.ContainsKey('mcpServers')) {
+        $claudeUser['mcpServers'] = @{}
     }
-    elseif ($null -eq $claudeUser.mcpServers) {
-        $claudeUser.mcpServers = [pscustomobject]@{}
+    elseif ($null -eq $claudeUser['mcpServers']) {
+        $claudeUser['mcpServers'] = @{}
     }
-    $imageMcp = [pscustomobject]@{
+    $imageMcp = New-Object PSObject -Property @{
         type = 'http'
         url = "http://127.0.0.1:$Port/mcp"
-        headers = [pscustomobject]@{
+        headers = (New-Object PSObject -Property @{
             Authorization = "Bearer $localAuthToken"
-        }
+        })
     }
-    $existingImageMcp = $claudeUser.mcpServers.PSObject.Properties['gemini-image']
-    if ($null -eq $existingImageMcp) {
-        $claudeUser.mcpServers | Add-Member `
-            -MemberType NoteProperty `
-            -Name 'gemini-image' `
-            -Value $imageMcp
+    $claudeUser['mcpServers']['gemini-image'] = $imageMcp
+    $computerMcp = New-Object PSObject -Property @{
+        type = 'stdio'
+        command = $computerHostExe
+        args = @('--stdio-mcp')
     }
-    else {
-        $existingImageMcp.Value = $imageMcp
-    }
+    $claudeUser['mcpServers']['gemini-computer'] = $computerMcp
     Write-Utf8TextAtomically `
         -Path $claudeUserConfig `
-        -Contents ($claudeUser | ConvertTo-Json -Depth 100)
+        -Contents (ConvertTo-JsonCompat ($claudeUser))
 }
 catch {
-    Write-Warning "无法自动注册 Gemini 生图工具：$($_.Exception.Message)"
+    Write-Warning "无法自动注册 Gemini 生图或 Computer Use MCP 工具：$($_.Exception.Message)"
 }
 
 $binaryPath = "`"$serviceExe`" --windows-service"
-$scBinaryPath = '\"' + $serviceExe + '\" --windows-service'
 if ($null -eq $existingService) {
     New-Service `
         -Name $serviceName `
@@ -821,7 +946,7 @@ if ($null -eq $existingService) {
     $serviceCreatedByThisRun = $true
 }
 else {
-    & sc.exe config $serviceName binPath= $scBinaryPath | Out-Null
+    & sc.exe config $serviceName binPath= $binaryPath | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "更新服务配置失败，sc.exe 返回 $LASTEXITCODE。"
     }
@@ -860,7 +985,7 @@ if ($LASTEXITCODE -ne 0) {
 $serviceSddl = $serviceSddlOutput |
     Where-Object { $_ -match '^D:' } |
     Select-Object -First 1
-if ([string]::IsNullOrWhiteSpace($serviceSddl)) {
+if (Test-StringNullOrWhitespace ($serviceSddl)) {
     throw 'Windows 返回了空的服务安全描述符。'
 }
 $currentUserSid = $installUserSid.Value
@@ -890,67 +1015,60 @@ $serviceEnvironment = @(
     'RUST_LOG=claude_bridge=info,tower_http=info'
 )
 $keyProfileEntry = $null
-if (Test-Path -LiteralPath $keyFile -PathType Leaf) {
+if ([System.IO.File]::Exists($keyFile)) {
     $keyProfileEntry = "GEMINI_BRIDGE_API_KEY_PROFILE=$keyFile"
 }
 elseif (-not $configureGemini) {
     $keyProfileEntry = $previousServiceEnvironment |
         Where-Object { $_ -like 'GEMINI_BRIDGE_API_KEY_PROFILE=*' } |
         Select-Object -First 1
-    if ([string]::IsNullOrWhiteSpace($keyProfileEntry)) {
+    if (Test-StringNullOrWhitespace ($keyProfileEntry)) {
         $userProfileDir = Split-Path -Parent $claudeDir
         $legacyKeyProfile = Join-Path `
             $userProfileDir `
             '.codex\gemini35flash-aistudio.config.toml'
-        if (Test-Path -LiteralPath $legacyKeyProfile -PathType Leaf) {
+        if ([System.IO.File]::Exists($legacyKeyProfile)) {
             $keyProfileEntry = "GEMINI_BRIDGE_API_KEY_PROFILE=$legacyKeyProfile"
         }
     }
 }
-if (-not [string]::IsNullOrWhiteSpace($keyProfileEntry)) {
+if (-not (Test-StringNullOrWhitespace ($keyProfileEntry))) {
     $serviceEnvironment += $keyProfileEntry
 }
-if (-not [string]::IsNullOrWhiteSpace($ProxyUrl)) {
+if (-not (Test-StringNullOrWhitespace ($ProxyUrl))) {
     $serviceEnvironment += "GEMINI_BRIDGE_PROXY=$ProxyUrl"
 }
 New-ItemProperty `
-    -LiteralPath $serviceRegistry `
+    -Path $serviceRegistry `
     -Name Environment `
     -PropertyType MultiString `
     -Value $serviceEnvironment `
     -Force | Out-Null
 
-$bridgeState = if (Test-Path -LiteralPath $stateFile -PathType Leaf) {
+$bridgeState = @{}
+if ([System.IO.File]::Exists($stateFile)) {
     try {
-        Get-Content -LiteralPath $stateFile -Raw | ConvertFrom-Json
+        $parsedState = ConvertFrom-JsonCompat ([System.IO.File]::ReadAllText($stateFile))
+        if ($parsedState -is [System.Collections.IDictionary]) {
+            $bridgeState = $parsedState
+        }
     }
     catch {
-        [PSCustomObject]@{}
     }
 }
-else {
-    [PSCustomObject]@{}
+if (-not $bridgeState.ContainsKey('active_profile')) {
+    $bridgeState['active_profile'] = 'gemini.json'
 }
-if ($null -eq $bridgeState.PSObject.Properties['active_profile']) {
-    $bridgeState | Add-Member `
-        -NotePropertyName active_profile `
-        -NotePropertyValue 'gemini.json'
-}
-if ($null -eq $bridgeState.PSObject.Properties['gemini_proxy']) {
-    $bridgeState | Add-Member -NotePropertyName gemini_proxy -NotePropertyValue $ProxyUrl
-}
-else {
-    $bridgeState.gemini_proxy = $ProxyUrl
-}
+$bridgeState['gemini_proxy'] = $ProxyUrl
 Write-Utf8TextAtomically `
     -Path $stateFile `
-    -Contents ($bridgeState | ConvertTo-Json -Depth 8 -Compress)
+    -Contents (ConvertTo-JsonCompat ($bridgeState))
 
-$localTokenAcl = [Security.AccessControl.FileSecurity]::new()
+$localTokenAcl = New-Object -TypeName Security.AccessControl.FileSecurity
 $localTokenAcl.SetAccessRuleProtection($true, $false)
 $localTokenPrincipals = @(
     @{
-        Identity = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+        Identity = (New-Object -TypeName Security.Principal.SecurityIdentifier -ArgumentList @('S-1-5-18'))
         Rights = [Security.AccessControl.FileSystemRights]::FullControl
     }
     @{
@@ -963,15 +1081,15 @@ $localTokenPrincipals = @(
     }
 )
 foreach ($principalEntry in $localTokenPrincipals) {
-    $rule = [Security.AccessControl.FileSystemAccessRule]::new(
-        $principalEntry.Identity,
-        $principalEntry.Rights,
+    $rule = New-Object -TypeName Security.AccessControl.FileSystemAccessRule -ArgumentList @(
+        $principalEntry['Identity'],
+        $principalEntry['Rights'],
         [Security.AccessControl.AccessControlType]::Allow
     )
     $localTokenAcl.AddAccessRule($rule)
 }
-Set-Acl -LiteralPath $localTokenFile -AclObject $localTokenAcl
-Set-Acl -LiteralPath $installMetadataFile -AclObject $localTokenAcl
+Set-Acl -Path $localTokenFile -AclObject $localTokenAcl
+Set-Acl -Path $installMetadataFile -AclObject $localTokenAcl
 
 Grant-ServicePathAccess `
     -Path $installDir `
@@ -993,13 +1111,14 @@ Grant-ServicePathAccess `
 Grant-ServicePathAccess `
     -Path $providersDir `
     -Rights ([Security.AccessControl.FileSystemRights]::ReadAndExecute)
-Get-ChildItem -LiteralPath $claudeDir -File -Filter 'settings - *.json' |
+Get-ChildItem -Path $claudeDir -Filter 'settings - *.json' |
+    Where-Object { -not $_.PSIsContainer } |
     ForEach-Object {
         Grant-ServicePathAccess `
             -Path $_.FullName `
             -Rights ([Security.AccessControl.FileSystemRights]::Read)
     }
-if (-not [string]::IsNullOrWhiteSpace($keyProfileEntry)) {
+if (-not (Test-StringNullOrWhitespace ($keyProfileEntry))) {
     $serviceKeyProfile = ($keyProfileEntry -split '=', 2)[1]
     Grant-ServicePathAccess `
         -Path $serviceKeyProfile `
@@ -1007,7 +1126,7 @@ if (-not [string]::IsNullOrWhiteSpace($keyProfileEntry)) {
 }
 
 if (-not $SkipShortcuts) {
-    if (-not [string]::IsNullOrWhiteSpace($shortcutPath)) {
+    if (-not (Test-StringNullOrWhitespace ($shortcutPath))) {
         $shell = New-Object -ComObject WScript.Shell
         $shortcut = $shell.CreateShortcut($shortcutPath)
         $shortcut.TargetPath = $guiExe
@@ -1017,20 +1136,51 @@ if (-not $SkipShortcuts) {
     }
 }
 
-Start-Service -Name $serviceName
 $service = Get-Service -Name $serviceName
-$service.WaitForStatus(
-    [System.ServiceProcess.ServiceControllerStatus]::Running,
-    [TimeSpan]::FromSeconds(30)
-)
+$serviceStartDeadline = [DateTime]::UtcNow.AddSeconds(60)
+$lastServiceStartError = $null
+while ([DateTime]::UtcNow -lt $serviceStartDeadline) {
+    $service.Refresh()
+    if ($service.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running) {
+        break
+    }
+    if ($service.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Stopped) {
+        try {
+            Start-Service -Name $serviceName -ErrorAction Stop
+            $lastServiceStartError = $null
+        }
+        catch {
+            # An upgrade can overlap a recovery action that was queued before the
+            # installer stopped the old service. Refresh and retry instead of
+            # reporting a failed install while SCM is already restarting it.
+            $lastServiceStartError = $_
+        }
+    }
+    Start-Sleep -Milliseconds 500
+}
+$service.Refresh()
+if ($service.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Running) {
+    $serviceStartDetail = if ($null -eq $lastServiceStartError) {
+        "当前状态为 $($service.Status)"
+    }
+    else {
+        $lastServiceStartError.Exception.Message
+    }
+    throw "服务无法在 60 秒内启动：$serviceStartDetail"
+}
 
 $healthUrl = "http://127.0.0.1:$Port/health"
 $deadline = [DateTime]::UtcNow.AddSeconds(30)
 $healthy = $false
 while ([DateTime]::UtcNow -lt $deadline) {
     try {
-        $health = Invoke-RestMethod -Uri $healthUrl -TimeoutSec 3
-        $healthy = $health.status -eq 'ok'
+        $health = Invoke-RestMethodCompat -Uri $healthUrl -TimeoutSec 3
+        if ($health -is [System.Collections.IDictionary]) {
+            $healthy = $health['status'] -eq 'ok'
+        }
+        else {
+            $healthy = $false
+        }
     }
     catch {
         $healthy = $false
@@ -1066,9 +1216,9 @@ if (
         $resolvedServiceExe,
         [StringComparison]::OrdinalIgnoreCase
     ) -and
-    (Test-Path -LiteralPath $resolvedLegacyServiceExe -PathType Leaf)
+    [System.IO.File]::Exists($resolvedLegacyServiceExe)
 ) {
-    Remove-Item -LiteralPath $resolvedLegacyServiceExe -Force
+    Remove-Item -Path $resolvedLegacyServiceExe -Force
 }
 
 Write-Host ''
@@ -1081,5 +1231,6 @@ Write-Host "  生图目录：$imageDir"
 Write-Host "  Claude 配置：$claudeSettings"
 Write-Host "  Provider 配置：$providersDir"
 Write-Host "  Gemini：$(if ($configureGemini) { '已配置' } else { '未配置（可稍后添加）' })"
+Write-Host "  Computer Host：$computerHostExe（由 Claude Code 通过 stdio MCP 自动启动）"
 Write-Host ''
-Write-Host '请重新启动正在运行的 Claude Code 会话，使环境配置和 Gemini 生图工具生效。'
+Write-Host '请重新启动正在运行的 Claude Code 会话，使环境配置、生图和 Computer Use 工具生效。'

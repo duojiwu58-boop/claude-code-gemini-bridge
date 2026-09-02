@@ -1,5 +1,5 @@
-﻿#ifndef AppVersion
-  #define AppVersion "0.7.2"
+#ifndef AppVersion
+  #define AppVersion "0.8.0"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\windows-x64"
@@ -36,6 +36,7 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: 
 
 [Files]
 Source: "{#SourceDir}\claude-bridge.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\claude-computer-host.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\ClaudeBridgeManager.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\claude-settings.bridge.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\claude-settings.example.json"; DestDir: "{app}"; Flags: ignoreversion
@@ -44,6 +45,7 @@ Source: "{#SourceDir}\update-api-key.ps1"; DestDir: "{app}"; Flags: ignoreversio
 Source: "{#SourceDir}\uninstall.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\使用说明.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\PROVIDER_CONFIG.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\COMPUTER_USE.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\README.zh-CN.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\CHANGELOG.md"; DestDir: "{app}"; Flags: ignoreversion

@@ -250,6 +250,28 @@ fn interaction_content_from_anthropic(part: &Value) -> Option<Value> {
             .get("text")
             .and_then(Value::as_str)
             .map(|text| json!({"type": "text", "text": text})),
+        Some("search_result") => {
+            let title = part
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("Search result");
+            let source = part
+                .get("source")
+                .or_else(|| part.get("url"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let body = value_to_text(part.get("content").unwrap_or(&Value::Null));
+            let mut text = format!("Search result: {title}");
+            if !source.is_empty() {
+                text.push_str("\nSource: ");
+                text.push_str(source);
+            }
+            if !body.is_empty() {
+                text.push_str("\n\n");
+                text.push_str(&body);
+            }
+            Some(json!({"type": "text", "text": text}))
+        }
         Some(block_type @ ("image" | "document")) => {
             let source = part.get("source")?;
             let mut content = Map::new();
@@ -400,6 +422,15 @@ fn interaction_user_steps(
                 .get(call_id)
                 .cloned()
                 .unwrap_or_else(|| "unknown_function".to_string());
+            if computer_tool_name_is(&name, "computer_action_batch") {
+                if !user_content.is_empty() {
+                    steps.push(json!({"type": "user_input", "content": std::mem::take(&mut user_content)}));
+                }
+                if let Some(expanded) = expand_computer_batch_tool_result(part.get("content").unwrap_or(&Value::Null)) {
+                    steps.extend(expanded);
+                    continue;
+                }
+            }
             if text_tool_history {
                 let status = if part.get("is_error").and_then(Value::as_bool) == Some(true) {
                     "error"
@@ -457,6 +488,231 @@ fn interaction_user_steps(
         steps.push(json!({"type": "user_input", "content": user_content}));
     }
     steps
+}
+
+fn computer_tool_name_is(name: &str, short_name: &str) -> bool {
+    name == short_name || name.ends_with(&format!("__{short_name}"))
+}
+
+fn completed_computer_cancel(request: &Value) -> bool {
+    let Some(messages) = request.get("messages").and_then(Value::as_array) else {
+        return false;
+    };
+    let completed_tool_uses = messages
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .filter_map(|message| message.get("content").and_then(Value::as_array))
+        .flatten()
+        .filter(|part| {
+            part.get("type").and_then(Value::as_str) == Some("tool_result")
+                && part.get("is_error").and_then(Value::as_bool) != Some(true)
+        })
+        .filter_map(|part| part.get("tool_use_id").and_then(Value::as_str))
+        .collect::<std::collections::HashSet<_>>();
+
+    let mut latest_lifecycle_was_cancel = None;
+    for part in messages
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+        .filter_map(|message| message.get("content").and_then(Value::as_array))
+        .flatten()
+    {
+        if part.get("type").and_then(Value::as_str) != Some("tool_use")
+            || !part
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| completed_tool_uses.contains(id))
+        {
+            continue;
+        }
+        let Some(name) = part.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if computer_tool_name_is(name, "computer_start") {
+            latest_lifecycle_was_cancel = Some(false);
+        } else if computer_tool_name_is(name, "computer_cancel") {
+            latest_lifecycle_was_cancel = Some(true);
+        }
+    }
+    latest_lifecycle_was_cancel.unwrap_or(false)
+}
+
+fn requested_computer_cancel_tool_name(request: &Value) -> Option<String> {
+    if completed_computer_cancel(request) {
+        return None;
+    }
+    let cancel_tools = request
+        .get("tools")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .filter(|name| computer_tool_name_is(name, "computer_cancel"))
+        .collect::<Vec<_>>();
+    if cancel_tools.is_empty() {
+        return None;
+    }
+
+    if let Some(selected) = request
+        .pointer("/tool_choice/name")
+        .and_then(Value::as_str)
+        .filter(|name| computer_tool_name_is(name, "computer_cancel"))
+    {
+        return cancel_tools
+            .contains(&selected)
+            .then(|| selected.to_string());
+    }
+
+    let latest_user_text = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .rev()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .filter_map(|message| {
+            let text = match message.get("content")? {
+                Value::String(text) => text.clone(),
+                Value::Array(parts) => parts
+                    .iter()
+                    .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                _ => String::new(),
+            };
+            (!text.trim().is_empty()).then_some(text)
+        })
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    latest_user_text.contains("computer_cancel")
+        .then(|| cancel_tools[0].to_string())
+}
+
+fn computer_result_envelope(content: &Value) -> Option<Value> {
+    let parts = content.as_array()?;
+    parts.iter().find_map(|part| {
+        (part.get("type").and_then(Value::as_str) == Some("text"))
+            .then(|| part.get("text").and_then(Value::as_str))
+            .flatten()
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .filter(|value| value.get("protocol_version").and_then(Value::as_str) == Some(COMPUTER_PROTOCOL_VERSION))
+    })
+}
+
+fn computer_result_images(content: &Value) -> Vec<Value> {
+    content.as_array().into_iter().flatten().filter_map(|part| {
+        if part.get("type").and_then(Value::as_str) != Some("image") { return None; }
+        let source = part.get("source").unwrap_or(part);
+        let data = source.get("data").and_then(Value::as_str)?;
+        let mime_type = source.get("media_type").or_else(|| source.get("mimeType")).and_then(Value::as_str).unwrap_or("image/png");
+        Some(json!({"type": "image", "data": data, "mime_type": mime_type}))
+    }).collect()
+}
+
+fn expand_computer_batch_tool_result(content: &Value) -> Option<Vec<Value>> {
+    let envelope = computer_result_envelope(content)?;
+    if envelope.get("kind").and_then(Value::as_str) != Some("computer_action_batch_result") { return None; }
+    let results = envelope.get("results").and_then(Value::as_array)?;
+    let images = computer_result_images(content);
+    Some(results.iter().map(|item| {
+        let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("computer_call_unknown");
+        let name = item.get("name").and_then(Value::as_str).unwrap_or("unknown_computer_action");
+        let is_error = item.get("status").and_then(Value::as_str) != Some("success");
+        let mut result_item = item.clone();
+        if result_item.get("safety_acknowledgement").and_then(Value::as_bool) != Some(true) {
+            if let Some(object) = result_item.as_object_mut() { object.remove("safety_acknowledgement"); }
+        }
+        let mut result = vec![json!({"type": "text", "text": result_item.to_string()})];
+        let image_index = item.pointer("/screenshot/content_index").and_then(Value::as_u64)
+            .and_then(|index| usize::try_from(index.saturating_sub(1)).ok());
+        if let Some(image) = image_index.and_then(|index| images.get(index)).cloned().or_else(|| images.last().cloned()) {
+            result.push(image);
+        }
+        json!({"type": "function_result", "call_id": call_id, "name": name, "is_error": is_error, "result": result})
+    }).collect())
+}
+
+#[derive(Clone)]
+struct ComputerConversationContext {
+    session_id: String,
+    sequence: u64,
+    environment: String,
+    viewport: Value,
+    batch_tool_name: String,
+}
+
+fn computer_conversation_context(request: &Value) -> Option<ComputerConversationContext> {
+    if completed_computer_cancel(request) {
+        return None;
+    }
+    let batch_tool_name = request.get("tools").and_then(Value::as_array).and_then(|tools| {
+        tools.iter().filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .find(|name| computer_tool_name_is(name, "computer_action_batch")).map(str::to_string)
+    }).unwrap_or_else(|| "computer_action_batch".to_string());
+    let messages = request.get("messages").and_then(Value::as_array)?;
+    for message in messages.iter().rev() {
+        let Some(parts) = message.get("content").and_then(Value::as_array) else { continue; };
+        for part in parts.iter().rev() {
+            if part.get("type").and_then(Value::as_str) != Some("tool_result") { continue; }
+            let Some(envelope) = computer_result_envelope(part.get("content").unwrap_or(&Value::Null)) else { continue; };
+            if !matches!(envelope.get("kind").and_then(Value::as_str), Some("computer_start_result" | "computer_action_batch_result")) { continue; }
+            return Some(ComputerConversationContext {
+                session_id: envelope.get("session_id").and_then(Value::as_str)?.to_string(),
+                sequence: envelope.get("sequence").and_then(Value::as_u64).unwrap_or_default(),
+                environment: envelope.get("environment").and_then(Value::as_str)
+                    .or_else(|| envelope.pointer("/environment_state/environment").and_then(Value::as_str))
+                    .unwrap_or("browser").to_string(),
+                viewport: envelope.get("viewport").cloned()
+                    .or_else(|| envelope.pointer("/environment_state/viewport").cloned())
+                    .unwrap_or_else(|| json!({"width": 1440, "height": 900, "device_scale_factor": 1})),
+                batch_tool_name,
+            });
+        }
+    }
+    None
+}
+
+fn is_gemini_computer_action(name: &str, environment: &str) -> bool {
+    matches!(name, "click" | "double_click" | "triple_click" | "middle_click" | "right_click"
+        | "mouse_down" | "mouse_up" | "move" | "type" | "drag_and_drop" | "wait"
+        | "press_key" | "key_down" | "key_up" | "hotkey" | "take_screenshot" | "scroll")
+        || (environment == "browser" && matches!(name, "go_back" | "navigate" | "go_forward"))
+}
+
+fn computer_batch_tool_block(interaction_id: &str, request: &Value, native_calls: &[Value]) -> Option<(Value, (String, String))> {
+    let context = computer_conversation_context(request)?;
+    if native_calls.is_empty() { return None; }
+    let calls = native_calls.iter().map(|step| {
+        let arguments = step.get("arguments").cloned().unwrap_or_else(|| json!({}));
+        json!({
+            "call_id": step.get("id").and_then(Value::as_str).unwrap_or("computer_call_unknown"),
+            "name": step.get("name").and_then(Value::as_str).unwrap_or("unknown_computer_action"),
+            "arguments": arguments,
+            "intent": step.pointer("/arguments/intent").cloned().unwrap_or(Value::Null),
+            "safety_decision": step.pointer("/arguments/safety_decision").cloned().unwrap_or(Value::Null)
+        })
+    }).collect::<Vec<_>>();
+    let mut digest = Sha256::new();
+    digest.update(interaction_id.as_bytes());
+    digest.update(serde_json::to_vec(&calls).unwrap_or_default());
+    let hash = format!("{:x}", digest.finalize());
+    let batch_id = format!("cub_{}", &hash[..24]);
+    let tool_use_id = format!("toolu_computer_{}", &hash[..24]);
+    let name = context.batch_tool_name;
+    Some((json!({
+        "type": "tool_use", "id": tool_use_id, "name": name,
+        "input": {
+            "protocol_version": COMPUTER_PROTOCOL_VERSION,
+            "session_id": context.session_id,
+            "batch_id": batch_id,
+            "sequence": context.sequence + 1,
+            "environment": context.environment,
+            "viewport": context.viewport,
+            "calls": calls
+        }
+    }), (tool_use_id, name)))
 }
 
 fn interaction_assistant_steps(
@@ -540,6 +796,22 @@ fn interaction_assistant_steps(
                     .and_then(Value::as_str)
                     .unwrap_or("unknown_function");
                 tool_names.insert(call_id.to_string(), name.to_string());
+                if computer_tool_name_is(name, "computer_action_batch") {
+                    if let Some(calls) = part.pointer("/input/calls").and_then(Value::as_array) {
+                        flush_text(&mut steps, &mut text_content);
+                        steps.extend(calls.iter().filter_map(|call| {
+                            let native_call_id = call.get("call_id").and_then(Value::as_str)?;
+                            let native_name = call.get("name").and_then(Value::as_str)?;
+                            Some(json!({
+                                "type": "function_call",
+                                "id": native_call_id,
+                                "name": native_name,
+                                "arguments": call.get("arguments").cloned().unwrap_or_else(|| json!({}))
+                            }))
+                        }));
+                        continue;
+                    }
+                }
                 if text_tool_history {
                     continue;
                 }
@@ -686,19 +958,350 @@ fn gemini_interaction_pdf_tool_diagnostic(
     capabilities: &OpenAiCapabilities,
 ) -> Option<String> {
     (interaction_request_contains_pdf(request)
-        && capabilities.gemini_builtin_tools.iter().any(|tool| {
+        && (capabilities.gemini_builtin_tools.iter().any(|tool| {
             tool.get("type").and_then(Value::as_str) == Some("code_execution")
-        }))
+        }) || request
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| {
+                tools.iter().any(|tool| {
+                    anthropic_server_tool_gemini_type(tool) == Some("code_execution")
+                })
+            })))
     .then(|| {
         "Omitted Gemini Code Execution because Gemini rejects code_execution with application/pdf input"
             .to_string()
     })
 }
 
-fn translated_interaction_tools(request: &Value, capabilities: &OpenAiCapabilities) -> Vec<Value> {
+fn anthropic_server_tool_gemini_type(tool: &Value) -> Option<&'static str> {
+    let tool_type = tool.get("type").and_then(Value::as_str)?;
+    if tool_type.starts_with("web_search_") {
+        Some("google_search")
+    } else if tool_type.starts_with("web_fetch_") {
+        Some("url_context")
+    } else if tool_type.starts_with("code_execution_") {
+        Some("code_execution")
+    } else {
+        None
+    }
+}
+
+fn anthropic_client_tool_as_function(tool: &Value) -> Result<Option<Value>, String> {
+    let Some(tool_type) = tool.get("type").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let (expected_name, description, parameters) = match tool_type {
+        "bash_20250124" => (
+            "bash",
+            "Run a command in the client's persistent Bash session, or restart that session.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Bash command to execute."},
+                    "restart": {"type": "boolean", "description": "Restart the persistent Bash session."}
+                }
+            }),
+        ),
+        value if value.starts_with("text_editor_") => (
+            "str_replace_based_edit_tool",
+            "Use the client-side text editor to view, create, replace, or insert text in files.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "enum": ["view", "str_replace", "create", "insert"]},
+                    "path": {"type": "string"},
+                    "view_range": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2},
+                    "old_str": {"type": "string"},
+                    "new_str": {"type": "string"},
+                    "file_text": {"type": "string"},
+                    "insert_line": {"type": "integer"},
+                    "insert_text": {"type": "string"}
+                },
+                "required": ["command", "path"]
+            }),
+        ),
+        "memory_20250818" => (
+            "memory",
+            "Operate on client-managed persistent memory. All paths must remain under /memories.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "enum": ["view", "create", "str_replace", "insert", "delete", "rename"]},
+                    "path": {"type": "string", "description": "Path under /memories."},
+                    "view_range": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2},
+                    "file_text": {"type": "string"},
+                    "old_str": {"type": "string"},
+                    "new_str": {"type": "string"},
+                    "insert_line": {"type": "integer"},
+                    "insert_text": {"type": "string"},
+                    "old_path": {"type": "string", "description": "Source path under /memories."},
+                    "new_path": {"type": "string", "description": "Destination path under /memories."}
+                },
+                "required": ["command"]
+            }),
+        ),
+        _ => return Ok(None),
+    };
+    let actual_name = tool.get("name").and_then(Value::as_str).unwrap_or_default();
+    if actual_name != expected_name {
+        return Err(format!(
+            "Anthropic client tool '{tool_type}' must use name '{expected_name}'"
+        ));
+    }
+    let mut description = description.to_string();
+    if let Some(max_characters) = tool.get("max_characters").and_then(Value::as_u64) {
+        description.push_str(&format!(
+            " The client limits view output to {max_characters} characters."
+        ));
+    }
+    Ok(Some(json!({
+        "type": "function",
+        "name": expected_name,
+        "description": description,
+        "parameters": parameters
+    })))
+}
+
+fn push_unique_interaction_tool(translated: &mut Vec<Value>, tool: Value) {
+    let Some(tool_type) = tool.get("type").and_then(Value::as_str) else {
+        translated.push(tool);
+        return;
+    };
+    let duplicate_index = if tool_type == "function" {
+        let name = tool.get("name").and_then(Value::as_str);
+        translated.iter().position(|existing| {
+            existing.get("type").and_then(Value::as_str) == Some("function")
+                && existing.get("name").and_then(Value::as_str) == name
+        })
+    } else {
+        translated
+            .iter()
+            .position(|existing| existing.get("type").and_then(Value::as_str) == Some(tool_type))
+    };
+    if let Some(index) = duplicate_index {
+        let existing_fields = translated[index].as_object().map_or(0, Map::len);
+        let new_fields = tool.as_object().map_or(0, Map::len);
+        if tool_type != "function" && new_fields > existing_fields {
+            translated[index] = tool;
+        }
+    } else {
+        translated.push(tool);
+    }
+}
+
+fn gemini_mcp_server_name(name: &str) -> Option<String> {
+    let mut translated = String::with_capacity(name.len());
+    for ch in name.trim().chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            translated.push(ch);
+        } else if ch == '-' {
+            translated.push('_');
+        } else {
+            return None;
+        }
+    }
+    (!translated.is_empty()).then_some(translated)
+}
+
+fn translated_anthropic_mcp_servers(request: &Value) -> Result<Vec<Value>, String> {
+    let Some(servers) = request.get("mcp_servers") else {
+        return Ok(Vec::new());
+    };
+    let servers = servers
+        .as_array()
+        .ok_or_else(|| "Anthropic mcp_servers must be an array".to_string())?;
+    if servers.len() > 20 {
+        return Err("Anthropic mcp_servers accepts at most 20 entries".to_string());
+    }
+    let toolsets = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let mut translated = Vec::with_capacity(servers.len());
+    let mut translated_names = HashSet::new();
+    for server in servers {
+        let server = server
+            .as_object()
+            .ok_or_else(|| "Anthropic mcp_servers entries must be objects".to_string())?;
+        if server.get("type").and_then(Value::as_str) != Some("url") {
+            return Err("Anthropic MCP server type must be 'url'".to_string());
+        }
+        let original_name = server
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Anthropic MCP server requires a non-empty name".to_string())?;
+        let translated_name = gemini_mcp_server_name(original_name).ok_or_else(|| {
+            format!(
+                "Anthropic MCP server '{original_name}' cannot be mapped to a Gemini snake_case name"
+            )
+        })?;
+        if !translated_names.insert(translated_name.clone()) {
+            return Err(format!(
+                "Anthropic MCP server names collide after Gemini name normalization: '{translated_name}'"
+            ));
+        }
+        let server_url = server
+            .get("url")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("Anthropic MCP server '{original_name}' requires a URL"))?;
+        let parsed_url = url::Url::parse(server_url).map_err(|_| {
+            format!("Anthropic MCP server '{original_name}' has an invalid URL")
+        })?;
+        if parsed_url.scheme() != "https"
+            || parsed_url.host_str().is_none()
+            || !parsed_url.username().is_empty()
+            || parsed_url.password().is_some()
+        {
+            return Err(format!(
+                "Anthropic MCP server '{original_name}' must use HTTPS without embedded credentials"
+            ));
+        }
+        let matching_toolsets = toolsets
+            .iter()
+            .filter(|tool| {
+                tool.get("type").and_then(Value::as_str) == Some("mcp_toolset")
+                    && tool.get("mcp_server_name").and_then(Value::as_str) == Some(original_name)
+            })
+            .collect::<Vec<_>>();
+        if matching_toolsets.len() != 1 {
+            return Err(format!(
+                "Anthropic MCP server '{original_name}' must be referenced by exactly one mcp_toolset"
+            ));
+        }
+        let toolset = matching_toolsets[0];
+        let default_enabled = toolset
+            .pointer("/default_config/enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let configs = toolset
+            .get("configs")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        if default_enabled
+            && configs
+                .values()
+                .any(|config| config.get("enabled").and_then(Value::as_bool) == Some(false))
+        {
+            return Err(format!(
+                "Anthropic MCP server '{original_name}' uses a denylist that Gemini Remote MCP cannot enforce; use an allowlist with default_config.enabled=false"
+            ));
+        }
+
+        let mut mcp_server = Map::new();
+        mcp_server.insert("type".to_string(), json!("mcp_server"));
+        mcp_server.insert("name".to_string(), json!(translated_name));
+        mcp_server.insert("url".to_string(), json!(server_url));
+        if let Some(token) = server
+            .get("authorization_token")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            let header_value = format!("Bearer {token}");
+            header_value
+                .parse::<reqwest::header::HeaderValue>()
+                .map_err(|_| {
+                    format!(
+                        "Anthropic MCP server '{original_name}' has an invalid authorization token"
+                    )
+                })?;
+            mcp_server.insert(
+                "headers".to_string(),
+                json!({"Authorization": header_value}),
+            );
+        }
+        if !default_enabled {
+            let allowed_tools = configs
+                .iter()
+                .filter(|(_, config)| {
+                    config.get("enabled").and_then(Value::as_bool) == Some(true)
+                })
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>();
+            mcp_server.insert("allowed_tools".to_string(), json!(allowed_tools));
+        }
+        translated.push(Value::Object(mcp_server));
+    }
+
+    for toolset in toolsets
+        .iter()
+        .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("mcp_toolset"))
+    {
+        let Some(name) = toolset.get("mcp_server_name").and_then(Value::as_str) else {
+            return Err("Anthropic mcp_toolset requires mcp_server_name".to_string());
+        };
+        let references = servers.iter().filter(|server| {
+            server.get("name").and_then(Value::as_str) == Some(name)
+        });
+        if references.count() != 1 {
+            return Err(format!(
+                "Anthropic mcp_toolset '{name}' must reference exactly one mcp_servers entry"
+            ));
+        }
+    }
+    Ok(translated)
+}
+
+fn translated_interaction_tools(
+    request: &Value,
+    capabilities: &OpenAiCapabilities,
+) -> Result<Vec<Value>, String> {
     let mut translated = Vec::new();
+    let computer_context = computer_conversation_context(request);
+    let requested_cancel_tool = computer_context
+        .as_ref()
+        .and_then(|_| requested_computer_cancel_tool_name(request));
+    let omit_code_execution =
+        interaction_request_contains_pdf(request) || computer_context.is_some();
     if let Some(tools) = request.get("tools").and_then(Value::as_array) {
         for tool in tools {
+            let tool_name = tool.get("name").and_then(Value::as_str);
+            if requested_cancel_tool.is_some()
+                && !tool_name.is_some_and(|name| computer_tool_name_is(name, "computer_cancel"))
+            {
+                continue;
+            }
+            if requested_cancel_tool.is_none()
+                && tool_name.is_some_and(|name| {
+                    computer_tool_name_is(name, "computer_action_batch")
+                        || (computer_context.is_some()
+                            && (computer_tool_name_is(name, "computer_start")
+                                || computer_tool_name_is(name, "computer_cancel")))
+                })
+            {
+                continue;
+            }
+            if let Some(gemini_type) = anthropic_server_tool_gemini_type(tool) {
+                if !(omit_code_execution && gemini_type == "code_execution") {
+                    push_unique_interaction_tool(
+                        &mut translated,
+                        json!({"type": gemini_type}),
+                    );
+                }
+                continue;
+            }
+            if let Some(translated_tool) = anthropic_client_tool_as_function(tool)? {
+                push_unique_interaction_tool(&mut translated, translated_tool);
+                continue;
+            }
+            if tool
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|tool_type| {
+                    tool_type.starts_with("tool_search_tool_")
+                        || tool_type.starts_with("advisor_")
+                        || tool_type.starts_with("computer_")
+                        || tool_type == "mcp_toolset"
+                })
+            {
+                continue;
+            }
             let Some(name) = tool.get("name").and_then(Value::as_str) else {
                 continue;
             };
@@ -717,20 +1320,26 @@ fn translated_interaction_tools(request: &Value, capabilities: &OpenAiCapabiliti
             if let Some(description) = tool.get("description") {
                 translated_tool["description"] = description.clone();
             }
-            translated.push(translated_tool);
+            push_unique_interaction_tool(&mut translated, translated_tool);
         }
     }
-    let omit_code_execution = interaction_request_contains_pdf(request);
-    translated.extend(
-        capabilities
-            .gemini_builtin_tools
-            .iter()
-            .filter(|tool| {
-                !(omit_code_execution
-                    && tool.get("type").and_then(Value::as_str) == Some("code_execution"))
-            })
-            .cloned(),
-    );
+    if requested_cancel_tool.is_some() {
+        return Ok(translated);
+    }
+    for tool in capabilities.gemini_builtin_tools.iter().filter(|tool| {
+        !(omit_code_execution
+            && tool.get("type").and_then(Value::as_str) == Some("code_execution"))
+            && tool.get("type").and_then(Value::as_str) != Some("computer_use")
+    }) {
+        push_unique_interaction_tool(&mut translated, tool.clone());
+    }
+    if let Some(context) = &computer_context {
+        push_unique_interaction_tool(&mut translated, json!({
+            "type": "computer_use",
+            "environment": context.environment,
+            "enable_prompt_injection_detection": true
+        }));
+    }
     if !capabilities.gemini_file_search_store_names.is_empty() {
         if let Some(file_search) = translated
             .iter_mut()
@@ -748,7 +1357,17 @@ fn translated_interaction_tools(request: &Value, capabilities: &OpenAiCapabiliti
         }
     }
     translated.extend(capabilities.gemini_remote_mcp_servers.iter().cloned());
-    translated
+    for request_server in translated_anthropic_mcp_servers(request)? {
+        let duplicate = translated.iter().any(|existing| {
+            existing.get("type").and_then(Value::as_str) == Some("mcp_server")
+                && existing.get("name").and_then(Value::as_str)
+                    == request_server.get("name").and_then(Value::as_str)
+        });
+        if !duplicate {
+            translated.push(request_server);
+        }
+    }
+    Ok(translated)
 }
 
 fn interaction_tool_choice(choice: &Value) -> Option<Value> {
@@ -778,7 +1397,7 @@ fn interaction_thinking_level(
     }
     if request.pointer("/thinking/type").and_then(Value::as_str) == Some("disabled") {
         return Some(
-            if model.starts_with("gemini-3") {
+            if model.starts_with("gemini-3") || is_gemini_37_or_newer_flash_model(model) {
                 "low"
             } else {
                 "none"
@@ -825,7 +1444,11 @@ fn interaction_thinking_level(
 
 fn normalize_gemini_thinking_level<'a>(effort: &'a str, model: &str) -> Option<&'a str> {
     match effort {
-        "none" | "minimal" if model.starts_with("gemini-3") => Some("low"),
+        "none" | "minimal"
+            if model.starts_with("gemini-3") || is_gemini_37_or_newer_flash_model(model) =>
+        {
+            Some("low")
+        }
         "none" | "minimal" | "low" => Some(effort),
         "medium" => Some("medium"),
         "high" | "xhigh" | "max" => Some("high"),
@@ -869,7 +1492,14 @@ fn interaction_response_format(request: &Value) -> Result<Option<Value>, String>
 }
 
 fn interaction_service_tier(request: &Value, capabilities: &OpenAiCapabilities) -> Option<String> {
-    capabilities.gemini_service_tier.clone().or_else(|| {
+    let configured = capabilities
+        .gemini_service_tier
+        .as_deref()
+        .filter(|tier| *tier != "auto");
+    configured.map(str::to_owned).or_else(|| {
+        if request.get("speed").and_then(Value::as_str) == Some("fast") {
+            return Some("priority".to_string());
+        }
         match request.get("service_tier").and_then(Value::as_str) {
             Some("standard_only") => Some("standard".to_string()),
             _ => None,
@@ -1088,7 +1718,6 @@ fn gemini_interaction_request_diagnostics(request: &Value) -> Vec<String> {
         "container",
         "context_management",
         "inference_geo",
-        "mcp_servers",
     ] {
         if request.get(field).is_some_and(|value| !value.is_null()) {
             add(&format!(
@@ -1106,8 +1735,19 @@ fn gemini_interaction_request_diagnostics(request: &Value) -> Vec<String> {
             ignored_sampling.join(", ")
         ));
     }
-    if request.get("candidate_count").is_some() {
-        add("Ignored candidate_count: Gemini 3.x supports a single response candidate");
+    let unsupported_parameters: Vec<&str> = [
+        "candidate_count",
+        "frequency_penalty",
+        "presence_penalty",
+    ]
+    .into_iter()
+    .filter(|field| request.get(*field).is_some())
+    .collect();
+    if !unsupported_parameters.is_empty() {
+        add(&format!(
+            "Dropped unsupported Gemini parameters: {}",
+            unsupported_parameters.join(", ")
+        ));
     }
     if let Some(effort) = request
         .pointer("/output_config/effort")
@@ -1115,7 +1755,7 @@ fn gemini_interaction_request_diagnostics(request: &Value) -> Vec<String> {
     {
         match effort {
             "none" | "minimal" => add(&format!(
-                "Mapped Anthropic output_config.effort '{effort}' to Gemini 3.7 minimum thinking level 'low'"
+                "Mapped Anthropic output_config.effort '{effort}' to the minimum supported Gemini thinking level 'low'"
             )),
             "low" | "medium" | "high" | "xhigh" | "max" => {}
             _ => add(&format!(
@@ -1126,12 +1766,103 @@ fn gemini_interaction_request_diagnostics(request: &Value) -> Vec<String> {
     if let Some(tier) = request.get("service_tier").and_then(Value::as_str) {
         match tier {
             "standard_only" => {}
-            "auto" => add(
-                "Anthropic service_tier 'auto' is left unset; Gemini uses its default standard tier",
-            ),
+            "auto" if request.get("speed").and_then(Value::as_str) == Some("fast") => {}
+            "auto" => add("Anthropic service_tier 'auto' is left unset; Gemini uses its default standard tier"),
             _ => add(&format!(
                 "Ignored unsupported Anthropic service_tier '{tier}'"
             )),
+        }
+    }
+    if let Some(speed) = request.get("speed").and_then(Value::as_str) {
+        match speed {
+            "fast" => add("Mapped Anthropic fast mode to Gemini Priority inference when the provider profile does not force another service tier"),
+            "standard" => {}
+            _ => add(&format!("Ignored unsupported Anthropic speed '{speed}'")),
+        }
+    }
+    if let Some(tools) = request.get("tools").and_then(Value::as_array) {
+        for tool in tools {
+            let Some(tool_type) = tool.get("type").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Some(gemini_type) = anthropic_server_tool_gemini_type(tool) {
+                add(&format!(
+                    "Mapped Anthropic server tool '{tool_type}' to Gemini native '{gemini_type}'"
+                ));
+                for field in [
+                    "allowed_domains",
+                    "blocked_domains",
+                    "max_uses",
+                    "max_content_tokens",
+                    "use_cache",
+                    "user_location",
+                    "response_inclusion",
+                ] {
+                    if tool.get(field).is_some() {
+                        add(&format!(
+                            "Gemini native '{gemini_type}' does not expose Anthropic server-tool control '{field}'; the control was not forwarded"
+                        ));
+                    }
+                }
+            } else if matches!(tool_type, "bash_20250124" | "memory_20250818")
+                || tool_type.starts_with("text_editor_")
+            {
+                if let Some(name) = tool.get("name").and_then(Value::as_str) {
+                    add(&format!(
+                        "Expanded Anthropic schema-less client tool '{tool_type}' into Gemini function '{name}' for client-side execution"
+                    ));
+                }
+            } else if matches!(
+                tool_type,
+                "computer_toolset_20260801" | "browser_toolset_20260801"
+            ) || tool_type.starts_with("computer_")
+            {
+                add(&format!(
+                    "Cannot safely translate Anthropic schema-less toolset '{tool_type}' to Gemini: use Claude Code Chrome/Computer Use or an MCP browser tool so the client executes actions and returns screenshots"
+                ));
+            } else if tool_type.starts_with("tool_search_tool_") {
+                add(&format!(
+                    "Replaced Anthropic server tool search '{tool_type}' by eagerly exposing the request's function tools to Gemini"
+                ));
+            } else if tool_type.starts_with("advisor_") {
+                add(&format!(
+                    "Skipped Anthropic advisor tool '{tool_type}': Gemini has no separate advisor service and performs the reasoning in the active model"
+                ));
+            } else if tool_type == "mcp_toolset" {
+                if let Some(name) = tool.get("mcp_server_name").and_then(Value::as_str) {
+                    add(&format!(
+                        "Mapped Anthropic request MCP toolset '{name}' to Gemini native Remote MCP"
+                    ));
+                }
+                let uses_deferred_loading = tool
+                    .pointer("/default_config/defer_loading")
+                    .is_some_and(|value| !value.is_null())
+                    || tool
+                        .get("configs")
+                        .and_then(Value::as_object)
+                        .is_some_and(|configs| {
+                            configs.values().any(|config| {
+                                config
+                                    .get("defer_loading")
+                                    .is_some_and(|value| !value.is_null())
+                            })
+                        });
+                if uses_deferred_loading {
+                    add("Gemini Remote MCP discovers tools server-side and does not expose Anthropic defer_loading controls; the controls were not forwarded");
+                }
+            }
+        }
+    }
+    if let Some(servers) = request.get("mcp_servers").and_then(Value::as_array) {
+        for server in servers {
+            let Some(name) = server.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Some(mapped) = gemini_mcp_server_name(name).filter(|mapped| mapped != name) {
+                add(&format!(
+                    "Normalized Anthropic MCP server name '{name}' to Gemini-compatible '{mapped}'"
+                ));
+            }
         }
     }
     if request
@@ -1671,7 +2402,9 @@ fn translate_gemini_interactions_request_with_continuation(
     if messages.is_empty() {
         return Err("Gemini Interactions requires at least one message".to_string());
     }
-    if display_model_name(&profile.model).starts_with("gemini-3")
+    let model = display_model_name(&profile.model);
+    if (model.to_ascii_lowercase().starts_with("gemini-3")
+        || is_gemini_37_or_newer_flash_model(&model))
         && messages
             .last()
             .and_then(|message| message.get("role"))
@@ -1679,8 +2412,10 @@ fn translate_gemini_interactions_request_with_continuation(
             == Some("assistant")
     {
         return Err(
-            "Gemini 3.x does not support an assistant prefill; the final message must be user input or a tool result"
-                .to_string(),
+            format!(
+                "{} does not support an assistant prefill; the final message must be user input or a tool result",
+                model
+            ),
         );
     }
     let store_interaction = profile.openai_capabilities.gemini_store;
@@ -1768,13 +2503,21 @@ fn translate_gemini_interactions_request_with_continuation(
             "none"
         }),
     );
-    let tools = translated_interaction_tools(request, &profile.openai_capabilities);
+    let requested_cancel_tool = computer_conversation_context(request)
+        .as_ref()
+        .and_then(|_| requested_computer_cancel_tool_name(request));
+    let tools = translated_interaction_tools(request, &profile.openai_capabilities)?;
     if !tools.is_empty() {
-        let tool_choice = profile
-            .openai_capabilities
-            .gemini_tool_choice_override
+        let tool_choice = requested_cancel_tool
             .as_ref()
-            .map(|choice| json!(choice))
+            .map(|name| json!({"allowed_tools": {"mode": "any", "tools": [name]}}))
+            .or_else(|| {
+                profile
+                    .openai_capabilities
+                    .gemini_tool_choice_override
+                    .as_ref()
+                    .map(|choice| json!(choice))
+            })
             .or_else(|| request.get("tool_choice").and_then(interaction_tool_choice));
         if let Some(choice) = tool_choice {
             generation_config.insert("tool_choice".to_string(), choice);
@@ -1886,8 +2629,25 @@ fn remove_interaction_server_tools(request: &mut Value) -> bool {
         return false;
     };
     let original_len = tools.len();
-    tools.retain(|tool| tool.get("type").and_then(Value::as_str) == Some("function"));
+    tools.retain(|tool| matches!(tool.get("type").and_then(Value::as_str), Some("function" | "computer_use")));
     original_len != tools.len()
+}
+
+fn interaction_request_has_computer_use(request: &Value) -> bool {
+    request.get("tools").and_then(Value::as_array).is_some_and(|tools| {
+        tools.iter().any(|tool| tool.get("type").and_then(Value::as_str) == Some("computer_use"))
+    })
+}
+
+fn remove_interaction_tools_incompatible_with_computer_use(request: &mut Value) -> bool {
+    let Some(tools) = request.get_mut("tools").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let original_len = tools.len();
+    tools.retain(|tool| {
+        tool.get("type").and_then(Value::as_str) == Some("computer_use")
+    });
+    original_len != tools.len() && !tools.is_empty()
 }
 
 fn is_mixed_interaction_tools_error(status: u16, message: &str) -> bool {
@@ -1898,6 +2658,7 @@ fn is_mixed_interaction_tools_error(status: u16, message: &str) -> bool {
     message.contains("include_server_side_tool_invocations")
         || (message.contains("server-side tool") && message.contains("function"))
         || (message.contains("built-in tool") && message.contains("function"))
+        || (message.contains("computer_use") && message.contains("cannot be combined"))
 }
 
 fn is_interaction_continuation_unavailable(status: u16, message: &str, request: &Value) -> bool {
@@ -2073,6 +2834,52 @@ fn bounded_interaction_trace_value(value: &Value) -> Value {
     json!({"truncated": true, "preview": preview})
 }
 
+fn gemini_mcp_step_to_anthropic(step: &Value) -> Option<Value> {
+    match step.get("type").and_then(Value::as_str)? {
+        "mcp_server_tool_call" => {
+            let id = step.get("id").and_then(Value::as_str)?;
+            let name = step.get("name").and_then(Value::as_str)?;
+            let server_name = step.get("server_name").and_then(Value::as_str)?;
+            Some(json!({
+                "type": "mcp_tool_use",
+                "id": id,
+                "name": name,
+                "server_name": server_name,
+                "input": step.get("arguments").cloned().unwrap_or_else(|| json!({}))
+            }))
+        }
+        "mcp_server_tool_result" => {
+            let call_id = step.get("call_id").and_then(Value::as_str)?;
+            let result = step.get("result").unwrap_or(&Value::Null);
+            let content = match result {
+                Value::Array(parts) => parts
+                    .iter()
+                    .map(|part| {
+                        if part.get("type").and_then(Value::as_str) == Some("text") {
+                            json!({
+                                "type": "text",
+                                "text": part.get("text").and_then(Value::as_str).unwrap_or_default()
+                            })
+                        } else {
+                            json!({"type": "text", "text": part.to_string()})
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+                Value::String(text) => vec![json!({"type": "text", "text": text})],
+                Value::Null => Vec::new(),
+                value => vec![json!({"type": "text", "text": value.to_string()})],
+            };
+            Some(json!({
+                "type": "mcp_tool_result",
+                "tool_use_id": call_id,
+                "is_error": step.get("is_error").and_then(Value::as_bool).unwrap_or(false),
+                "content": content
+            }))
+        }
+        _ => None,
+    }
+}
+
 fn gemini_interaction_usage_to_anthropic(usage: &Value, fallback_input_tokens: u64) -> Value {
     let input_tokens = usage_token(
         usage,
@@ -2111,6 +2918,28 @@ fn gemini_interaction_usage_to_anthropic(usage: &Value, fallback_input_tokens: u
     translated
 }
 
+fn attach_anthropic_inference_usage(usage: &mut Value, service_tier: Option<&str>) {
+    let Some(service_tier) = service_tier.filter(|value| !value.is_empty()) else {
+        return;
+    };
+    match service_tier {
+        "priority" => {
+            usage["service_tier"] = json!("priority");
+            usage["speed"] = json!("fast");
+        }
+        "standard" => {
+            usage["service_tier"] = json!("standard");
+            usage["speed"] = json!("standard");
+        }
+        "flex" => {
+            // Claude has no Flex usage enum. Preserve the exact provider tier in
+            // provider_metadata and report only its standard output speed here.
+            usage["speed"] = json!("standard");
+        }
+        _ => {}
+    }
+}
+
 fn interaction_stop_reason(status: &str, has_calls: bool) -> &'static str {
     if has_calls || status == "requires_action" {
         "tool_use"
@@ -2129,10 +2958,20 @@ fn translate_gemini_interactions_response(
     translate_gemini_interactions_response_with_service_tier(upstream, model, None)
 }
 
+#[cfg(test)]
 fn translate_gemini_interactions_response_with_service_tier(
     upstream: &Value,
     model: &str,
     actual_service_tier: Option<&str>,
+) -> Result<InteractionResponseTranslation, String> {
+    translate_gemini_interactions_response_for_request(upstream, model, actual_service_tier, None)
+}
+
+fn translate_gemini_interactions_response_for_request(
+    upstream: &Value,
+    model: &str,
+    actual_service_tier: Option<&str>,
+    request: Option<&Value>,
 ) -> Result<InteractionResponseTranslation, String> {
     let interaction_id = upstream
         .get("id")
@@ -2163,6 +3002,8 @@ fn translate_gemini_interactions_response_with_service_tier(
         .ok_or_else(|| "Gemini Interactions response has no steps array".to_string())?;
     let mut content = Vec::new();
     let mut calls = Vec::new();
+    let computer_context = request.and_then(computer_conversation_context);
+    let mut native_computer_calls = Vec::new();
     let mut interaction_annotations = Vec::new();
     let mut server_tools = InteractionServerToolTrace::default();
     for (step_index, step) in steps.iter().enumerate() {
@@ -2221,6 +3062,12 @@ fn translate_gemini_interactions_response_with_service_tier(
                     .and_then(Value::as_str)
                     .unwrap_or("unknown_function")
                     .to_string();
+                if computer_context.as_ref().is_some_and(|context| is_gemini_computer_action(&name, &context.environment)) {
+                    let mut native_call = step.clone();
+                    native_call["id"] = json!(call_id);
+                    native_computer_calls.push(native_call);
+                    continue;
+                }
                 let input = step.get("arguments").cloned().unwrap_or_else(|| json!({}));
                 calls.push((call_id.clone(), name.clone()));
                 content.push(json!({
@@ -2230,6 +3077,13 @@ fn translate_gemini_interactions_response_with_service_tier(
                     "input": input
                 }));
             }
+            Some(step_type @ ("mcp_server_tool_call" | "mcp_server_tool_result")) => {
+                server_tools.capture(step);
+                if let Some(block) = gemini_mcp_step_to_anthropic(step) {
+                    content.push(block);
+                }
+                info!(step_type, "Gemini MCP server-side tool step completed");
+            }
             Some(step_type) if is_gemini_server_tool_step(step_type) => {
                 server_tools.capture(step);
                 info!(step_type, "Gemini server-side tool step completed");
@@ -2237,8 +3091,17 @@ fn translate_gemini_interactions_response_with_service_tier(
             _ => {}
         }
     }
+    if let Some(request) = request {
+        if let Some((block, call)) = computer_batch_tool_block(&interaction_id, request, &native_computer_calls) {
+            content.push(block);
+            calls.push(call);
+        }
+    }
     let interaction_usage = upstream.get("usage").unwrap_or(&Value::Null);
-    let usage = gemini_interaction_usage_to_anthropic(interaction_usage, 0);
+    let resolved_service_tier =
+        actual_service_tier.or_else(|| upstream.get("service_tier").and_then(Value::as_str));
+    let mut usage = gemini_interaction_usage_to_anthropic(interaction_usage, 0);
+    attach_anthropic_inference_usage(&mut usage, resolved_service_tier);
     let stop_reason = interaction_stop_reason(status, !calls.is_empty());
     let mut message = json!({
         "id": format!("msg_{}", Uuid::new_v4().simple()),
@@ -2256,7 +3119,7 @@ fn translate_gemini_interactions_response_with_service_tier(
     if let Some(metadata) = server_tools.provider_metadata(
         interaction_usage,
         &interaction_annotations,
-        actual_service_tier.or_else(|| upstream.get("service_tier").and_then(Value::as_str)),
+        resolved_service_tier,
     ) {
         message["provider_metadata"] = metadata;
     }
@@ -2301,10 +3164,16 @@ async fn forward_gemini_interactions_profile(
             .post(&profile.upstream_url)
             .header("x-goog-api-key", api_key)
             .json(&interaction_request);
-        let response = match apply_upstream_total_timeout(upstream_request, stream_requested)
-            .send()
-            .await
+        let upstream_request =
+            apply_upstream_total_timeout(upstream_request, stream_requested);
+        let upstream_request = if !stream_requested
+            && interaction_request.get("service_tier").and_then(Value::as_str) == Some("flex")
         {
+            upstream_request.timeout(GEMINI_FLEX_REQUEST_TIMEOUT)
+        } else {
+            upstream_request
+        };
+        let response = match upstream_request.send().await {
             Ok(response) => response,
             Err(err) => {
                 error!(
@@ -2327,17 +3196,30 @@ async fn forward_gemini_interactions_profile(
             .map(|value| safe_error_message(&value))
             .unwrap_or(response_text);
 
-        if !mixed_tools_fallback
-            && interaction_request_has_mixed_tools(&interaction_request)
-            && is_mixed_interaction_tools_error(status.as_u16(), &message)
-            && remove_interaction_server_tools(&mut interaction_request)
-        {
-            mixed_tools_fallback = true;
-            warn!(
-                provider = %profile.file_name,
-                "Gemini rejected mixed function and server-side tools; retrying this request with Claude Code function tools only"
-            );
-            continue;
+        if !mixed_tools_fallback && is_mixed_interaction_tools_error(status.as_u16(), &message) {
+            if interaction_request_has_computer_use(&interaction_request)
+                && remove_interaction_tools_incompatible_with_computer_use(
+                    &mut interaction_request,
+                )
+            {
+                mixed_tools_fallback = true;
+                warn!(
+                    provider = %profile.file_name,
+                    upstream_error = %message,
+                    "Gemini rejected tools combined with computer_use; retrying with computer_use preserved as the sole tool"
+                );
+                continue;
+            }
+            if interaction_request_has_mixed_tools(&interaction_request)
+                && remove_interaction_server_tools(&mut interaction_request)
+            {
+                mixed_tools_fallback = true;
+                warn!(
+                    provider = %profile.file_name,
+                    "Gemini rejected mixed function and server-side tools; retrying this request with Claude Code function tools only"
+                );
+                continue;
+            }
         }
 
         if !continuation_fallback
@@ -2363,7 +3245,13 @@ async fn forward_gemini_interactions_profile(
                 }
             };
             if mixed_tools_fallback {
-                remove_interaction_server_tools(&mut interaction_request);
+                if interaction_request_has_computer_use(&interaction_request) {
+                    remove_interaction_tools_incompatible_with_computer_use(
+                        &mut interaction_request,
+                    );
+                } else {
+                    remove_interaction_server_tools(&mut interaction_request);
+                }
             }
             continuation_fallback = true;
             warn!(
@@ -2384,14 +3272,19 @@ async fn forward_gemini_interactions_profile(
     };
     let model = display_model_name(&profile.model);
     if stream_requested {
+        let flex_requested =
+            interaction_request.get("service_tier").and_then(Value::as_str) == Some("flex");
         return gemini_interactions_stream_response(
             upstream,
             model,
             profile.file_name,
             request,
             continuations,
-            estimated_input_tokens,
-            profile.openai_capabilities.gemini_store,
+            GeminiInteractionsStreamOptions {
+                estimated_input_tokens,
+                store_interactions: profile.openai_capabilities.gemini_store,
+                flex_requested,
+            },
         );
     }
     let actual_service_tier = upstream
@@ -2410,10 +3303,11 @@ async fn forward_gemini_interactions_profile(
             )
         }
     };
-    let translated = match translate_gemini_interactions_response_with_service_tier(
+    let translated = match translate_gemini_interactions_response_for_request(
         &upstream_body,
         &model,
         actual_service_tier.as_deref(),
+        Some(&request),
     ) {
         Ok(value) => value,
         Err(message) => {

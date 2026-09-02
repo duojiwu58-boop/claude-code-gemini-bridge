@@ -59,6 +59,364 @@ fn image_generation_tool() -> Value {
     })
 }
 
+#[allow(dead_code)]
+#[cfg(any())]
+fn computer_start_tool() -> Value {
+    json!({
+        "name": "computer_start",
+        "title": "Start Gemini Computer Use",
+        "description": "Start either an isolated loopback browser or the desktop window explicitly selected by the user in Claude Bridge Manager, then return its initial screenshot.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "environment": {"type": "string", "enum": ["browser", "desktop"], "default": "browser"},
+                "local_url": {"type": "string", "description": "Initial http:// or https:// loopback URL; browser only."}
+            },
+            "additionalProperties": false
+        },
+        "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false}
+    })
+}
+
+#[allow(dead_code)]
+#[cfg(any())]
+fn computer_action_batch_tool() -> Value {
+    json!({
+        "name": "computer_action_batch",
+        "title": "Execute a Gemini Computer Use action batch",
+        "description": "Execute an authenticated batch of native Gemini UI calls strictly in order. Do not construct this input manually; it is emitted by the bridge from Gemini Computer Use output.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "protocol_version": {"type": "string", "const": COMPUTER_PROTOCOL_VERSION},
+                "session_id": {"type": "string"},
+                "batch_id": {"type": "string"},
+                "sequence": {"type": "integer", "minimum": 1},
+                "environment": {"type": "string", "enum": ["browser", "desktop"]},
+                "viewport": {"type": "object"},
+                "calls": {"type": "array", "minItems": 1, "items": {"type": "object"}}
+            },
+            "required": ["protocol_version", "session_id", "batch_id", "sequence", "environment", "viewport", "calls"],
+            "additionalProperties": false
+        },
+        "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": true, "openWorldHint": false}
+    })
+}
+
+#[allow(dead_code)]
+#[cfg(any())]
+fn computer_cancel_tool() -> Value {
+    json!({
+        "name": "computer_cancel",
+        "title": "Stop Gemini Computer Use",
+        "description": "Immediately stop the active isolated Computer Use session.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
+        "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
+    })
+}
+
+#[allow(dead_code)]
+#[cfg(any())]
+fn computer_loopback_url(value: &str) -> Result<String, String> {
+    let url = url::Url::parse(value).map_err(|error| format!("Invalid local_url: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https") || !url.host().is_some_and(|host| match host {
+        url::Host::Domain(name) => name.eq_ignore_ascii_case("localhost"),
+        url::Host::Ipv4(address) => address.is_loopback(),
+        url::Host::Ipv6(address) => address.is_loopback(),
+    }) {
+        return Err("Computer Use version 1 only permits http(s) loopback URLs (localhost, 127.0.0.1, or ::1)".to_string());
+    }
+    Ok(url.to_string())
+}
+
+#[allow(dead_code)]
+#[cfg(any())]
+fn computer_coordinate(arguments: &Map<String, Value>, name: &str) -> Result<u64, String> {
+    arguments.get(name).and_then(Value::as_u64).filter(|value| *value <= 999)
+        .ok_or_else(|| format!("Computer action field '{name}' must be an integer from 0 through 999"))
+}
+
+#[allow(dead_code)]
+#[cfg(any())]
+fn validate_computer_action(call: &Value, environment: &str) -> Result<(), String> {
+    let call_id = call.get("call_id").and_then(Value::as_str).filter(|value| !value.is_empty())
+        .ok_or_else(|| "Computer action call_id is required".to_string())?;
+    let name = call.get("name").and_then(Value::as_str).ok_or_else(|| format!("Computer action '{call_id}' has no name"))?;
+    let arguments = call.get("arguments").and_then(Value::as_object)
+        .ok_or_else(|| format!("Computer action '{call_id}' arguments must be an object"))?;
+    if arguments.get("intent").and_then(Value::as_str).is_none_or(|value| value.trim().is_empty()) {
+        return Err(format!("Computer action '{call_id}' is missing its Gemini intent"));
+    }
+    let coordinate_pair = |x: &str, y: &str| -> Result<(), String> {
+        computer_coordinate(arguments, x)?;
+        computer_coordinate(arguments, y)?;
+        Ok(())
+    };
+    match name {
+        "click" | "double_click" | "triple_click" | "middle_click" | "right_click"
+        | "mouse_down" | "mouse_up" | "move" => coordinate_pair("x", "y")?,
+        "type" => {
+            let text = arguments.get("text").and_then(Value::as_str).ok_or_else(|| "Computer type action requires text".to_string())?;
+            if text.encode_utf16().count() > 4_000 {
+                return Err("Computer type text exceeds the 4000 UTF-16 unit safety limit".to_string());
+            }
+            if arguments.get("press_enter").is_some_and(|value| !value.is_boolean()) {
+                return Err("Computer type press_enter must be boolean".to_string());
+            }
+        }
+        "drag_and_drop" => {
+            coordinate_pair("start_x", "start_y")?;
+            coordinate_pair("end_x", "end_y")?;
+        }
+        "wait" => {
+            if arguments.get("seconds").is_some_and(|value| value.as_u64().is_none_or(|seconds| seconds > 30)) {
+                return Err("Computer wait seconds must be an integer from 0 through 30".to_string());
+            }
+        }
+        "press_key" | "key_down" | "key_up" => {
+            arguments.get("key").and_then(Value::as_str).filter(|value| !value.is_empty())
+                .ok_or_else(|| format!("Computer {name} requires key"))?;
+        }
+        "hotkey" => {
+            arguments.get("keys").and_then(Value::as_array).filter(|keys| {
+                !keys.is_empty() && keys.iter().all(|key| key.as_str().is_some_and(|value| !value.is_empty()))
+            }).ok_or_else(|| "Computer hotkey requires a non-empty string array 'keys'".to_string())?;
+        }
+        "take_screenshot" | "go_back" | "go_forward" => {}
+        "scroll" => {
+            coordinate_pair("x", "y")?;
+            if !matches!(arguments.get("direction").and_then(Value::as_str), Some("up" | "down" | "left" | "right")) {
+                return Err("Computer scroll direction must be up, down, left, or right".to_string());
+            }
+            if arguments.get("magnitude_in_pixels").is_some_and(|value| value.as_u64().is_none_or(|pixels| pixels > 999)) {
+                return Err("Computer scroll magnitude_in_pixels must be an integer from 0 through 999".to_string());
+            }
+        }
+        "navigate" => {
+            let target = arguments.get("url").and_then(Value::as_str).ok_or_else(|| "Computer navigate requires url".to_string())?;
+            computer_loopback_url(target)?;
+        }
+        _ => return Err(format!("Unsupported Gemini Computer Use action '{name}'")),
+    }
+    if environment == "desktop" && matches!(name, "go_back" | "navigate" | "go_forward") {
+        return Err(format!("Gemini desktop environment does not support '{name}'"));
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+#[cfg(any())]
+fn computer_batch_requires_confirmation(calls: &[Value], current_url: Option<&str>) -> Result<Option<String>, String> {
+    let on_loopback = current_url.and_then(|value| url::Url::parse(value).ok()).is_some_and(|url| {
+        url.host().is_some_and(|host| match host {
+            url::Host::Domain(name) => name.eq_ignore_ascii_case("localhost"),
+            url::Host::Ipv4(address) => address.is_loopback(),
+            url::Host::Ipv6(address) => address.is_loopback(),
+        })
+    });
+    let mut reasons = Vec::new();
+    for call in calls {
+        let name = call.get("name").and_then(Value::as_str).unwrap_or("unknown");
+        let decision = call.pointer("/safety_decision/decision")
+            .or_else(|| call.pointer("/arguments/safety_decision/decision"))
+            .and_then(Value::as_str);
+        if decision == Some("blocked") {
+            return Err(format!("Gemini safety policy blocked Computer Use action '{name}'"));
+        }
+        if decision == Some("require_confirmation") {
+            let explanation = call.pointer("/safety_decision/explanation")
+                .or_else(|| call.pointer("/arguments/safety_decision/explanation"))
+                .and_then(Value::as_str).unwrap_or("Gemini requires confirmation");
+            reasons.push(format!("{name}: {explanation}"));
+            continue;
+        }
+        let locally_low_risk = matches!(name, "take_screenshot" | "wait" | "move")
+            || (on_loopback && matches!(name, "click" | "double_click" | "triple_click" | "scroll" | "go_back" | "go_forward"));
+        if !locally_low_risk {
+            reasons.push(format!("{name}: local policy requires a real user confirmation"));
+        }
+    }
+    Ok((!reasons.is_empty()).then(|| reasons.join("\n")))
+}
+
+#[allow(dead_code)]
+#[cfg(any())]
+fn computer_result_content(mut result: Value) -> Result<Value, String> {
+    let is_error = result.get("status").and_then(Value::as_str) != Some("success");
+    let result_object = result.as_object_mut().ok_or_else(|| "Computer Host returned a non-object result".to_string())?;
+    let mut screenshots = Vec::new();
+    if let Some(results) = result_object.get_mut("results").and_then(Value::as_array_mut) {
+        for item in results {
+            if let Some(screenshot) = item.get_mut("screenshot").and_then(Value::as_object_mut) {
+                if let Some(data) = screenshot.remove("data").and_then(|value| value.as_str().map(str::to_string)) {
+                    screenshot.insert("content_index".to_string(), json!(screenshots.len() + 1));
+                    screenshots.push(data);
+                }
+            }
+        }
+    }
+    if let Some(screenshot) = result_object.get_mut("screenshot").and_then(Value::as_object_mut) {
+        if let Some(data) = screenshot.remove("data").and_then(|value| value.as_str().map(str::to_string)) {
+            screenshot.insert("content_index".to_string(), json!(screenshots.len() + 1));
+            screenshots.push(data);
+        }
+    }
+    let text = serde_json::to_string(&result).map_err(|error| format!("Cannot serialize Computer Host result: {error}"))?;
+    let mut content = vec![json!({"type": "text", "text": text})];
+    content.extend(screenshots.into_iter().map(|data| json!({"type": "image", "data": data, "mimeType": "image/png"})));
+    Ok(json!({"content": content, "structuredContent": result, "isError": is_error}))
+}
+
+#[allow(dead_code)]
+#[cfg(any())]
+async fn mcp_computer_start(state: &AppState, arguments: Option<&Value>) -> Result<Value, String> {
+    let arguments = arguments.and_then(Value::as_object).ok_or_else(|| "computer_start arguments must be an object".to_string())?;
+    let environment = arguments.get("environment").and_then(Value::as_str).unwrap_or("browser");
+    if !matches!(environment, "browser" | "desktop") {
+        return Err("computer_start environment must be browser or desktop".to_string());
+    }
+    let (configured_url, selected_window) = {
+        let inner = state.computer.inner.lock().await;
+        (inner.default_local_url.clone(), inner.selected_window.clone())
+    };
+    let local_url = if environment == "browser" {
+        Some(computer_loopback_url(arguments.get("local_url").and_then(Value::as_str)
+            .or(configured_url.as_deref())
+            .ok_or_else(|| "computer_start requires local_url or a URL configured in the model center".to_string())?
+        )?)
+    } else { None };
+    let target_window = if environment == "desktop" {
+        Some(selected_window.ok_or_else(|| "Select a desktop window in Claude Bridge Manager before computer_start".to_string())?)
+    } else { None };
+    let target_hwnd = target_window.as_ref().and_then(|window| window.get("hwnd")).and_then(Value::as_str).map(str::to_string);
+    let session_id = format!("cus_{}", Uuid::new_v4().simple());
+    {
+        let mut inner = state.computer.inner.lock().await;
+        if inner.session.is_some() {
+            return Err("Only one Computer Use session may be active; cancel it before starting another".to_string());
+        }
+        inner.session = Some(ComputerSessionState {
+            session_id: session_id.clone(), environment: environment.to_string(), sequence: 0,
+            current_url: local_url.clone(),
+            window_title: target_window.as_ref().and_then(|window| window.get("title")).and_then(Value::as_str).map(str::to_string),
+            target_pid: target_window.as_ref().and_then(|window| window.get("pid")).and_then(Value::as_u64),
+            target_hwnd: target_hwnd.clone(), last_intent: None,
+            started_at: SystemTime::now(), last_activity: SystemTime::now(),
+        });
+    }
+    let command_id = format!("start:{session_id}");
+    let mut command = json!({
+        "protocol_version": COMPUTER_PROTOCOL_VERSION, "command_id": command_id,
+        "type": "start", "session_id": session_id, "environment": environment,
+        "viewport": {"width": 1440, "height": 900, "device_scale_factor": 1}
+    });
+    if let Some(local_url) = local_url { command["local_url"] = json!(local_url); }
+    if let Some(target_hwnd) = target_hwnd { command["target_hwnd"] = json!(target_hwnd); }
+    match submit_computer_command(state, command_id, command).await {
+        Ok(mut result) => {
+            if result.get("status").and_then(Value::as_str) != Some("success") {
+                let message = result.get("error").and_then(Value::as_str).unwrap_or("Computer Host failed to start Computer Use").to_string();
+                let mut inner = state.computer.inner.lock().await;
+                inner.session = None;
+                return Err(message);
+            }
+            result["kind"] = json!("computer_start_result");
+            result["protocol_version"] = json!(COMPUTER_PROTOCOL_VERSION);
+            result["session_id"] = json!(session_id);
+            result["sequence"] = json!(0);
+            computer_result_content(result)
+        }
+        Err(message) => {
+            let mut inner = state.computer.inner.lock().await;
+            inner.session = None;
+            Err(message)
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[cfg(any())]
+async fn mcp_computer_action_batch(state: &AppState, arguments: Option<&Value>) -> Result<Value, String> {
+    let arguments = arguments.and_then(Value::as_object).ok_or_else(|| "computer_action_batch arguments must be an object".to_string())?;
+    if arguments.get("protocol_version").and_then(Value::as_str) != Some(COMPUTER_PROTOCOL_VERSION) {
+        return Err("Unsupported Computer Use protocol_version".to_string());
+    }
+    let session_id = arguments.get("session_id").and_then(Value::as_str).filter(|value| !value.is_empty()).ok_or_else(|| "computer_action_batch requires session_id".to_string())?;
+    let batch_id = arguments.get("batch_id").and_then(Value::as_str).filter(|value| !value.is_empty()).ok_or_else(|| "computer_action_batch requires batch_id".to_string())?;
+    let sequence = arguments.get("sequence").and_then(Value::as_u64).ok_or_else(|| "computer_action_batch requires sequence".to_string())?;
+    let environment = arguments.get("environment").and_then(Value::as_str).ok_or_else(|| "computer_action_batch requires environment".to_string())?;
+    let calls = arguments.get("calls").and_then(Value::as_array).filter(|calls| !calls.is_empty()).ok_or_else(|| "computer_action_batch requires calls".to_string())?;
+    for call in calls { validate_computer_action(call, environment)?; }
+    let command_id = format!("batch:{session_id}:{batch_id}");
+    let (current_sequence, current_url, cached) = {
+        let inner = state.computer.inner.lock().await;
+        let session = inner.session.as_ref().filter(|session| session.session_id == session_id)
+            .ok_or_else(|| "Computer Use session is not active or session_id does not match".to_string())?;
+        if session.environment != environment { return Err("Computer Use environment does not match the active session".to_string()); }
+        (session.sequence, session.current_url.clone(), inner.completed.get(&command_id).cloned())
+    };
+    if let Some(mut result) = cached {
+        result["kind"] = json!("computer_action_batch_result");
+        result["protocol_version"] = json!(COMPUTER_PROTOCOL_VERSION);
+        result["session_id"] = json!(session_id);
+        result["batch_id"] = json!(batch_id);
+        result["sequence"] = json!(sequence);
+        return computer_result_content(result);
+    }
+    if sequence != current_sequence + 1 {
+        return Err(format!("Computer Use sequence must be {}, received {sequence}", current_sequence + 1));
+    }
+    if sequence > 50 {
+        return Err("Computer Use reached the 50-step safety limit".to_string());
+    }
+    {
+        let mut inner = state.computer.inner.lock().await;
+        if let Some(session) = inner.session.as_mut().filter(|session| session.session_id == session_id) {
+            if session.started_at.elapsed().unwrap_or_default() > Duration::from_secs(900) {
+                return Err("Computer Use session exceeded the 15-minute safety timeout".to_string());
+            }
+            session.last_intent = calls.last()
+                .and_then(|call| call.get("intent").or_else(|| call.pointer("/arguments/intent")))
+                .and_then(Value::as_str).map(str::to_string);
+        }
+    }
+    let confirmation_reason = computer_batch_requires_confirmation(calls, current_url.as_deref())?;
+    let mut approval_token = None;
+    if let Some(reason) = confirmation_reason {
+        approval_token = Some(await_computer_approval(state, session_id, batch_id, arguments.get("calls").unwrap(), reason).await?);
+    }
+    let mut command = Value::Object(arguments.clone());
+    command["command_id"] = json!(command_id);
+    command["type"] = json!("action_batch");
+    command["approved_by_user"] = json!(approval_token.is_some());
+    if let Some(token) = approval_token { command["approval_token"] = json!(token); }
+    let mut result = submit_computer_command(state, command_id, command).await?;
+    result["kind"] = json!("computer_action_batch_result");
+    result["protocol_version"] = json!(COMPUTER_PROTOCOL_VERSION);
+    result["session_id"] = json!(session_id);
+    result["batch_id"] = json!(batch_id);
+    result["sequence"] = json!(sequence);
+    if let Some(results) = result.get_mut("results").and_then(Value::as_array_mut) {
+        let approved = arguments.get("calls").and_then(Value::as_array).zip(Some(results)).map(|(calls, results)| {
+            for (call, item) in calls.iter().zip(results.iter_mut()) {
+                let required = call.pointer("/safety_decision/decision").or_else(|| call.pointer("/arguments/safety_decision/decision")).and_then(Value::as_str) == Some("require_confirmation");
+                if required && item.get("status").and_then(Value::as_str) == Some("success") {
+                    item["safety_acknowledgement"] = json!(true);
+                }
+            }
+        });
+        let _ = approved;
+    }
+    {
+        let mut inner = state.computer.inner.lock().await;
+        if let Some(session) = inner.session.as_mut().filter(|session| session.session_id == session_id) {
+            session.sequence = sequence;
+            session.last_activity = SystemTime::now();
+        }
+    }
+    computer_result_content(result)
+}
+
 fn mcp_tool_result(text: impl Into<String>, is_error: bool) -> Value {
     json!({
         "content": [{"type": "text", "text": text.into()}],

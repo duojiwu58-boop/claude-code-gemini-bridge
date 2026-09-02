@@ -39,6 +39,8 @@ struct GeminiInteractionsStreamTranslator {
     server_tools: InteractionServerToolTrace,
     interaction_annotations: Vec<Value>,
     service_tier: Option<String>,
+    computer_context: Option<ComputerConversationContext>,
+    native_computer_calls: Vec<Value>,
     completed: bool,
     finished: bool,
 }
@@ -52,6 +54,7 @@ impl GeminiInteractionsStreamTranslator {
         estimated_input_tokens: u64,
         store_interactions: bool,
     ) -> Self {
+        let computer_context = computer_conversation_context(&request);
         Self {
             message_id: format!("msg_{}", Uuid::new_v4().simple()),
             model,
@@ -72,6 +75,8 @@ impl GeminiInteractionsStreamTranslator {
             server_tools: InteractionServerToolTrace::default(),
             interaction_annotations: Vec::new(),
             service_tier: None,
+            computer_context,
+            native_computer_calls: Vec::new(),
             completed: false,
             finished: false,
         }
@@ -279,6 +284,13 @@ impl GeminiInteractionsStreamTranslator {
                 };
                 let mut arguments = String::new();
                 append_streamed_tool_arguments(&mut arguments, &initial_arguments)?;
+                if self.computer_context.as_ref().is_some_and(|context| is_gemini_computer_action(&name, &context.environment)) {
+                    self.active_blocks.insert(index, ActiveInteractionStreamingBlock {
+                        anthropic_index: usize::MAX,
+                        block: InteractionStreamingBlock::Tool { id, name, arguments },
+                    });
+                    return Ok(Vec::new());
+                }
                 (
                     InteractionStreamingBlock::Tool {
                         id: id.clone(),
@@ -517,10 +529,52 @@ impl GeminiInteractionsStreamTranslator {
                 merge_interaction_delta(&mut step, completed_step);
             }
             self.server_tools.capture(&step);
+            if let Some(block) = gemini_mcp_step_to_anthropic(&step) {
+                let anthropic_index = self.next_content_index;
+                self.next_content_index += 1;
+                self.assistant_content.push(block.clone());
+                let mut events = Vec::new();
+                push_anthropic_event(
+                    &mut events,
+                    "content_block_start",
+                    json!({
+                        "type": "content_block_start",
+                        "index": anthropic_index,
+                        "content_block": block
+                    }),
+                )?;
+                push_anthropic_event(
+                    &mut events,
+                    "content_block_stop",
+                    json!({"type": "content_block_stop", "index": anthropic_index}),
+                )?;
+                return Ok(events);
+            }
             return Ok(Vec::new());
         }
         if let Some(step) = event.get("step") {
             self.server_tools.capture(step);
+            if let Some(block) = gemini_mcp_step_to_anthropic(step) {
+                let anthropic_index = self.next_content_index;
+                self.next_content_index += 1;
+                self.assistant_content.push(block.clone());
+                let mut events = Vec::new();
+                push_anthropic_event(
+                    &mut events,
+                    "content_block_start",
+                    json!({
+                        "type": "content_block_start",
+                        "index": anthropic_index,
+                        "content_block": block
+                    }),
+                )?;
+                push_anthropic_event(
+                    &mut events,
+                    "content_block_stop",
+                    json!({"type": "content_block_stop", "index": anthropic_index}),
+                )?;
+                return Ok(events);
+            }
         }
         let Some(active) = self.active_blocks.shift_remove(&index) else {
             return Ok(Vec::new());
@@ -566,6 +620,12 @@ impl GeminiInteractionsStreamTranslator {
                 } else {
                     &arguments
                 })?;
+                if active.anthropic_index == usize::MAX {
+                    self.native_computer_calls.push(json!({
+                        "type": "function_call", "id": id, "name": name, "arguments": input
+                    }));
+                    return Ok(Vec::new());
+                }
                 if stop_only_arguments && !arguments.is_empty() {
                     push_anthropic_event(
                         &mut events,
@@ -631,15 +691,36 @@ impl GeminiInteractionsStreamTranslator {
                 "Gemini Interactions stream finished with status '{status}'"
             ));
         }
-        let interaction_id = self.interaction_id.as_deref().ok_or_else(|| {
+        let interaction_id = self.interaction_id.clone().ok_or_else(|| {
             "Gemini Interactions stream completed without an interaction id".to_string()
         })?;
+        let mut computer_batch_events = Vec::new();
+        if let Some((block, call)) = computer_batch_tool_block(&interaction_id, &self.request, &self.native_computer_calls) {
+            let index = self.next_content_index;
+            self.next_content_index += 1;
+            self.assistant_content.push(block.clone());
+            self.calls.push(call.clone());
+            if self.store_interactions {
+                remember_interaction_calls_in_memory(
+                    &self.continuations, &self.profile_file, &interaction_id, std::slice::from_ref(&call),
+                );
+            }
+            push_anthropic_event(&mut computer_batch_events, "content_block_start", json!({
+                "type": "content_block_start", "index": index,
+                "content_block": {"type": "tool_use", "id": block.get("id"), "name": block.get("name"), "input": {}}
+            }))?;
+            push_anthropic_event(&mut computer_batch_events, "content_block_delta", json!({
+                "type": "content_block_delta", "index": index,
+                "delta": {"type": "input_json_delta", "partial_json": block.get("input").cloned().unwrap_or_else(|| json!({})).to_string()}
+            }))?;
+            push_anthropic_event(&mut computer_batch_events, "content_block_stop", json!({"type": "content_block_stop", "index": index}))?;
+        }
         if self.store_interactions {
             remember_interaction_continuation(
                 &self.continuations,
                 &self.profile_file,
                 &self.request,
-                interaction_id,
+                &interaction_id,
                 &self.assistant_content,
                 &self.calls,
             );
@@ -647,6 +728,7 @@ impl GeminiInteractionsStreamTranslator {
         let stop_reason = interaction_stop_reason(status, !self.calls.is_empty());
         self.finished = true;
         let mut events = self.deferred_tool_batch_events.take().unwrap_or_default();
+        events.extend(computer_batch_events);
         let mut delta = json!({"stop_reason": stop_reason, "stop_sequence": Value::Null});
         if let Some(metadata) = self.server_tools.provider_metadata(
             &self.usage,
@@ -662,6 +744,7 @@ impl GeminiInteractionsStreamTranslator {
         if let Some(server_tool_use) = self.server_tools.anthropic_usage() {
             usage["server_tool_use"] = server_tool_use;
         }
+        attach_anthropic_inference_usage(&mut usage, self.service_tier.as_deref());
         push_anthropic_event(
             &mut events,
             "message_delta",
@@ -706,6 +789,7 @@ fn merge_interaction_delta(target: &mut Value, delta: &Value) {
 fn gemini_interactions_event_stream<S, B, E>(
     byte_stream: S,
     translator: GeminiInteractionsStreamTranslator,
+    idle_timeout: Duration,
 ) -> impl Stream<Item = Result<Event, Infallible>>
 where
     S: Stream<Item = Result<B, E>> + Send + 'static,
@@ -725,7 +809,7 @@ where
             initial_events,
             false,
         ),
-        |(mut byte_stream, mut decoder, mut translator, mut pending, mut ended)| async move {
+        move |(mut byte_stream, mut decoder, mut translator, mut pending, mut ended)| async move {
             loop {
                 if let Some(event) = pending.pop_front() {
                     return Some((
@@ -736,7 +820,7 @@ where
                 if ended {
                     return None;
                 }
-                match tokio::time::timeout(UPSTREAM_STREAM_IDLE_TIMEOUT, byte_stream.next()).await {
+                match tokio::time::timeout(idle_timeout, byte_stream.next()).await {
                     Ok(Some(Ok(bytes))) => match decoder.push_bytes(bytes.as_ref()) {
                         Ok(payloads) => {
                             for payload in payloads {
@@ -816,14 +900,19 @@ where
     )
 }
 
+struct GeminiInteractionsStreamOptions {
+    estimated_input_tokens: u64,
+    store_interactions: bool,
+    flex_requested: bool,
+}
+
 fn gemini_interactions_stream_response(
     upstream: reqwest::Response,
     model: String,
     profile_file: String,
     request: Value,
     continuations: Arc<InteractionContinuationState>,
-    estimated_input_tokens: u64,
-    store_interactions: bool,
+    options: GeminiInteractionsStreamOptions,
 ) -> Response {
     let actual_service_tier = upstream
         .headers()
@@ -836,11 +925,18 @@ fn gemini_interactions_stream_response(
         profile_file,
         request,
         continuations,
-        estimated_input_tokens,
-        store_interactions,
+        options.estimated_input_tokens,
+        options.store_interactions,
     );
+    let actual_flex = actual_service_tier.as_deref() == Some("flex");
     translator.service_tier = actual_service_tier;
-    let event_stream = gemini_interactions_event_stream(upstream.bytes_stream(), translator);
+    let idle_timeout = if options.flex_requested || actual_flex {
+        GEMINI_FLEX_STREAM_IDLE_TIMEOUT
+    } else {
+        UPSTREAM_STREAM_IDLE_TIMEOUT
+    };
+    let event_stream =
+        gemini_interactions_event_stream(upstream.bytes_stream(), translator, idle_timeout);
     Sse::new(event_stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response()

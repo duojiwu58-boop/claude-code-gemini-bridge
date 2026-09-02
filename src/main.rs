@@ -74,15 +74,18 @@ const MAX_STREAMED_TOOL_ARGUMENT_BYTES: usize = 8 * 1024 * 1024;
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const UPSTREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const UPSTREAM_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+const GEMINI_FLEX_REQUEST_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+const GEMINI_FLEX_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 const BRIDGE_IDENTITY_MARKER: &str = "<bridge_runtime_identity>";
 const MAX_UPSTREAM_IDENTITY_CHARS: usize = 200;
-const DEFAULT_GEMINI_MODEL: &str = "gemini-3.7-flash";
+const DEFAULT_GEMINI_MODEL: &str = "gemini-3.8-flash";
 const DEFAULT_IMAGE_MODEL: &str = "gemini-3.1-flash-image";
 const DEFAULT_IMAGE_UPSTREAM: &str =
     "https://generativelanguage.googleapis.com/v1beta/interactions";
 const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
+const COMPUTER_PROTOCOL_VERSION: &str = "gemini-computer-v1";
 // Identity phrases Claude Code injects into system prompts. These are matched
 // as phrases/patterns rather than whole declarations so that subagent persona
 // variants ("You are a file search specialist for Claude Code, ...", "You are
@@ -108,6 +111,7 @@ type InteractionContinuationState = RwLock<InteractionContinuationCache>;
 include!("core.rs");
 include!("runtime.rs");
 include!("provider.rs");
+include!("computer.rs");
 include!("mcp.rs");
 include!("vision.rs");
 include!("admin.rs");

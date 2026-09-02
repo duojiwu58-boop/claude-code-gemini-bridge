@@ -13,7 +13,7 @@ $headers = New-BridgeAuthorizationHeaders -Token $localAuthToken
 $headers['Content-Type'] = 'application/json'
 
 $body = @{
-    model = 'gemini-3.7-flash'
+    model = 'gemini-3.8-flash'
     input = 'Reply with exactly OK.'
     stream = $true
     reasoning = @{

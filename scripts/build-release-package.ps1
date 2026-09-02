@@ -1,5 +1,5 @@
-﻿param(
-    [string]$Version = '0.7.2'
+param(
+    [string]$Version = '0.8.0'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -8,6 +8,7 @@ $projectDir = Split-Path -Parent $PSScriptRoot
 $packageTemplateDir = Join-Path $projectDir 'packaging\windows-x64'
 $buildTargetDir = Join-Path $projectDir 'target\package-build'
 $builtExe = Join-Path $buildTargetDir 'x86_64-pc-windows-msvc\release\claude-bridge.exe'
+$computerHostExe = Join-Path $buildTargetDir 'x86_64-pc-windows-msvc\release\claude-computer-host.exe'
 $guiExe = Join-Path $projectDir 'ClaudeBridgeManager.exe'
 $appIcon = Join-Path `
     $projectDir `
@@ -15,6 +16,7 @@ $appIcon = Join-Path `
 $settingsTemplate = Join-Path $projectDir 'claude-settings.example.json'
 $bridgeSettingsTemplate = Join-Path $projectDir 'claude-settings.bridge.json'
 $providerGuide = Join-Path $projectDir 'PROVIDER_CONFIG.md'
+$computerUseGuide = Join-Path $projectDir 'COMPUTER_USE.md'
 $readmeEnglish = Join-Path $projectDir 'README.md'
 $readmeChinese = Join-Path $projectDir 'README.zh-CN.md'
 $changelog = Join-Path $projectDir 'CHANGELOG.md'
@@ -35,6 +37,7 @@ foreach ($requiredPath in @(
     $settingsTemplate
     $bridgeSettingsTemplate
     $providerGuide
+    $computerUseGuide
     $readmeEnglish
     $readmeChinese
     $changelog
@@ -77,6 +80,9 @@ if ($LASTEXITCODE -ne 0) {
 if (-not (Test-Path -LiteralPath $builtExe -PathType Leaf)) {
     throw "Package executable was not produced: $builtExe"
 }
+if (-not (Test-Path -LiteralPath $computerHostExe -PathType Leaf)) {
+    throw "Computer Host executable was not produced: $computerHostExe"
+}
 
 New-Item -ItemType Directory -Path $distDir -Force | Out-Null
 if (Test-Path -LiteralPath $stagingDir) {
@@ -98,6 +104,9 @@ Copy-Item `
     -LiteralPath $builtExe `
     -Destination (Join-Path $stagingDir 'claude-bridge.exe')
 Copy-Item `
+    -LiteralPath $computerHostExe `
+    -Destination (Join-Path $stagingDir 'claude-computer-host.exe')
+Copy-Item `
     -LiteralPath $guiExe `
     -Destination (Join-Path $stagingDir 'ClaudeBridgeManager.exe')
 Copy-Item `
@@ -112,6 +121,9 @@ Copy-Item `
 Copy-Item `
     -LiteralPath $providerGuide `
     -Destination (Join-Path $stagingDir 'PROVIDER_CONFIG.md')
+Copy-Item `
+    -LiteralPath $computerUseGuide `
+    -Destination (Join-Path $stagingDir 'COMPUTER_USE.md')
 Copy-Item `
     -LiteralPath $readmeEnglish `
     -Destination (Join-Path $stagingDir 'README.md')
@@ -162,7 +174,7 @@ Compress-Archive -LiteralPath $stagingDir -DestinationPath $zipPath -Compression
 $innoCandidates = @(
     (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe')
     (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
-    'E:\Program Files (x86)\Inno Setup 5\ISCC.exe'
+    (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe')
 )
 $iscc = $innoCandidates |
     Where-Object {

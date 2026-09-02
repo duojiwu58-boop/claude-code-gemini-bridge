@@ -358,14 +358,18 @@ fn capability_gemini_builtin_tools(
         return values
             .iter()
             .map(|value| {
-                let tool = if let Some(tool_type) = value.as_str() {
+                let mut tool = if let Some(tool_type) = value.as_str() {
                     let tool_type = tool_type.trim();
                     if tool_type.is_empty() {
                         return Err(format!(
                             "Provider profile '{file_name}' capability '{name}' contains an empty tool type"
                         ));
                     }
-                    json!({"type": tool_type})
+                    if tool_type == "computer_use" {
+                        json!({"type": tool_type, "environment": "browser", "enable_prompt_injection_detection": true})
+                    } else {
+                        json!({"type": tool_type})
+                    }
                 } else {
                     value.clone()
                 };
@@ -386,10 +390,24 @@ fn capability_gemini_builtin_tools(
                         | "code_execution"
                         | "google_maps"
                         | "file_search"
+                        | "computer_use"
                 ) {
                     return Err(format!(
-                        "Provider profile '{file_name}' capability '{name}' contains unsupported tool '{tool_type}' (expected google_search, url_context, code_execution, google_maps, or file_search)"
+                        "Provider profile '{file_name}' capability '{name}' contains unsupported tool '{tool_type}' (expected google_search, url_context, code_execution, google_maps, file_search, or computer_use)"
                     ));
+                }
+                if tool_type == "computer_use" {
+                    let environment = tool.get("environment").and_then(Value::as_str).unwrap_or("browser");
+                    if !matches!(environment, "browser" | "desktop") {
+                        return Err(format!("Provider profile '{file_name}' Computer Use environment must be browser or desktop"));
+                    }
+                    if tool.get("enable_prompt_injection_detection").and_then(Value::as_bool) != Some(true) {
+                        return Err(format!("Provider profile '{file_name}' Computer Use must set enable_prompt_injection_detection to true"));
+                    }
+                    if tool.get("disabled_safety_policies").is_some() {
+                        return Err(format!("Provider profile '{file_name}' may not set disabled_safety_policies in the Computer Use MVP"));
+                    }
+                    tool["enable_prompt_injection_detection"] = json!(true);
                 }
                 Ok(tool)
             })
@@ -809,10 +827,10 @@ fn parse_openai_capabilities_with_defaults(
     )?;
     if gemini_service_tier
         .as_deref()
-        .is_some_and(|tier| !matches!(tier, "standard" | "priority" | "flex"))
+        .is_some_and(|tier| !matches!(tier, "auto" | "standard" | "priority" | "flex"))
     {
         return Err(format!(
-            "Provider profile '{file_name}' capability 'gemini_service_tier' has an unsupported value (expected standard, priority, or flex)"
+            "Provider profile '{file_name}' capability 'gemini_service_tier' has an unsupported value (expected auto, standard, priority, or flex)"
         ));
     }
     let gemini_tool_choice_override = capability_string(

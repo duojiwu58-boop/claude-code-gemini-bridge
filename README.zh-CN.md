@@ -8,6 +8,8 @@
 
 以 Claude Code 作为稳定的编码智能体入口，同时在后端选用 Gemini、DeepSeek、Qwen、Kimi、OpenRouter Claude 或其他兼容模型。桥接器保留真实 Claude Code 任务所依赖的推理、流式输出、工具、状态、用量和错误语义，而不是把所有提供商压缩成“HTTP 200 加一段文本”。
 
+> **v0.8.0 重大升级：** 本运行时已针对 **Gemini 3.8 Flash 新提供的原生 Computer Use 能力**完成 Claude Code 深度适配。Gemini 决定动作，Claude Code 托管本地 stdio MCP 生命周期，Windows 用户态 Host 执行截图与输入；不需要打开模型中心，不调用第二个模型，也不需要手动启动 Host。
+
 本项目不是一层简单的请求格式转换器，而是围绕三项职责构建：
 
 - **语义适配：** 将 Claude Code 生命周期映射到各提供商所能安全承载的最丰富协议。
@@ -29,7 +31,7 @@
 | 能力 | 状态 | 当前行为 |
 | --- | --- | --- |
 | 文本、系统指令与 SSE | **已实测** | 普通与流式 Claude Code 对话均保留消息生命周期和终止错误 |
-| Thinking 与推理控制 | **已实测** | 按提供商映射 effort/budget；Gemini 3.7 提供 Low/Medium/High，并保持签名思维连续性 |
+| Thinking 与推理控制 | **已实测** | 按提供商映射 effort/budget；Gemini Flash 3.7 及更高版本提供 Low/Medium/High，并保持签名思维连续性 |
 | Claude Code 本地工具 | **已实测** | 函数声明、流式参数、工具结果、失败及后续推理均可完整往返 |
 | 并行客户端工具 | **已实测** | Gemini 调用会保留到终态 `requires_action`；真实 Claude Code 验证过多个独立只读 `Grep` 重叠执行 |
 | 结构化输出 | **已实测** | 转换 JSON Schema，仅在必要时净化；契约无法表达时明确拒绝 |
@@ -37,9 +39,11 @@
 | Token 计数、用量与缓存 | **已实测** | 可用时调用原生计数端点；如实映射输入、输出、推理、缓存和服务端工具用量，不虚构命中 |
 | Gemini 服务端工具 | **已实测 / 按需启用** | Google Search、URL Context、Code Execution 已实测；Maps 和已配置的 File Search 查询按需启用 |
 | 图片生成 | **已实测** | `generate_image` MCP 默认委托 `gemini-3.1-flash-image`，返回预览和保存路径 |
-| Remote MCP、Kimi Formula、Flex/Priority | **按需启用** | 已实现校验和脱敏，未显式配置时关闭 |
+| Remote MCP、Kimi Formula、Flex/Priority | **按需启用** | profile 与 Claude 请求级 MCP connector 均可映射为 Gemini Remote MCP，并保留校验、脱敏、allowlist 和响应块转换 |
+| Claude Bash/Text Editor/Memory 声明 | **已实测** | schema-less 客户端声明会展开为 Gemini 可调用的带 schema 函数，仍由 Claude Code 执行；tool-search 声明改为立即暴露函数 |
 | Claude Code 向 Gemini 输入音频/视频 | **不在范围** | Gemini 支持这些模态，但当前 Anthropic Messages 入口没有音频/视频块映射 |
-| Computer Use、Files/Batch/store 管理、Live/后台 API | **不在范围** | 需要客户端执行器或平台管理界面，不属于这个本地编码桥接器暴露的能力 |
+| Gemini 3.8 Flash Computer Use（Windows） | **已实测** | Gemini 3.8 Flash 原生动作会转换给 Claude Code 自动托管的 `gemini-computer` stdio MCP；Browser 和 Desktop 均已完成真实链路验证 |
+| Files/Batch/store 管理、Live/后台 API | **不在范围** | 保留清晰边界，不隐式启动额外服务或模型 |
 
 “能调用”不等于“深度适配”。通用兼容提供商只会收到其真实 API 和显式 profile 能承载的语义。
 
@@ -60,11 +64,12 @@
        Anthropic Messages                    ├─ Claude Code 本地工具
        Gemini Interactions                   ├─ Google 服务端工具
        OpenAI Responses                      ├─ Gemini Remote MCP
-       OpenAI Chat 回退                      └─ 桥接器 MCP 扩展
+       OpenAI Chat 回退                      ├─ 桥接器 MCP 扩展
+                                             └─ Gemini Computer Host
                      │                               │
                      ▼                               ▼
        Gemini · DeepSeek · Qwen · Kimi          专用执行器
-          OpenRouter Claude · 其他          Gemini Image · Kimi Formula
+          OpenRouter Claude · 其他       Gemini Image · Kimi Formula · Windows Host
 ```
 
 桥接器选择已配置且语义损失最小的传输，而不是把所有模型压到统一的最低公分母：
@@ -82,7 +87,7 @@
 
 从 [GitHub Releases](https://github.com/duojiwu58-boop/claude-code-multi-model-agent-runtime/releases/latest) 下载：
 
-- `ClaudeCodeBridge-<version>-Setup.exe`：推荐；安装服务、模型中心、开始菜单入口、`gemini-image` MCP 注册和卸载器。
+- `ClaudeCodeBridge-<version>-Setup.exe`：推荐；安装服务、模型中心、开始菜单入口、`gemini-image` HTTP MCP、`gemini-computer` stdio MCP 注册和卸载器。
 - `ClaudeCodeBridge-<version>-windows-x64.zip`：完整解压后运行 `Install.cmd`。
 
 安装器会创建自动启动的 Windows 服务 `ClaudeCodeBridge`，并将 Claude Code 指向：
@@ -121,7 +126,7 @@ http://127.0.0.1:18787
 - [通用 OpenAI 兼容提供商](examples/providers/custom-openai.example.json)
 - [能力覆盖配置](examples/providers/capability-overrides.example.json)
 
-打开 **Claude Code 模型中心**，选择 **重新加载配置**，再选择模型。下一次请求立即使用新模型，无需重启 VS Code、Claude Code 或服务。当前 Gemini 3.7 Interactions profile 还提供可热切换的 **Low / Medium / High** Thinking 控件。
+打开 **Claude Code 模型中心**，选择 **重新加载配置**，再选择模型。下一次请求立即使用新模型，无需重启 VS Code、Claude Code 或服务。当前 Gemini 3.7 及更高版本 Flash Interactions profile 还提供可热切换的 **Low / Medium / High** Thinking 控件。
 
 ### 3. 验证
 
@@ -135,7 +140,7 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:18787/health'
 
 | 模型 | 推荐路径 | 已适配能力 |
 | --- | --- | --- |
-| **Gemini 3.7 Flash** | `gemini-interactions` | 当前 step 型 SSE、Low/Medium/High Thinking、终态批量并行客户端调用、精确 stored continuation、1M 上下文、图片/PDF、结构化输出、原生 Token 计数、详细用量/缓存/服务层、Google 工具、可选原生 Remote MCP |
+| **Gemini 3.8 Flash** | `gemini-interactions` | 当前 step 型 SSE、Low/Medium/High Thinking、终态批量并行客户端调用、精确 stored continuation、1M 上下文、图片/PDF、结构化输出、原生 Token 计数、详细用量/缓存/服务层、Google 工具、可选原生 Remote MCP |
 | **DeepSeek V4 Flash / Pro** | 可用时使用 `anthropic` | 最小化 Claude 契约转换、按提供商处理 disabled/high/max 推理、工具轮推理回放、输出余量保护；保留 Responses/Chat 回退 |
 | **Qwen3.8 Max** | `anthropic` 或经验证的 `openai-responses` | 有意义的 effort 档位、有界普通推理、精确 Responses 续接、DashScope 会话缓存、结构化输出、用量与延迟诊断 |
 | **Kimi K3** | `anthropic` | Bearer 鉴权、已验证模型 ID、1M 上下文元数据、原生 Token 估算和缓存用量；Chat 推理回放及按需 Kimi Formula 工具 |
@@ -144,11 +149,17 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:18787/health'
 
 模型 ID、区域端点、配额、价格和提供商行为都可能变化。修改已验证模板前，请查看[提供商配置指南](PROVIDER_CONFIG.md)和[更新日志](CHANGELOG.md)。
 
-## Gemini 3.7 Flash：本地开发基线
+## Gemini 3.8 Flash：本地开发基线
 
 `standard` 服务层上的原生 `gemini-interactions` 路径足以完成常规仓库开发：读取、搜索、编辑、构建、测试、调试和审查。已验证链路包括文本/SSE、系统指令、签名 Thinking、本地工具及精确工具结果续接、结构化 JSON、图片/PDF、原生 Token 计数、有状态会话、隐式缓存报告和服务端工具用量。
 
-Gemini 3.7 Flash 支持 1,048,576 Token 输入窗口和最多 65,536 输出 Token。要暴露完整输出上限，请同时把 profile 的 `max_output_tokens` 和 Claude Code 的 `CLAUDE_CODE_MAX_OUTPUT_TOKENS` 设为 `65536`。隐式缓存命中由 Google 控制，不能保证发生；只有上游报告命中时，桥接器才会记录。
+Claude 最新版本化服务端工具会按请求自动映射：`web_search_*` → `google_search`、
+`web_fetch_*` → `url_context`、`code_execution_*` → `code_execution`，并与 profile 工具去重。
+Anthropic 独有的域名、缓存和调用次数控制若无 Gemini 等价字段，会产生明确诊断。profile 服务层设为
+`auto` 时，Claude `speed: "fast"` 映射为 Gemini Priority，实际 tier/speed 写回 usage；Flex 的非流式总等待
+和流式空闲等待均扩展到 20 分钟。
+
+Gemini 3.8 Flash 支持 1,048,576 Token 输入窗口和最多 65,536 输出 Token。Thinking 只接受 `low`、`medium`、`high`，Google 默认使用 `medium`。要暴露完整输出上限，请同时把 profile 的 `max_output_tokens` 和 Claude Code 的 `CLAUDE_CODE_MAX_OUTPUT_TOKENS` 设为 `65536`。隐式缓存命中由 Google 控制，不能保证发生；只有上游报告命中时，桥接器才会记录。
 
 ### 并行工具调用
 
@@ -158,10 +169,10 @@ Gemini Interactions 可以在一轮内产生多个客户端函数调用。桥接
 
 ### 图片生成是显式的多模型执行
 
-Gemini 3.7 Flash 在这条路由上不会原生输出图片。当前安装链路是：
+Gemini 3.8 Flash 在这条路由上不会原生输出图片。当前安装链路是：
 
 ```text
-Gemini 3.7 Flash（推理并选择工具）
+Gemini 3.8 Flash（推理并选择工具）
         │
         ▼
 Claude Code 通过带鉴权的回环 MCP 调用 generate_image
@@ -179,7 +190,9 @@ MCP 返回预览 + MIME 类型 + 实际执行模型 + 保存路径
 
 普通本地开发**不需要** Google Maps、File Search store、Remote MCP、Flex 或 Priority。只有任务确实需要托管 RAG、外部系统、地理上下文或不同服务层时才启用。Google Search、URL Context、Code Execution、Maps、已配置的 File Search 查询和 Remote MCP 都可能增加数据流、资源要求或费用。
 
-当前本地开发范围有意排除旧版 `generateContent` 传输、显式 `cachedContents`、File Search store 创建/本地目录同步、独立 Files/Batch 管理、Live API 会话、后台 Interaction 管理和 Computer Use 执行器。Gemini 模型支持音频/视频输入，但当前 Claude Code Messages 入口尚未映射。
+Claude 请求级 `mcp_servers` 及其匹配的 `mcp_toolset` 会转换为 Gemini Remote MCP：Bearer token 转为脱敏 Authorization header，带连字符的 server 名会规范化为 Gemini 接受的下划线，allowlist 会保留；Gemini 无法执行的 denylist 会明确报错。Gemini 返回的 MCP 调用与结果在普通和流式响应中都会还原成 Claude `mcp_tool_use`/`mcp_tool_result` 块。此路径仅支持 Streamable HTTP，不支持 Anthropic 的 SSE MCP transport。
+
+当前本地开发范围有意排除旧版 `generateContent` 传输、显式 `cachedContents`、File Search store 创建/本地目录同步、独立 Files/Batch 管理、Live API 会话和后台 Interaction 管理。Windows x64 已提供 Gemini Computer Use：安装器把独立用户态 Host 注册为 Claude Code 的本地 stdio MCP Server，由 Claude Code 自动拉起、调度和停止；Windows 服务只做 API 与工具协议对齐，模型中心不在执行链路中。Browser 支持隔离的 1440×900 浏览器、全部 20 个浏览器动作和仅 localhost 导航；Desktop 在 `computer_start` 时按需弹出真实用户选窗，支持 Windows Graphics Capture、SendInput 的 17 个动作、PerMonitorV2/多屏坐标、HWND+PID 范围约束以及提权/敏感窗口阻止。两种环境均提供逐动作 PNG、顺序幂等批次和 Host 一次性安全确认。详见 [Gemini Computer Use](COMPUTER_USE.md)。Gemini 模型支持音频/视频输入，但当前 Claude Code Messages 入口尚未映射。
 
 ## 跨模型扩展
 
@@ -200,9 +213,11 @@ MCP 返回预览 + MIME 类型 + 实际执行模型 + 保存路径
 ### MCP 与服务端工具
 
 - `gemini-image`：由安装器管理的本地 MCP 图片生成，提供预览和安全文件落盘。
+- `gemini-computer`：由安装器管理的本地 stdio MCP Computer Use 执行器，由 Claude Code 自动拉起和停止。
 - Kimi Formula：只暴露显式 allowlist 中的官方 Formula URI；默认列表为空。
 - Gemini 服务端工具：`google_search`、`url_context`、`code_execution`、`google_maps` 和已配置的 File Search 查询。
 - Gemini 原生 Remote MCP：经校验的 HTTPS Streamable HTTP 服务，Authorization 值会脱敏，并可限制工具 allowlist。
+- Claude 请求级 MCP connector：转换成 Gemini 原生 Remote MCP，普通与流式 MCP 结果会还原为 Claude 协议块。
 
 ### 按模型设置推理策略
 
@@ -217,7 +232,7 @@ Windows 发行版按本地服务设计，而不是一个无鉴权的局域网代
 - Messages、Responses、Token 计数、MCP 和所有 `/admin/*` 路由都要求 Bearer 鉴权；`/health` 和 `/v1/models` 仅保留为本地诊断。
 - 本地 Token 永远不会被复用为上游提供商凭据。
 - 提供商 Key 可以存放在受保护的服务凭据文件、profile 或服务可见的 `api_key_env` 中；不要提交或分享真实 Key。
-- 图片 MCP 校验本地 Origin，限制 Prompt、响应、解码体积和总时长，校验 MIME，且永不接受模型指定的输出路径。
+- 图片 MCP 校验本地 Origin，限制 Prompt、响应、解码体积和总时长，校验 MIME，且永不接受模型指定的输出路径。Computer Host 不监听端口、不读取桥接令牌，也不调用第二个模型。
 - 有状态上游 API 可能保留会话。启用前请评估各提供商的数据保留和隐私政策。
 - Vision Proxy、图片生成、服务端工具、Remote MCP 和高级服务层可能产生额外调用、费用和外部数据流。
 
@@ -250,7 +265,7 @@ Windows 发行版按本地服务设计，而不是一个无鉴权的局域网代
 7. 鉴权、限流、过载、上下文上限、拒绝、取消和异常流终止。
 8. 官方契约请求/响应/流式 fixture、回归测试，以及客户端边界相关的真实客户端验收。
 
-当前锁定的 Rust 测试套件包含 204 项通过测试。关键路径还会经过真实 Windows 服务和 VS Code Claude Code 客户端验证；仅仅 mock 成功不视为端到端兼容。
+当前锁定的 Rust 测试套件包含 225 项桥接器测试和 3 项 Computer Host 测试，全部通过。关键路径还会经过真实 Windows 服务和 VS Code Claude Code 客户端验证；仅仅 mock 成功不视为端到端兼容。
 
 ## 从源码构建
 
