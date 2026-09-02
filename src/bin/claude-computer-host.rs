@@ -3,9 +3,10 @@ use std::{
     env, fs,
     io::{self, BufRead, Write},
     net::TcpListener,
-    path::PathBuf,
+    os::windows::io::AsRawHandle,
+    path::{Path, PathBuf},
     process::{Child, Command},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -16,6 +17,17 @@ use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use uuid::Uuid;
+use windows::{
+    core::{Owned, PCWSTR},
+    Win32::{
+        Foundation::HANDLE,
+        System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        },
+    },
+};
 
 #[path = "../computer_desktop.rs"]
 mod computer_desktop;
@@ -26,13 +38,18 @@ const VIEWPORT_HEIGHT: u64 = 900;
 const MAX_SCREENSHOT_BYTES: usize = 8 * 1024 * 1024;
 const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 const MAX_COMPLETED_BATCHES: usize = 128;
+const ORPHAN_PROFILE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const ENVIRONMENT_STATE_RETRIES: usize = 3;
+const ENVIRONMENT_STATE_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 struct BrowserSession {
     child: Child,
+    job: Option<Owned<HANDLE>>,
     port: u16,
     websocket_url: String,
     target_pid: Option<u64>,
     session_id: String,
+    profile_dir: PathBuf,
     last_allowed_url: String,
     held_keys: HashSet<String>,
 }
@@ -118,13 +135,49 @@ fn find_browser() -> Result<PathBuf, String> {
         .ok_or_else(|| "Microsoft Edge or Google Chrome was not found".to_string())
 }
 
-fn isolated_profile_dir(session_id: &str) -> Result<PathBuf, String> {
+fn browser_profiles_root() -> Result<PathBuf, String> {
     let root = env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .ok_or_else(|| "LOCALAPPDATA is unavailable".to_string())?;
-    let path = root
-        .join(r"ClaudeCodeBridge\ComputerHost\BrowserProfiles")
-        .join(session_id);
+    Ok(root.join(r"ClaudeCodeBridge\ComputerHost\BrowserProfiles"))
+}
+
+fn cleanup_orphaned_profiles(root: &Path) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_stale_directory = entry
+            .file_type()
+            .ok()
+            .filter(|kind| kind.is_dir())
+            .and_then(|_| entry.metadata().ok())
+            .and_then(|metadata| metadata.created().ok())
+            .and_then(|created| now.duration_since(created).ok())
+            .is_some_and(|age| age > ORPHAN_PROFILE_MAX_AGE);
+        if is_stale_directory {
+            if let Err(error) = fs::remove_dir_all(&path) {
+                eprintln!(
+                    "Computer Host could not remove stale browser profile '{}': {error}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+fn isolated_profile_dir(session_id: &str) -> Result<PathBuf, String> {
+    let root = browser_profiles_root()?;
+    fs::create_dir_all(&root).map_err(|error| {
+        format!(
+            "Cannot create browser profile root '{}': {error}",
+            root.display()
+        )
+    })?;
+    cleanup_orphaned_profiles(&root);
+    let path = root.join(session_id);
     fs::create_dir_all(&path).map_err(|error| {
         format!(
             "Cannot create isolated browser profile '{}': {error}",
@@ -132,6 +185,69 @@ fn isolated_profile_dir(session_id: &str) -> Result<PathBuf, String> {
         )
     })?;
     Ok(path)
+}
+
+fn browser_job() -> Result<Owned<HANDLE>, String> {
+    let job = unsafe { CreateJobObjectW(None, PCWSTR::null()) }
+        .map_err(|error| format!("Cannot create browser Job Object: {error}"))?;
+    let job = unsafe { Owned::new(job) };
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    unsafe {
+        SetInformationJobObject(
+            *job,
+            JobObjectExtendedLimitInformation,
+            (&raw const limits).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    }
+    .map_err(|error| format!("Cannot configure browser Job Object: {error}"))?;
+    Ok(job)
+}
+
+fn assign_browser_to_job(job: &Owned<HANDLE>, child: &Child) -> Result<(), String> {
+    let process = HANDLE(child.as_raw_handle());
+    unsafe { AssignProcessToJobObject(**job, process) }
+        .map_err(|error| format!("Cannot assign browser process to Job Object: {error}"))
+}
+
+async fn remove_profile_dir(path: &Path) {
+    let expected_parent = match browser_profiles_root() {
+        Ok(root) => root,
+        Err(error) => {
+            eprintln!("Computer Host cannot validate browser profile cleanup: {error}");
+            return;
+        }
+    };
+    if path.parent() != Some(expected_parent.as_path()) {
+        eprintln!(
+            "Computer Host refused to remove unexpected browser profile '{}': parent mismatch",
+            path.display()
+        );
+        return;
+    }
+    for attempt in 0..=5 {
+        match fs::remove_dir_all(path) {
+            Ok(()) => return,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+            Err(error) if attempt < 5 => {
+                tokio::time::sleep(Duration::from_millis(100 * (attempt + 1) as u64)).await;
+                if attempt == 4 {
+                    eprintln!(
+                        "Computer Host is still waiting to remove browser profile '{}': {error}",
+                        path.display()
+                    );
+                }
+            }
+            Err(error) => {
+                eprintln!(
+                    "Computer Host could not remove browser profile '{}': {error}",
+                    path.display()
+                );
+                return;
+            }
+        }
+    }
 }
 
 fn unused_loopback_port() -> Result<u16, String> {
@@ -212,9 +328,10 @@ async fn start_browser(
         return Err("Computer Host refuses a non-loopback initial URL".to_string());
     }
     let browser = find_browser()?;
-    let profile = isolated_profile_dir(session_id)?;
     let port = unused_loopback_port()?;
-    let child = Command::new(&browser)
+    let job = browser_job()?;
+    let profile = isolated_profile_dir(session_id)?;
+    let mut child = match Command::new(&browser)
         .args([
             format!("--remote-debugging-port={port}"),
             format!("--user-data-dir={}", profile.display()),
@@ -230,27 +347,42 @@ async fn start_browser(
             "about:blank".to_string(),
         ])
         .spawn()
-        .map_err(|error| {
-            format!(
+    {
+        Ok(child) => child,
+        Err(error) => {
+            let message = format!(
                 "Cannot start isolated browser '{}': {error}",
                 browser.display()
-            )
-        })?;
+            );
+            remove_profile_dir(&profile).await;
+            return Err(message);
+        }
+    };
+    if let Err(error) = assign_browser_to_job(&job, &child) {
+        let _ = child.kill();
+        let _ = child.wait();
+        remove_profile_dir(&profile).await;
+        return Err(error);
+    }
     let websocket_url = match browser_target(client, port).await {
         Ok(value) => value,
         Err(error) => {
-            let mut child = child;
+            drop(job);
             let _ = child.kill();
+            let _ = child.wait();
+            remove_profile_dir(&profile).await;
             return Err(error);
         }
     };
     let target_pid = browser_process_id(client, port).await;
     let mut session = BrowserSession {
         child,
+        job: Some(job),
         port,
         websocket_url,
         target_pid,
         session_id: session_id.to_string(),
+        profile_dir: profile,
         last_allowed_url: initial_url.to_string(),
         held_keys: HashSet::new(),
     };
@@ -290,8 +422,10 @@ impl BrowserSession {
         if let Ok(mut cdp) = self.connect(client).await {
             let _ = cdp.call("Browser.close", json!({})).await;
         }
+        drop(self.job.take());
         let _ = self.child.kill();
         let _ = self.child.wait();
+        remove_profile_dir(&self.profile_dir).await;
     }
 }
 
@@ -335,7 +469,20 @@ async fn screenshot(cdp: &mut CdpClient) -> Result<Value, String> {
 }
 
 async fn environment_state(cdp: &mut CdpClient, session: &BrowserSession) -> Result<Value, String> {
-    let result = cdp.call("Runtime.evaluate", json!({"expression": "JSON.stringify({current_url:location.href,window_title:document.title})", "returnByValue": true})).await?;
+    let mut retry = 0;
+    let result = loop {
+        match cdp.call("Runtime.evaluate", json!({"expression": "JSON.stringify({current_url:location.href,window_title:document.title})", "returnByValue": true})).await {
+            Ok(result) => break result,
+            Err(error)
+                if retry < ENVIRONMENT_STATE_RETRIES
+                    && is_transient_execution_context_error(&error) =>
+            {
+                retry += 1;
+                tokio::time::sleep(ENVIRONMENT_STATE_RETRY_DELAY * retry as u32).await;
+            }
+            Err(error) => return Err(error),
+        }
+    };
     let serialized = result
         .pointer("/result/value")
         .and_then(Value::as_str)
@@ -346,6 +493,12 @@ async fn environment_state(cdp: &mut CdpClient, session: &BrowserSession) -> Res
     state["viewport"] =
         json!({"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT, "device_scale_factor": 1});
     Ok(state)
+}
+
+fn is_transient_execution_context_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("execution context was destroyed")
+        || error.contains("cannot find context with specified id")
 }
 
 fn scaled_coordinate(value: u64, extent: u64) -> f64 {
@@ -1605,6 +1758,19 @@ mod tests {
         ] {
             assert!(computer_loopback_url(denied).is_err(), "{denied}");
         }
+    }
+
+    #[test]
+    fn recognizes_only_transient_execution_context_errors() {
+        assert!(is_transient_execution_context_error(
+            "DevTools Runtime.evaluate failed: {\"code\":-32000,\"message\":\"Execution context was destroyed.\"}"
+        ));
+        assert!(is_transient_execution_context_error(
+            "Cannot find context with specified id"
+        ));
+        assert!(!is_transient_execution_context_error(
+            "DevTools Runtime.evaluate failed: access denied"
+        ));
     }
 
     #[test]

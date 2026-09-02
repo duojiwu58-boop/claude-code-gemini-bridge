@@ -8442,67 +8442,6 @@ fn provider_accepts_safe_computer_use_and_rejects_unsafe_overrides() {
 }
 
 #[test]
-#[cfg(any())]
-fn validates_all_gemini_browser_and_desktop_actions() {
-    assert!(
-        computer_start_tool()["inputSchema"]["properties"]["environment"]["enum"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|value| value == "desktop")
-    );
-    let coordinate = |name: &str| json!({"call_id": format!("call_{name}"), "name": name, "arguments": {"x": 500, "y": 500, "intent": "test"}});
-    for name in [
-        "click",
-        "double_click",
-        "triple_click",
-        "middle_click",
-        "right_click",
-        "mouse_down",
-        "mouse_up",
-        "move",
-    ] {
-        validate_computer_action(&coordinate(name), "browser").unwrap();
-        validate_computer_action(&coordinate(name), "desktop").unwrap();
-    }
-    let calls = vec![
-        json!({"call_id":"type","name":"type","arguments":{"text":"hello","press_enter":true,"intent":"test"}}),
-        json!({"call_id":"drag","name":"drag_and_drop","arguments":{"start_x":0,"start_y":1,"end_x":998,"end_y":999,"intent":"test"}}),
-        json!({"call_id":"wait","name":"wait","arguments":{"seconds":1,"intent":"test"}}),
-        json!({"call_id":"press","name":"press_key","arguments":{"key":"Enter","intent":"test"}}),
-        json!({"call_id":"down","name":"key_down","arguments":{"key":"Control","intent":"test"}}),
-        json!({"call_id":"up","name":"key_up","arguments":{"key":"Control","intent":"test"}}),
-        json!({"call_id":"hotkey","name":"hotkey","arguments":{"keys":["Control","A"],"intent":"test"}}),
-        json!({"call_id":"shot","name":"take_screenshot","arguments":{"intent":"test"}}),
-        json!({"call_id":"scroll","name":"scroll","arguments":{"x":999,"y":999,"direction":"down","magnitude_in_pixels":300,"intent":"test"}}),
-    ];
-    for call in &calls {
-        validate_computer_action(call, "browser").unwrap();
-        validate_computer_action(call, "desktop").unwrap();
-    }
-    for call in [
-        json!({"call_id":"back","name":"go_back","arguments":{"intent":"test"}}),
-        json!({"call_id":"navigate","name":"navigate","arguments":{"url":"http://localhost:3000/next","intent":"test"}}),
-        json!({"call_id":"forward","name":"go_forward","arguments":{"intent":"test"}}),
-    ] {
-        validate_computer_action(&call, "browser").unwrap();
-        assert!(validate_computer_action(&call, "desktop").is_err());
-    }
-    assert!(validate_computer_action(
-        &json!({"call_id":"bad","name":"click","arguments":{"x":1000,"y":0,"intent":"test"}}),
-        "browser"
-    )
-    .is_err());
-    assert!(validate_computer_action(&json!({"call_id":"bad-nav","name":"navigate","arguments":{"url":"https://example.com","intent":"test"}}), "browser").is_err());
-    assert!(validate_computer_action(
-        &json!({"call_id":"too-long","name":"type","arguments":{
-        "text":"x".repeat(4_001),"intent":"test"}}),
-        "desktop"
-    )
-    .is_err());
-}
-
-#[test]
 fn injects_native_computer_use_after_initial_screenshot() {
     let request = computer_request_fixture();
     let mut profile = interactions_test_profile("gemini-computer.json");
@@ -8751,28 +8690,6 @@ fn stateless_history_reconstructs_native_computer_calls_and_results() {
     assert_eq!(steps[2]["call_id"], "call_restart_click");
     assert_eq!(steps[3]["call_id"], "call_restart_shot");
     assert_eq!(steps[3]["result"][1]["data"], "shot2");
-}
-
-#[test]
-#[cfg(any())]
-fn computer_safety_requires_real_confirmation_and_blocks_blocked_calls() {
-    let type_call =
-        json!({"call_id":"type","name":"type","arguments":{"text":"hello","intent":"test"}});
-    assert!(
-        computer_batch_requires_confirmation(&[type_call], Some("http://localhost:3000/"))
-            .unwrap()
-            .is_some()
-    );
-    let click = json!({"call_id":"click","name":"click","arguments":{"x":1,"y":2,"intent":"test"}});
-    assert!(
-        computer_batch_requires_confirmation(&[click], Some("http://localhost:3000/"))
-            .unwrap()
-            .is_none()
-    );
-    let blocked = json!({"call_id":"blocked","name":"click","arguments":{"x":1,"y":2,"intent":"test"},"safety_decision":{"decision":"blocked"}});
-    assert!(
-        computer_batch_requires_confirmation(&[blocked], Some("http://localhost:3000/")).is_err()
-    );
 }
 
 #[test]

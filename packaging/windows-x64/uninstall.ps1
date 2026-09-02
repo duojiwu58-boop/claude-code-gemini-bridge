@@ -2,7 +2,8 @@
     [switch]$RemoveConfiguration,
     [switch]$KeepProgramFiles,
     [string]$ElevationUserProfile,
-    [string]$ElevationUserDesktop
+    [string]$ElevationUserDesktop,
+    [string]$ElevationUserLocalAppData
 )
 
 $ErrorActionPreference = 'Stop'
@@ -102,14 +103,17 @@ if (-not (Test-IsAdministrator)) {
     }
     $unelevatedProfile = [System.IO.Path]::GetFullPath($env:USERPROFILE)
     $unelevatedDesktop = [Environment]::GetFolderPath('DesktopDirectory')
+    $unelevatedLocalAppData = [Environment]::GetFolderPath('LocalApplicationData')
     $elevationArguments = (
         (
             '-NoProfile -ExecutionPolicy Bypass -File "{0}" ' +
-            '-ElevationUserProfile "{1}" -ElevationUserDesktop "{2}"'
+            '-ElevationUserProfile "{1}" -ElevationUserDesktop "{2}" ' +
+            '-ElevationUserLocalAppData "{3}"'
         ) -f
         $MyInvocation.MyCommand.Path,
         $unelevatedProfile,
-        $unelevatedDesktop
+        $unelevatedDesktop,
+        $unelevatedLocalAppData
     )
     $elevated = Start-Process `
         -FilePath 'powershell.exe' `
@@ -136,8 +140,15 @@ $desktop = if (Test-StringNullOrWhitespace ($ElevationUserDesktop)) {
 else {
     [System.IO.Path]::GetFullPath($ElevationUserDesktop)
 }
+$targetUserLocalAppData = if (Test-StringNullOrWhitespace ($ElevationUserLocalAppData)) {
+    [Environment]::GetFolderPath('LocalApplicationData')
+}
+else {
+    [System.IO.Path]::GetFullPath($ElevationUserLocalAppData)
+}
 $shortcutPath = Join-Path $desktop 'Claude Code 模型切换器.lnk'
 $claudeUserConfig = Join-Path $targetUserProfile '.claude.json'
+$computerHostDir = Join-Path $targetUserLocalAppData 'ClaudeCodeBridge\ComputerHost'
 $utf8NoBom = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList @($false)
 
 function Write-Utf8TextAtomically {
@@ -249,6 +260,22 @@ if ([System.IO.File]::Exists($claudeUserConfig)) {
     catch {
         Write-Warning "无法移除 Gemini 生图或 Computer Use MCP 工具配置：$($_.Exception.Message)"
     }
+}
+
+if ([System.IO.Directory]::Exists($computerHostDir)) {
+    $expectedComputerHostDir = [System.IO.Path]::GetFullPath(
+        (Join-Path $targetUserLocalAppData 'ClaudeCodeBridge\ComputerHost')
+    )
+    $resolvedComputerHostDir = [System.IO.Path]::GetFullPath($computerHostDir)
+    if (-not [string]::Equals(
+        $resolvedComputerHostDir,
+        $expectedComputerHostDir,
+        [StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "拒绝删除意外目录：$resolvedComputerHostDir"
+    }
+    Remove-Item -Path $resolvedComputerHostDir -Recurse -Force
+    Write-Host 'Computer Host 浏览器会话数据已经删除。'
 }
 
 $expectedInstallDir = [System.IO.Path]::GetFullPath(
