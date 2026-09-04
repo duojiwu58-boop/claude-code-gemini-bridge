@@ -424,9 +424,13 @@ fn interaction_user_steps(
                 .unwrap_or_else(|| "unknown_function".to_string());
             if computer_tool_name_is(&name, "computer_action_batch") {
                 if !user_content.is_empty() {
-                    steps.push(json!({"type": "user_input", "content": std::mem::take(&mut user_content)}));
+                    steps.push(
+                        json!({"type": "user_input", "content": std::mem::take(&mut user_content)}),
+                    );
                 }
-                if let Some(expanded) = expand_computer_batch_tool_result(part.get("content").unwrap_or(&Value::Null)) {
+                if let Some(expanded) =
+                    expand_computer_batch_tool_result(part.get("content").unwrap_or(&Value::Null))
+                {
                     steps.extend(expanded);
                     continue;
                 }
@@ -586,7 +590,8 @@ fn requested_computer_cancel_tool_name(request: &Value) -> Option<String> {
         .unwrap_or_default()
         .to_ascii_lowercase();
 
-    latest_user_text.contains("computer_cancel")
+    latest_user_text
+        .contains("computer_cancel")
         .then(|| cancel_tools[0].to_string())
 }
 
@@ -597,23 +602,39 @@ fn computer_result_envelope(content: &Value) -> Option<Value> {
             .then(|| part.get("text").and_then(Value::as_str))
             .flatten()
             .and_then(|text| serde_json::from_str::<Value>(text).ok())
-            .filter(|value| value.get("protocol_version").and_then(Value::as_str) == Some(COMPUTER_PROTOCOL_VERSION))
+            .filter(|value| {
+                value.get("protocol_version").and_then(Value::as_str)
+                    == Some(COMPUTER_PROTOCOL_VERSION)
+            })
     })
 }
 
 fn computer_result_images(content: &Value) -> Vec<Value> {
-    content.as_array().into_iter().flatten().filter_map(|part| {
-        if part.get("type").and_then(Value::as_str) != Some("image") { return None; }
-        let source = part.get("source").unwrap_or(part);
-        let data = source.get("data").and_then(Value::as_str)?;
-        let mime_type = source.get("media_type").or_else(|| source.get("mimeType")).and_then(Value::as_str).unwrap_or("image/png");
-        Some(json!({"type": "image", "data": data, "mime_type": mime_type}))
-    }).collect()
+    content
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|part| {
+            if part.get("type").and_then(Value::as_str) != Some("image") {
+                return None;
+            }
+            let source = part.get("source").unwrap_or(part);
+            let data = source.get("data").and_then(Value::as_str)?;
+            let mime_type = source
+                .get("media_type")
+                .or_else(|| source.get("mimeType"))
+                .and_then(Value::as_str)
+                .unwrap_or("image/png");
+            Some(json!({"type": "image", "data": data, "mime_type": mime_type}))
+        })
+        .collect()
 }
 
 fn expand_computer_batch_tool_result(content: &Value) -> Option<Vec<Value>> {
     let envelope = computer_result_envelope(content)?;
-    if envelope.get("kind").and_then(Value::as_str) != Some("computer_action_batch_result") { return None; }
+    if envelope.get("kind").and_then(Value::as_str) != Some("computer_action_batch_result") {
+        return None;
+    }
     let results = envelope.get("results").and_then(Value::as_array)?;
     let images = computer_result_images(content);
     Some(results.iter().map(|item| {
@@ -647,26 +668,63 @@ fn computer_conversation_context(request: &Value) -> Option<ComputerConversation
     if completed_computer_cancel(request) {
         return None;
     }
-    let batch_tool_name = request.get("tools").and_then(Value::as_array).and_then(|tools| {
-        tools.iter().filter_map(|tool| tool.get("name").and_then(Value::as_str))
-            .find(|name| computer_tool_name_is(name, "computer_action_batch")).map(str::to_string)
-    }).unwrap_or_else(|| "computer_action_batch".to_string());
+    let batch_tool_name = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .and_then(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+                .find(|name| computer_tool_name_is(name, "computer_action_batch"))
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "computer_action_batch".to_string());
     let messages = request.get("messages").and_then(Value::as_array)?;
     for message in messages.iter().rev() {
-        let Some(parts) = message.get("content").and_then(Value::as_array) else { continue; };
+        let Some(parts) = message.get("content").and_then(Value::as_array) else {
+            continue;
+        };
         for part in parts.iter().rev() {
-            if part.get("type").and_then(Value::as_str) != Some("tool_result") { continue; }
-            let Some(envelope) = computer_result_envelope(part.get("content").unwrap_or(&Value::Null)) else { continue; };
-            if !matches!(envelope.get("kind").and_then(Value::as_str), Some("computer_start_result" | "computer_action_batch_result")) { continue; }
+            if part.get("type").and_then(Value::as_str) != Some("tool_result") {
+                continue;
+            }
+            let Some(envelope) =
+                computer_result_envelope(part.get("content").unwrap_or(&Value::Null))
+            else {
+                continue;
+            };
+            if !matches!(
+                envelope.get("kind").and_then(Value::as_str),
+                Some("computer_start_result" | "computer_action_batch_result")
+            ) {
+                continue;
+            }
             return Some(ComputerConversationContext {
-                session_id: envelope.get("session_id").and_then(Value::as_str)?.to_string(),
-                sequence: envelope.get("sequence").and_then(Value::as_u64).unwrap_or_default(),
-                environment: envelope.get("environment").and_then(Value::as_str)
-                    .or_else(|| envelope.pointer("/environment_state/environment").and_then(Value::as_str))
-                    .unwrap_or("browser").to_string(),
-                viewport: envelope.get("viewport").cloned()
+                session_id: envelope
+                    .get("session_id")
+                    .and_then(Value::as_str)?
+                    .to_string(),
+                sequence: envelope
+                    .get("sequence")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+                environment: envelope
+                    .get("environment")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        envelope
+                            .pointer("/environment_state/environment")
+                            .and_then(Value::as_str)
+                    })
+                    .unwrap_or("browser")
+                    .to_string(),
+                viewport: envelope
+                    .get("viewport")
+                    .cloned()
                     .or_else(|| envelope.pointer("/environment_state/viewport").cloned())
-                    .unwrap_or_else(|| json!({"width": 1440, "height": 900, "device_scale_factor": 1})),
+                    .unwrap_or_else(
+                        || json!({"width": 1440, "height": 900, "device_scale_factor": 1}),
+                    ),
                 batch_tool_name,
             });
         }
@@ -675,15 +733,37 @@ fn computer_conversation_context(request: &Value) -> Option<ComputerConversation
 }
 
 fn is_gemini_computer_action(name: &str, environment: &str) -> bool {
-    matches!(name, "click" | "double_click" | "triple_click" | "middle_click" | "right_click"
-        | "mouse_down" | "mouse_up" | "move" | "type" | "drag_and_drop" | "wait"
-        | "press_key" | "key_down" | "key_up" | "hotkey" | "take_screenshot" | "scroll")
-        || (environment == "browser" && matches!(name, "go_back" | "navigate" | "go_forward"))
+    matches!(
+        name,
+        "click"
+            | "double_click"
+            | "triple_click"
+            | "middle_click"
+            | "right_click"
+            | "mouse_down"
+            | "mouse_up"
+            | "move"
+            | "type"
+            | "drag_and_drop"
+            | "wait"
+            | "press_key"
+            | "key_down"
+            | "key_up"
+            | "hotkey"
+            | "take_screenshot"
+            | "scroll"
+    ) || (environment == "browser" && matches!(name, "go_back" | "navigate" | "go_forward"))
 }
 
-fn computer_batch_tool_block(interaction_id: &str, request: &Value, native_calls: &[Value]) -> Option<(Value, (String, String))> {
+fn computer_batch_tool_block(
+    interaction_id: &str,
+    request: &Value,
+    native_calls: &[Value],
+) -> Option<(Value, (String, String))> {
     let context = computer_conversation_context(request)?;
-    if native_calls.is_empty() { return None; }
+    if native_calls.is_empty() {
+        return None;
+    }
     let calls = native_calls.iter().map(|step| {
         let arguments = step.get("arguments").cloned().unwrap_or_else(|| json!({}));
         json!({
@@ -701,18 +781,21 @@ fn computer_batch_tool_block(interaction_id: &str, request: &Value, native_calls
     let batch_id = format!("cub_{}", &hash[..24]);
     let tool_use_id = format!("toolu_computer_{}", &hash[..24]);
     let name = context.batch_tool_name;
-    Some((json!({
-        "type": "tool_use", "id": tool_use_id, "name": name,
-        "input": {
-            "protocol_version": COMPUTER_PROTOCOL_VERSION,
-            "session_id": context.session_id,
-            "batch_id": batch_id,
-            "sequence": context.sequence + 1,
-            "environment": context.environment,
-            "viewport": context.viewport,
-            "calls": calls
-        }
-    }), (tool_use_id, name)))
+    Some((
+        json!({
+            "type": "tool_use", "id": tool_use_id, "name": name,
+            "input": {
+                "protocol_version": COMPUTER_PROTOCOL_VERSION,
+                "session_id": context.session_id,
+                "batch_id": batch_id,
+                "sequence": context.sequence + 1,
+                "environment": context.environment,
+                "viewport": context.viewport,
+                "calls": calls
+            }
+        }),
+        (tool_use_id, name),
+    ))
 }
 
 fn interaction_assistant_steps(
@@ -930,18 +1013,18 @@ fn interaction_value_contains_pdf_document(value: &Value) -> bool {
         Value::Array(values) => values.iter().any(interaction_value_contains_pdf_document),
         Value::Object(object) => {
             let is_pdf_document = object.get("type").and_then(Value::as_str) == Some("document")
-                && object.get("source").and_then(Value::as_object).is_some_and(|source| {
-                    source
-                        .get("media_type")
-                        .and_then(Value::as_str)
-                        .is_some_and(|mime| mime.eq_ignore_ascii_case("application/pdf"))
-                        || (source.get("type").and_then(Value::as_str) == Some("url")
-                            && source.get("media_type").is_none_or(Value::is_null))
-                });
-            is_pdf_document
-                || object
-                    .values()
-                    .any(interaction_value_contains_pdf_document)
+                && object
+                    .get("source")
+                    .and_then(Value::as_object)
+                    .is_some_and(|source| {
+                        source
+                            .get("media_type")
+                            .and_then(Value::as_str)
+                            .is_some_and(|mime| mime.eq_ignore_ascii_case("application/pdf"))
+                            || (source.get("type").and_then(Value::as_str) == Some("url")
+                                && source.get("media_type").is_none_or(Value::is_null))
+                    });
+            is_pdf_document || object.values().any(interaction_value_contains_pdf_document)
         }
         _ => false,
     }
@@ -1150,9 +1233,8 @@ fn translated_anthropic_mcp_servers(request: &Value) -> Result<Vec<Value>, Strin
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| format!("Anthropic MCP server '{original_name}' requires a URL"))?;
-        let parsed_url = url::Url::parse(server_url).map_err(|_| {
-            format!("Anthropic MCP server '{original_name}' has an invalid URL")
-        })?;
+        let parsed_url = url::Url::parse(server_url)
+            .map_err(|_| format!("Anthropic MCP server '{original_name}' has an invalid URL"))?;
         if parsed_url.scheme() != "https"
             || parsed_url.host_str().is_none()
             || !parsed_url.username().is_empty()
@@ -1219,9 +1301,7 @@ fn translated_anthropic_mcp_servers(request: &Value) -> Result<Vec<Value>, Strin
         if !default_enabled {
             let allowed_tools = configs
                 .iter()
-                .filter(|(_, config)| {
-                    config.get("enabled").and_then(Value::as_bool) == Some(true)
-                })
+                .filter(|(_, config)| config.get("enabled").and_then(Value::as_bool) == Some(true))
                 .map(|(name, _)| name.clone())
                 .collect::<Vec<_>>();
             mcp_server.insert("allowed_tools".to_string(), json!(allowed_tools));
@@ -1236,9 +1316,9 @@ fn translated_anthropic_mcp_servers(request: &Value) -> Result<Vec<Value>, Strin
         let Some(name) = toolset.get("mcp_server_name").and_then(Value::as_str) else {
             return Err("Anthropic mcp_toolset requires mcp_server_name".to_string());
         };
-        let references = servers.iter().filter(|server| {
-            server.get("name").and_then(Value::as_str) == Some(name)
-        });
+        let references = servers
+            .iter()
+            .filter(|server| server.get("name").and_then(Value::as_str) == Some(name));
         if references.count() != 1 {
             return Err(format!(
                 "Anthropic mcp_toolset '{name}' must reference exactly one mcp_servers entry"
@@ -1279,10 +1359,7 @@ fn translated_interaction_tools(
             }
             if let Some(gemini_type) = anthropic_server_tool_gemini_type(tool) {
                 if !(omit_code_execution && gemini_type == "code_execution") {
-                    push_unique_interaction_tool(
-                        &mut translated,
-                        json!({"type": gemini_type}),
-                    );
+                    push_unique_interaction_tool(&mut translated, json!({"type": gemini_type}));
                 }
                 continue;
             }
@@ -1327,18 +1404,20 @@ fn translated_interaction_tools(
         return Ok(translated);
     }
     for tool in capabilities.gemini_builtin_tools.iter().filter(|tool| {
-        !(omit_code_execution
-            && tool.get("type").and_then(Value::as_str) == Some("code_execution"))
+        !(omit_code_execution && tool.get("type").and_then(Value::as_str) == Some("code_execution"))
             && tool.get("type").and_then(Value::as_str) != Some("computer_use")
     }) {
         push_unique_interaction_tool(&mut translated, tool.clone());
     }
     if let Some(context) = &computer_context {
-        push_unique_interaction_tool(&mut translated, json!({
-            "type": "computer_use",
-            "environment": context.environment,
-            "enable_prompt_injection_detection": true
-        }));
+        push_unique_interaction_tool(
+            &mut translated,
+            json!({
+                "type": "computer_use",
+                "environment": context.environment,
+                "enable_prompt_injection_detection": true
+            }),
+        );
     }
     if !capabilities.gemini_file_search_store_names.is_empty() {
         if let Some(file_search) = translated
@@ -1735,14 +1814,11 @@ fn gemini_interaction_request_diagnostics(request: &Value) -> Vec<String> {
             ignored_sampling.join(", ")
         ));
     }
-    let unsupported_parameters: Vec<&str> = [
-        "candidate_count",
-        "frequency_penalty",
-        "presence_penalty",
-    ]
-    .into_iter()
-    .filter(|field| request.get(*field).is_some())
-    .collect();
+    let unsupported_parameters: Vec<&str> =
+        ["candidate_count", "frequency_penalty", "presence_penalty"]
+            .into_iter()
+            .filter(|field| request.get(*field).is_some())
+            .collect();
     if !unsupported_parameters.is_empty() {
         add(&format!(
             "Dropped unsupported Gemini parameters: {}",
@@ -2629,14 +2705,24 @@ fn remove_interaction_server_tools(request: &mut Value) -> bool {
         return false;
     };
     let original_len = tools.len();
-    tools.retain(|tool| matches!(tool.get("type").and_then(Value::as_str), Some("function" | "computer_use")));
+    tools.retain(|tool| {
+        matches!(
+            tool.get("type").and_then(Value::as_str),
+            Some("function" | "computer_use")
+        )
+    });
     original_len != tools.len()
 }
 
 fn interaction_request_has_computer_use(request: &Value) -> bool {
-    request.get("tools").and_then(Value::as_array).is_some_and(|tools| {
-        tools.iter().any(|tool| tool.get("type").and_then(Value::as_str) == Some("computer_use"))
-    })
+    request
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| tool.get("type").and_then(Value::as_str) == Some("computer_use"))
+        })
 }
 
 fn remove_interaction_tools_incompatible_with_computer_use(request: &mut Value) -> bool {
@@ -2644,9 +2730,7 @@ fn remove_interaction_tools_incompatible_with_computer_use(request: &mut Value) 
         return false;
     };
     let original_len = tools.len();
-    tools.retain(|tool| {
-        tool.get("type").and_then(Value::as_str) == Some("computer_use")
-    });
+    tools.retain(|tool| tool.get("type").and_then(Value::as_str) == Some("computer_use"));
     original_len != tools.len() && !tools.is_empty()
 }
 
@@ -3062,7 +3146,10 @@ fn translate_gemini_interactions_response_for_request(
                     .and_then(Value::as_str)
                     .unwrap_or("unknown_function")
                     .to_string();
-                if computer_context.as_ref().is_some_and(|context| is_gemini_computer_action(&name, &context.environment)) {
+                if computer_context
+                    .as_ref()
+                    .is_some_and(|context| is_gemini_computer_action(&name, &context.environment))
+                {
                     let mut native_call = step.clone();
                     native_call["id"] = json!(call_id);
                     native_computer_calls.push(native_call);
@@ -3092,7 +3179,9 @@ fn translate_gemini_interactions_response_for_request(
         }
     }
     if let Some(request) = request {
-        if let Some((block, call)) = computer_batch_tool_block(&interaction_id, request, &native_computer_calls) {
+        if let Some((block, call)) =
+            computer_batch_tool_block(&interaction_id, request, &native_computer_calls)
+        {
             content.push(block);
             calls.push(call);
         }
@@ -3164,10 +3253,12 @@ async fn forward_gemini_interactions_profile(
             .post(&profile.upstream_url)
             .header("x-goog-api-key", api_key)
             .json(&interaction_request);
-        let upstream_request =
-            apply_upstream_total_timeout(upstream_request, stream_requested);
+        let upstream_request = apply_upstream_total_timeout(upstream_request, stream_requested);
         let upstream_request = if !stream_requested
-            && interaction_request.get("service_tier").and_then(Value::as_str) == Some("flex")
+            && interaction_request
+                .get("service_tier")
+                .and_then(Value::as_str)
+                == Some("flex")
         {
             upstream_request.timeout(GEMINI_FLEX_REQUEST_TIMEOUT)
         } else {
@@ -3198,9 +3289,7 @@ async fn forward_gemini_interactions_profile(
 
         if !mixed_tools_fallback && is_mixed_interaction_tools_error(status.as_u16(), &message) {
             if interaction_request_has_computer_use(&interaction_request)
-                && remove_interaction_tools_incompatible_with_computer_use(
-                    &mut interaction_request,
-                )
+                && remove_interaction_tools_incompatible_with_computer_use(&mut interaction_request)
             {
                 mixed_tools_fallback = true;
                 warn!(
@@ -3272,8 +3361,10 @@ async fn forward_gemini_interactions_profile(
     };
     let model = display_model_name(&profile.model);
     if stream_requested {
-        let flex_requested =
-            interaction_request.get("service_tier").and_then(Value::as_str) == Some("flex");
+        let flex_requested = interaction_request
+            .get("service_tier")
+            .and_then(Value::as_str)
+            == Some("flex");
         return gemini_interactions_stream_response(
             upstream,
             model,

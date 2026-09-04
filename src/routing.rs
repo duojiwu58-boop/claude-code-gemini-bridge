@@ -190,11 +190,7 @@ async fn anthropic_messages(
         match apply_provider_request_overrides(&active_profile, &mut request) {
             Ok(diagnostics) => diagnostics,
             Err(message) => {
-                return anthropic_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
-                    &message,
-                );
+                return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message);
             }
         };
     if let Some(identity) = upstream_identity_label(&active_profile, &state.model) {
@@ -434,7 +430,13 @@ enum Claude5Model {
 
 fn claude_5_model(model: &str) -> Option<Claude5Model> {
     let model = display_model_name(model);
-    match model.rsplit('/').next().unwrap_or(&model).to_ascii_lowercase().as_str() {
+    match model
+        .rsplit('/')
+        .next()
+        .unwrap_or(&model)
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "claude-sonnet-5" => Some(Claude5Model::Sonnet),
         "claude-opus-5" => Some(Claude5Model::Opus),
         _ => None,
@@ -486,14 +488,12 @@ fn normalize_openrouter_claude5_request(
     {
         object.remove("top_p");
         diagnostics.push(
-            "Removed top_p below 0.99 because Claude 5 models reject non-default top_p"
-                .to_string(),
+            "Removed top_p below 0.99 because Claude 5 models reject non-default top_p".to_string(),
         );
     }
     if object.remove("top_k").is_some() {
-        diagnostics.push(
-            "Removed top_k because Claude 5 models do not accept that parameter".to_string(),
-        );
+        diagnostics
+            .push("Removed top_k because Claude 5 models do not accept that parameter".to_string());
     }
     let thinking_disabled = object
         .get("thinking")
@@ -712,29 +712,26 @@ where
     B: Send + 'static,
     E: std::fmt::Display + Send + 'static,
 {
-    stream::unfold(
-        Some(Box::pin(byte_stream)),
-        move |byte_stream| async move {
-            let mut byte_stream = byte_stream?;
-            match tokio::time::timeout(idle_timeout, byte_stream.next()).await {
-                Ok(Some(Ok(bytes))) => Some((Ok(bytes), Some(byte_stream))),
-                Ok(Some(Err(err))) => Some((
-                    Err(std::io::Error::other(format!(
-                        "Anthropic upstream stream failed: {err}"
-                    ))),
-                    None,
+    stream::unfold(Some(Box::pin(byte_stream)), move |byte_stream| async move {
+        let mut byte_stream = byte_stream?;
+        match tokio::time::timeout(idle_timeout, byte_stream.next()).await {
+            Ok(Some(Ok(bytes))) => Some((Ok(bytes), Some(byte_stream))),
+            Ok(Some(Err(err))) => Some((
+                Err(std::io::Error::other(format!(
+                    "Anthropic upstream stream failed: {err}"
+                ))),
+                None,
+            )),
+            Ok(None) => None,
+            Err(_) => Some((
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "Anthropic upstream stream was idle for too long",
                 )),
-                Ok(None) => None,
-                Err(_) => Some((
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "Anthropic upstream stream was idle for too long",
-                    )),
-                    None,
-                )),
-            }
-        },
-    )
+                None,
+            )),
+        }
+    })
 }
 
 fn apply_anthropic_forward_headers(
@@ -769,7 +766,10 @@ fn apply_anthropic_forward_headers(
             "http-referer",
             "x-openrouter-title",
         ] {
-            if let Some(value) = client_headers.get(name).and_then(|value| value.to_str().ok()) {
+            if let Some(value) = client_headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+            {
                 upstream_request = upstream_request.header(name, value);
             }
         }

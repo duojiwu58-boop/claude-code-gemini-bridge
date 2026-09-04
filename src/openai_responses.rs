@@ -340,13 +340,12 @@ fn translate_anthropic_to_responses(
                         .default_reasoning_effort
                         .as_deref());
                 if let Some(effort) = effort {
-                    let effort = if profile.openai_capabilities.chat_dialect
-                        == OpenAiChatDialect::Kimi
-                    {
-                        kimi_reasoning_effort(effort)
-                    } else {
-                        effort
-                    };
+                    let effort =
+                        if profile.openai_capabilities.chat_dialect == OpenAiChatDialect::Kimi {
+                            kimi_reasoning_effort(effort)
+                        } else {
+                            effort
+                        };
                     body.insert("reasoning".to_string(), json!({"effort": effort}));
                 }
             }

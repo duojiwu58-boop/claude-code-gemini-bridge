@@ -248,70 +248,80 @@ impl GeminiInteractionsStreamTranslator {
             return Ok(Vec::new());
         };
         let anthropic_index = self.next_content_index;
-        let (block, content_block) = match step_type {
-            "thought" => (
-                InteractionStreamingBlock::Thought {
-                    thinking: String::new(),
-                    signature: None,
-                },
-                json!({"type": "thinking", "thinking": ""}),
-            ),
-            "model_output" => (
-                InteractionStreamingBlock::Text {
-                    text: String::new(),
-                    annotations: Vec::new(),
-                },
-                json!({"type": "text", "text": ""}),
-            ),
-            "function_call" => {
-                self.deferred_tool_batch_events.get_or_insert_with(Vec::new);
-                let id = step
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .filter(|id| !id.is_empty())
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| format!("toolu_{}", Uuid::new_v4().simple()));
-                let name = step
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown_function")
-                    .to_string();
-                let initial_arguments = match step.get("arguments") {
-                    Some(Value::String(value)) => value.clone(),
-                    Some(Value::Object(value)) if value.is_empty() => String::new(),
-                    Some(Value::Null) | None => String::new(),
-                    Some(value) => value.to_string(),
-                };
-                let mut arguments = String::new();
-                append_streamed_tool_arguments(&mut arguments, &initial_arguments)?;
-                if self.computer_context.as_ref().is_some_and(|context| is_gemini_computer_action(&name, &context.environment)) {
-                    self.active_blocks.insert(index, ActiveInteractionStreamingBlock {
-                        anthropic_index: usize::MAX,
-                        block: InteractionStreamingBlock::Tool { id, name, arguments },
-                    });
+        let (block, content_block) =
+            match step_type {
+                "thought" => (
+                    InteractionStreamingBlock::Thought {
+                        thinking: String::new(),
+                        signature: None,
+                    },
+                    json!({"type": "thinking", "thinking": ""}),
+                ),
+                "model_output" => (
+                    InteractionStreamingBlock::Text {
+                        text: String::new(),
+                        annotations: Vec::new(),
+                    },
+                    json!({"type": "text", "text": ""}),
+                ),
+                "function_call" => {
+                    self.deferred_tool_batch_events.get_or_insert_with(Vec::new);
+                    let id = step
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("toolu_{}", Uuid::new_v4().simple()));
+                    let name = step
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown_function")
+                        .to_string();
+                    let initial_arguments = match step.get("arguments") {
+                        Some(Value::String(value)) => value.clone(),
+                        Some(Value::Object(value)) if value.is_empty() => String::new(),
+                        Some(Value::Null) | None => String::new(),
+                        Some(value) => value.to_string(),
+                    };
+                    let mut arguments = String::new();
+                    append_streamed_tool_arguments(&mut arguments, &initial_arguments)?;
+                    if self.computer_context.as_ref().is_some_and(|context| {
+                        is_gemini_computer_action(&name, &context.environment)
+                    }) {
+                        self.active_blocks.insert(
+                            index,
+                            ActiveInteractionStreamingBlock {
+                                anthropic_index: usize::MAX,
+                                block: InteractionStreamingBlock::Tool {
+                                    id,
+                                    name,
+                                    arguments,
+                                },
+                            },
+                        );
+                        return Ok(Vec::new());
+                    }
+                    (
+                        InteractionStreamingBlock::Tool {
+                            id: id.clone(),
+                            name: name.clone(),
+                            arguments,
+                        },
+                        json!({"type": "tool_use", "id": id, "name": name, "input": {}}),
+                    )
+                }
+                _ => {
+                    if is_gemini_server_tool_step(step_type) {
+                        self.active_server_tools.insert(index, step.clone());
+                        info!(
+                            provider = %self.profile_file,
+                            step_type,
+                            "Gemini server-side tool step started"
+                        );
+                    }
                     return Ok(Vec::new());
                 }
-                (
-                    InteractionStreamingBlock::Tool {
-                        id: id.clone(),
-                        name: name.clone(),
-                        arguments,
-                    },
-                    json!({"type": "tool_use", "id": id, "name": name, "input": {}}),
-                )
-            }
-            _ => {
-                if is_gemini_server_tool_step(step_type) {
-                    self.active_server_tools.insert(index, step.clone());
-                    info!(
-                        provider = %self.profile_file,
-                        step_type,
-                        "Gemini server-side tool step started"
-                    );
-                }
-                return Ok(Vec::new());
-            }
-        };
+            };
         self.next_content_index += 1;
         self.active_blocks.insert(
             index,
@@ -695,25 +705,42 @@ impl GeminiInteractionsStreamTranslator {
             "Gemini Interactions stream completed without an interaction id".to_string()
         })?;
         let mut computer_batch_events = Vec::new();
-        if let Some((block, call)) = computer_batch_tool_block(&interaction_id, &self.request, &self.native_computer_calls) {
+        if let Some((block, call)) =
+            computer_batch_tool_block(&interaction_id, &self.request, &self.native_computer_calls)
+        {
             let index = self.next_content_index;
             self.next_content_index += 1;
             self.assistant_content.push(block.clone());
             self.calls.push(call.clone());
             if self.store_interactions {
                 remember_interaction_calls_in_memory(
-                    &self.continuations, &self.profile_file, &interaction_id, std::slice::from_ref(&call),
+                    &self.continuations,
+                    &self.profile_file,
+                    &interaction_id,
+                    std::slice::from_ref(&call),
                 );
             }
-            push_anthropic_event(&mut computer_batch_events, "content_block_start", json!({
-                "type": "content_block_start", "index": index,
-                "content_block": {"type": "tool_use", "id": block.get("id"), "name": block.get("name"), "input": {}}
-            }))?;
-            push_anthropic_event(&mut computer_batch_events, "content_block_delta", json!({
-                "type": "content_block_delta", "index": index,
-                "delta": {"type": "input_json_delta", "partial_json": block.get("input").cloned().unwrap_or_else(|| json!({})).to_string()}
-            }))?;
-            push_anthropic_event(&mut computer_batch_events, "content_block_stop", json!({"type": "content_block_stop", "index": index}))?;
+            push_anthropic_event(
+                &mut computer_batch_events,
+                "content_block_start",
+                json!({
+                    "type": "content_block_start", "index": index,
+                    "content_block": {"type": "tool_use", "id": block.get("id"), "name": block.get("name"), "input": {}}
+                }),
+            )?;
+            push_anthropic_event(
+                &mut computer_batch_events,
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta", "index": index,
+                    "delta": {"type": "input_json_delta", "partial_json": block.get("input").cloned().unwrap_or_else(|| json!({})).to_string()}
+                }),
+            )?;
+            push_anthropic_event(
+                &mut computer_batch_events,
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": index}),
+            )?;
         }
         if self.store_interactions {
             remember_interaction_continuation(
