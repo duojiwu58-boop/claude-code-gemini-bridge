@@ -24,7 +24,7 @@ use axum::{
     extract::{DefaultBodyLimit, Request, State},
     http::{
         header::{AUTHORIZATION, ORIGIN},
-        HeaderMap, HeaderValue, StatusCode,
+        HeaderMap, HeaderValue, StatusCode, Uri,
     },
     middleware::{self, Next},
     response::{

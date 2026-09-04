@@ -189,7 +189,9 @@ where
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
+        .route("/v1/models/{model_id}", get(model_by_id))
         .merge(protected_routes)
+        .fallback(unsupported_api)
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
@@ -319,6 +321,50 @@ async fn require_local_auth(
         })),
     )
         .into_response()
+}
+
+// Anthropic API surfaces clients may probe that this bridge cannot serve
+// because the upstream providers do not offer them. Matching them explicitly
+// lets the fallback answer 501 with a useful message instead of a bare 404.
+const UNSUPPORTED_ANTHROPIC_API_PREFIXES: &[&str] =
+    &["/v1/messages/batches", "/v1/files", "/v1/organizations"];
+
+async fn unsupported_api(uri: Uri) -> Response {
+    let path = uri.path();
+    let known_but_unsupported = UNSUPPORTED_ANTHROPIC_API_PREFIXES.iter().any(|prefix| {
+        path == *prefix
+            || path
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('/'))
+    });
+    if known_but_unsupported {
+        return anthropic_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "api_error",
+            &format!(
+                "The Anthropic API at '{path}' is not implemented by this bridge because the upstream provider does not offer it"
+            ),
+        );
+    }
+    if path == "/v1/complete" {
+        return anthropic_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "api_error",
+            "Text Completions is retired; use POST /v1/messages",
+        );
+    }
+    if path == "/v1/chat/completions" {
+        return anthropic_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "api_error",
+            "This bridge exposes the Anthropic dialect; use POST /v1/messages",
+        );
+    }
+    anthropic_error(
+        StatusCode::NOT_FOUND,
+        "not_found_error",
+        &format!("No route for '{path}'"),
+    )
 }
 
 fn resolve_fallback_api_key() -> Result<Option<String>, String> {

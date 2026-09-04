@@ -1130,6 +1130,16 @@ fn apply_qwen_anthropic_reasoning_policy(
 
     ensure_anthropic_thinking_output_headroom(request, policy.thinking_enabled, "Qwen")?;
 
+    // The Qwen Anthropic upstream rejects requests that carry both
+    // reasoning_effort (output_config.effort) and thinking_budget
+    // (thinking.budget_tokens) at the same time. The forwarded effort already
+    // encodes the requested depth, so drop the budget before forwarding.
+    if capabilities.reasoning_effort && policy.thinking_enabled {
+        if let Some(thinking) = request.get_mut("thinking").and_then(Value::as_object_mut) {
+            thinking.remove("budget_tokens");
+        }
+    }
+
     Ok(policy)
 }
 

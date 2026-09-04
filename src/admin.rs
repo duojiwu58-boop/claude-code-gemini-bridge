@@ -37,8 +37,12 @@ fn is_gemini_37_or_newer_flash_model(model: &str) -> bool {
 
     let mut version_parts = version.split('.');
     let (Some(major), Some(minor), None) = (
-        version_parts.next().and_then(|part| part.parse::<u64>().ok()),
-        version_parts.next().and_then(|part| part.parse::<u64>().ok()),
+        version_parts
+            .next()
+            .and_then(|part| part.parse::<u64>().ok()),
+        version_parts
+            .next()
+            .and_then(|part| part.parse::<u64>().ok()),
         version_parts.next(),
     ) else {
         return false;
@@ -618,4 +622,43 @@ fn models_response_value(local_model: &str, active_profile: Option<&ProviderProf
             "max_output_tokens": max_output_tokens
         }]
     })
+}
+
+async fn model_by_id(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(model_id): axum::extract::Path<String>,
+) -> Response {
+    let active_profile = active_provider_profile(&state);
+    let listed = models_response_value(&state.model, active_profile.as_ref());
+    let Some(model) = listed
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .cloned()
+    else {
+        return anthropic_error(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            "No model is currently available",
+        );
+    };
+    // Accept every name the bridge itself routes to /v1/messages: the listed
+    // model id, the upstream model id, and the local fallback model name.
+    let known = [
+        model.get("id").and_then(Value::as_str),
+        model.get("upstream_model").and_then(Value::as_str),
+        Some(state.model.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|candidate| candidate == model_id);
+    if known {
+        Json(model).into_response()
+    } else {
+        anthropic_error(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            &format!("Model '{model_id}' not found"),
+        )
+    }
 }

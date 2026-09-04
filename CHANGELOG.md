@@ -9,6 +9,13 @@ All notable changes to **Claude Code Multi-Model Agent Runtime** will be documen
 
 ## [Unreleased]
 
+### Anthropic Surface Completeness for Qwen Routes
+
+- Added `GET /v1/models/{model_id}`: serves the active profile's model object for the listed model id, the upstream model id, and the local fallback model name, and answers an Anthropic-shaped `not_found_error` for anything else.
+- Fixed Qwen native Anthropic reasoning policy sending `output_config.effort` and `thinking.budget_tokens` together. The Qwen upstream rejects `reasoning_effort` and `thinking_budget` in one request; since the forwarded effort already encodes the requested depth, the budget is now dropped after the `max_tokens` headroom check whenever effort is forwarded.
+- `/v1/messages/count_tokens` estimates now exclude the bridge's injected identity text, so reported counts reflect the client's own payload instead of a fixed overhead; native Kimi and Gemini counting paths are unchanged.
+- Added a router fallback: probed Anthropic surfaces the upstream providers do not offer (`/v1/messages/batches`, `/v1/files`, `/v1/organizations`), retired Text Completions, and OpenAI-style `/v1/chat/completions` now return HTTP 501 with an Anthropic-shaped error body explaining the gap instead of a bare 404; unknown paths return a JSON `not_found_error`.
+
 ## [v0.8.0] - 2026-09-03
 
 ### Gemini 3.8 Flash Native Computer Use
@@ -334,6 +341,13 @@ All notable changes to **Claude Code Multi-Model Agent Runtime** will be documen
 ## 中文
 
 ## [未发布]
+
+### Qwen 路由的 Anthropic 接口面完善
+
+- 新增 `GET /v1/models/{model_id}`：按列表模型 id、上游模型 id 或本地回退模型名返回活动 profile 的模型对象；其余名称返回 Anthropic 风格的 `not_found_error`。
+- 修复 Qwen 原生 Anthropic 推理策略同时下发 `output_config.effort` 与 `thinking.budget_tokens` 的问题。Qwen 上游拒绝在同一请求中同时携带 `reasoning_effort` 与 `thinking_budget`；由于转发的 effort 已表达请求的深度，现在在 `max_tokens` 余量检查之后删除 budget。
+- `/v1/messages/count_tokens` 的本地估算不再计入桥接器注入的身份说明文本，报告值只反映客户端自身负载，不再带有固定虚增；Kimi 与 Gemini 的原生计数路径保持不变。
+- 新增路由回退：对上游不提供的 Anthropic 端点（`/v1/messages/batches`、`/v1/files`、`/v1/organizations`）、已退役的 Text Completions 以及 OpenAI 风格的 `/v1/chat/completions`，返回 HTTP 501 与 Anthropic 风格错误体说明原因，替代裸 404；未知路径返回 JSON `not_found_error`。
 
 ## [v0.8.0] - 2026-09-03
 

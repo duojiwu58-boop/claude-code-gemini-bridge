@@ -159,22 +159,23 @@ fn gemini_count_tokens_request(
             json!({"parts": [{"text": system}]}),
         );
     }
-    let functions: Vec<Value> = translated_interaction_tools(request, &profile.openai_capabilities)?
-        .into_iter()
-        .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("function"))
-        .map(|tool| {
-            let mut function = Map::new();
-            for field in ["name", "description"] {
-                if let Some(value) = tool.get(field) {
-                    function.insert(field.to_string(), value.clone());
+    let functions: Vec<Value> =
+        translated_interaction_tools(request, &profile.openai_capabilities)?
+            .into_iter()
+            .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("function"))
+            .map(|tool| {
+                let mut function = Map::new();
+                for field in ["name", "description"] {
+                    if let Some(value) = tool.get(field) {
+                        function.insert(field.to_string(), value.clone());
+                    }
                 }
-            }
-            if let Some(parameters) = tool.get("parameters") {
-                function.insert("parameters".to_string(), parameters.clone());
-            }
-            Value::Object(function)
-        })
-        .collect();
+                if let Some(parameters) = tool.get("parameters") {
+                    function.insert("parameters".to_string(), parameters.clone());
+                }
+                Value::Object(function)
+            })
+            .collect();
     if !functions.is_empty() {
         generate.insert(
             "tools".to_string(),
@@ -262,6 +263,11 @@ async fn anthropic_count_tokens(
     _headers: HeaderMap,
     Json(mut request): Json<Value>,
 ) -> Response {
+    // Estimate before append_bridge_identity so the reported count reflects the
+    // client's own payload instead of the bridge's injected identity text,
+    // which would otherwise inflate every estimate by a fixed overhead.
+    let input_tokens = estimate_anthropic_input_tokens(&request);
+
     let active_profile = active_provider_profile(&state);
     if let Some(profile) = active_profile.as_ref() {
         if let Some(identity) = upstream_identity_label(profile, &state.model) {
@@ -270,8 +276,6 @@ async fn anthropic_count_tokens(
             }
         }
     }
-
-    let input_tokens = estimate_anthropic_input_tokens(&request);
     if let Some(profile) = active_profile
         .as_ref()
         .filter(|profile| is_kimi_profile(profile))

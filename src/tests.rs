@@ -2800,7 +2800,10 @@ fn qwen_anthropic_normalizes_effort_budget_and_max_tokens() {
     let policy = apply_qwen_anthropic_reasoning_policy(&mut request, &capabilities).unwrap();
     assert_eq!(policy.effort, Some("medium"));
     assert_eq!(request["thinking"]["type"], "enabled");
-    assert_eq!(request["thinking"]["budget_tokens"], 31_999);
+    // The Qwen Anthropic upstream rejects requests that carry both effort and
+    // thinking_budget, so the forwarded request keeps output_config.effort
+    // and drops the budget.
+    assert!(request.pointer("/thinking/budget_tokens").is_none());
     assert_eq!(request["output_config"]["effort"], "medium");
     assert_eq!(request["output_config"]["format"]["type"], "json_schema");
     assert_eq!(
@@ -2827,6 +2830,9 @@ fn qwen_anthropic_normalizes_effort_budget_and_max_tokens() {
         apply_qwen_anthropic_reasoning_policy(&mut ultrathink_request, &capabilities).unwrap();
     assert_eq!(ultrathink_policy.effort, Some("xhigh"));
     assert_eq!(ultrathink_request["max_tokens"], 32_000);
+    assert!(ultrathink_request
+        .pointer("/thinking/budget_tokens")
+        .is_none());
 
     let mut ordinary_request = json!({
         "messages": [{"role": "user", "content": "Think it through"}],
@@ -2837,6 +2843,143 @@ fn qwen_anthropic_normalizes_effort_budget_and_max_tokens() {
         apply_qwen_anthropic_reasoning_policy(&mut ordinary_request, &capabilities).unwrap();
     assert_eq!(ordinary_policy.effort, Some("medium"));
     assert_eq!(ordinary_request["max_tokens"], 16_000);
+    assert!(ordinary_request
+        .pointer("/thinking/budget_tokens")
+        .is_none());
+}
+
+#[tokio::test]
+async fn model_by_id_serves_known_names_and_rejects_unknown() {
+    let client = Client::builder().build().unwrap();
+    let profile = ProviderProfile {
+        file_name: "qwen.json".to_string(),
+        display_name: "Qwen3.8 Max".to_string(),
+        source: ProviderProfileSource::Native,
+        model: "qwen3.8-max".to_string(),
+        context_window: None,
+        upstream_identity: Some("Qwen3.8 Max".to_string()),
+        identity_override: true,
+        base_url: "https://example.invalid".to_string(),
+        auth_token: Some("qwen-secret".to_string()),
+        api_key: None,
+        proxy_url: None,
+        local_gemini: false,
+        transport: ProviderTransport::Anthropic,
+        openai_capabilities: OpenAiCapabilities::default(),
+        vision: VisionConfig::default(),
+        upstream_url: "https://example.invalid/v1/messages".to_string(),
+        client: client.clone(),
+    };
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let state = Arc::new(AppState {
+        gemini_transport: Arc::new(RwLock::new(GeminiTransport {
+            client,
+            proxy_url: None,
+        })),
+        gemini_thinking_level: Arc::new(RwLock::new(None)),
+        fallback_api_key: None,
+        local_auth_token: "test-local-token-that-is-long-enough-1234567890".to_string(),
+        upstream_url: "https://example.invalid/gemini".to_string(),
+        model: "fallback-model".to_string(),
+        thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
+        interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
+        computer: Arc::new(ComputerBroker),
+        vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
+        routing: Arc::new(RwLock::new(ProviderRoutingState {
+            profiles: vec![profile],
+            active_file: "qwen.json".to_string(),
+            source: ProviderProfileSource::Native,
+        })),
+        shutdown_tx,
+        settings_dir: PathBuf::new(),
+        providers_dir: PathBuf::new(),
+        bridge_state_path: PathBuf::new(),
+        image_output_dir: env::temp_dir(),
+        image_model: DEFAULT_IMAGE_MODEL.to_string(),
+        image_upstream_url: DEFAULT_IMAGE_UPSTREAM.to_string(),
+        local_bridge_base_url: "http://127.0.0.1:18787".to_string(),
+        admin_state_lock: Arc::new(tokio::sync::Mutex::new(())),
+    });
+
+    let listed = model_by_id(
+        State(state.clone()),
+        axum::extract::Path("qwen3.8-max".to_string()),
+    )
+    .await;
+    assert_eq!(listed.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(listed.into_body(), 4096)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["id"], "qwen3.8-max");
+    assert_eq!(body["object"], "model");
+    assert_eq!(body["upstream_model"], "qwen3.8-max");
+
+    let aliased = model_by_id(
+        State(state.clone()),
+        axum::extract::Path("fallback-model".to_string()),
+    )
+    .await;
+    assert_eq!(aliased.status(), StatusCode::OK);
+
+    let missing = model_by_id(
+        State(state.clone()),
+        axum::extract::Path("no-such-model".to_string()),
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    // The generic listing still exposes exactly the same model object.
+    let listing = models(State(state)).await;
+    assert_eq!(listing.0["data"][0]["id"], "qwen3.8-max");
+}
+
+#[tokio::test]
+async fn unsupported_api_explains_unimplemented_anthropic_endpoints() {
+    async fn call(path: &str) -> Response {
+        let uri: Uri = format!("http://127.0.0.1:18787{path}").parse().unwrap();
+        unsupported_api(uri).await
+    }
+
+    for path in [
+        "/v1/messages/batches",
+        "/v1/messages/batches/batch_123/results",
+        "/v1/files",
+        "/v1/files/file_123",
+        "/v1/organizations/usage_report/messages",
+        "/v1/complete",
+        "/v1/chat/completions",
+    ] {
+        let response = call(path).await;
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED, "{path}");
+    }
+
+    let batches = call("/v1/messages/batches").await;
+    let bytes = axum::body::to_bytes(batches.into_body(), 4096)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["type"], "error");
+    assert_eq!(
+        body.pointer("/error/type").and_then(Value::as_str),
+        Some("api_error")
+    );
+    assert!(body
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .unwrap()
+        .contains("not implemented"));
+
+    let missing = call("/v1/does-not-exist").await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    let bytes = axum::body::to_bytes(missing.into_body(), 4096)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        body.pointer("/error/type").and_then(Value::as_str),
+        Some("not_found_error")
+    );
 }
 
 #[test]
